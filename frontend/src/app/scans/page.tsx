@@ -7,7 +7,8 @@ import Sidebar from "@/components/Sidebar";
 import ScanProgress from "@/components/ScanProgress";
 import { getScans, getTargets, stopScan, deleteScan } from "@/lib/api";
 import { timeAgo, statusColor, cn, parseUTC } from "@/lib/utils";
-import { StopCircle, ExternalLink, Trash2 } from "lucide-react";
+import { useNotifications } from "@/lib/notifications";
+import { StopCircle, ExternalLink, Trash2, Loader2 } from "lucide-react";
 import Link from "next/link";
 
 export default function ScansPage() {
@@ -48,14 +49,20 @@ function ScansContent() {
   const [scans, setScans] = useState<any[]>([]);
   const [targets, setTargets] = useState<any[]>([]);
   const [statusFilter, setStatusFilter] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const notify = useNotifications((s) => s.add);
 
   const load = useCallback(async () => {
     try {
       const [s, t] = await Promise.all([getScans(), getTargets()]);
       setScans(s);
       setTargets(t);
-    } catch {}
-  }, []);
+    } catch (e: any) {
+      notify({ type: "error", title: "Failed to load scans", message: e?.message });
+    } finally {
+      setLoading(false);
+    }
+  }, [notify]);
 
   useEffect(() => {
     load();
@@ -66,16 +73,22 @@ function ScansContent() {
   async function handleStop(id: string) {
     try {
       await stopScan(id);
+      notify({ type: "success", title: "Scan stopped" });
       load();
-    } catch {}
+    } catch (e: any) {
+      notify({ type: "error", title: "Failed to stop scan", message: e?.message });
+    }
   }
 
   async function handleDelete(id: string) {
     if (!confirm("Delete this scan and its logs?")) return;
     try {
       await deleteScan(id);
+      notify({ type: "success", title: "Scan deleted" });
       load();
-    } catch {}
+    } catch (e: any) {
+      notify({ type: "error", title: "Failed to delete scan", message: e?.message });
+    }
   }
 
   const getTarget = (id: string) => targets.find((t: any) => t.id === id);
@@ -86,6 +99,15 @@ function ScansContent() {
 
   const runningCount = scans.filter((s: any) => s.status === "running").length;
   const completedCount = scans.filter((s: any) => s.status === "completed").length;
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="w-6 h-6 text-red-500 animate-spin" />
+        <span className="ml-2 text-gray-400">Loading scans...</span>
+      </div>
+    );
+  }
 
   return (
     <div>

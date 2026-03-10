@@ -16,6 +16,7 @@ import {
   transitionVuln,
 } from "@/lib/api";
 import { severityColor, cn } from "@/lib/utils";
+import { useNotifications } from "@/lib/notifications";
 import {
   ShieldAlert,
   Search,
@@ -134,12 +135,15 @@ function TransitionMenu({ vulnId, status, onTransitioned }: { vulnId: string; st
 
   if (transitions.length === 0) return null;
 
+  const notify = useNotifications((s) => s.add);
   async function doTransition(newStatus: string) {
     setLoading(true);
     try {
       await transitionVuln(vulnId, newStatus);
       onTransitioned();
-    } catch {}
+    } catch (e: any) {
+      notify({ type: "error", title: "Transition failed", message: e?.message });
+    }
     setLoading(false);
     setOpen(false);
   }
@@ -196,13 +200,20 @@ function VulnsContent() {
     label: string;
   }>({ running: false, current: 0, total: 0, label: "" });
 
+  const [loading, setLoading] = useState(true);
+  const notify = useNotifications((s) => s.add);
+
   const load = useCallback(async () => {
     try {
       const [v, t] = await Promise.all([getVulnerabilities(), getTargets()]);
       setVulns(v);
       setTargets(t);
-    } catch {}
-  }, []);
+    } catch (e: any) {
+      notify({ type: "error", title: "Failed to load vulnerabilities", message: e?.message });
+    } finally {
+      setLoading(false);
+    }
+  }, [notify]);
 
   useEffect(() => {
     load();
@@ -323,13 +334,16 @@ function VulnsContent() {
   async function bulkValidate() {
     const ids = Array.from(selectedIds);
     setBulkProgress({ running: true, current: 0, total: ids.length, label: "Validating" });
+    let failed = 0;
     for (let i = 0; i < ids.length; i++) {
       try {
         await validateVulnerability(ids[i]);
-      } catch {}
+      } catch { failed++; }
       setBulkProgress((p) => ({ ...p, current: i + 1 }));
     }
     setBulkProgress({ running: false, current: 0, total: 0, label: "" });
+    if (failed) notify({ type: "warning", title: `${failed}/${ids.length} validations failed` });
+    else notify({ type: "success", title: `Validated ${ids.length} vulns` });
     setSelectedIds(new Set());
     await load();
   }
@@ -337,13 +351,16 @@ function VulnsContent() {
   async function bulkCVSS() {
     const ids = Array.from(selectedIds);
     setBulkProgress({ running: true, current: 0, total: ids.length, label: "Calculating CVSS" });
+    let failed = 0;
     for (let i = 0; i < ids.length; i++) {
       try {
         await calculateCVSS(ids[i]);
-      } catch {}
+      } catch { failed++; }
       setBulkProgress((p) => ({ ...p, current: i + 1 }));
     }
     setBulkProgress({ running: false, current: 0, total: 0, label: "" });
+    if (failed) notify({ type: "warning", title: `${failed}/${ids.length} CVSS calculations failed` });
+    else notify({ type: "success", title: `CVSS calculated for ${ids.length} vulns` });
     setSelectedIds(new Set());
     await load();
   }
@@ -351,10 +368,11 @@ function VulnsContent() {
   async function bulkMarkFalsePositive() {
     const ids = Array.from(selectedIds);
     setBulkProgress({ running: true, current: 0, total: ids.length, label: "Marking False Positive" });
+    let failed = 0;
     for (let i = 0; i < ids.length; i++) {
       try {
         await updateVulnStatus(ids[i], "false_positive");
-      } catch {}
+      } catch { failed++; }
       setBulkProgress((p) => ({ ...p, current: i + 1 }));
     }
     setBulkProgress({ running: false, current: 0, total: 0, label: "" });
@@ -392,7 +410,10 @@ function VulnsContent() {
     setBulkProgress({ running: true, current: 0, total: 1, label: "Validating all for target" });
     try {
       await bulkValidateVulnerabilities(targetFilter);
-    } catch {}
+      notify({ type: "success", title: "Validation started for target" });
+    } catch (e: any) {
+      notify({ type: "error", title: "Bulk validation failed", message: e?.message });
+    }
     setBulkProgress({ running: false, current: 0, total: 0, label: "" });
     await load();
   }
@@ -402,7 +423,10 @@ function VulnsContent() {
     setBulkProgress({ running: true, current: 0, total: 1, label: "Calculating CVSS for target" });
     try {
       await bulkCalculateCVSS(targetFilter);
-    } catch {}
+      notify({ type: "success", title: "CVSS calculation started for target" });
+    } catch (e: any) {
+      notify({ type: "error", title: "Bulk CVSS failed", message: e?.message });
+    }
     setBulkProgress({ running: false, current: 0, total: 0, label: "" });
     await load();
   }
@@ -413,6 +437,15 @@ function VulnsContent() {
     { value: "cvss", label: "CVSS Score (highest)" },
     { value: "confidence", label: "AI Confidence" },
   ];
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="w-6 h-6 text-red-500 animate-spin" />
+        <span className="ml-2 text-gray-400">Loading vulnerabilities...</span>
+      </div>
+    );
+  }
 
   return (
     <div>
