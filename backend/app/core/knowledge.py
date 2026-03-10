@@ -80,16 +80,23 @@ class KnowledgeBase:
 
         results = []
         for p in patterns:
-            if not p.pattern_data.get("payload"):
+            data = p.pattern_data or {}
+            # For nuclei_live patterns, paths with injection markers count as payloads
+            nuclei_paths = data.get("paths", []) if p.pattern_type == "nuclei_live" else []
+            has_payload = data.get("payload") or data.get("payloads") or nuclei_paths
+
+            if not has_payload:
                 continue
             entry = {
-                "payload": p.pattern_data.get("payload", ""),
+                "payload": data.get("payload", nuclei_paths[0] if nuclei_paths else ""),
                 "success_count": p.sample_count,
                 "confidence": p.confidence,
                 "technology": p.technology,
             }
-            # Include full payload list if available (from PayloadsAllTheThings etc.)
-            all_payloads = p.pattern_data.get("payloads", [])
+            # Include full payload list if available (from PayloadsAllTheThings, nuclei etc.)
+            all_payloads = data.get("payloads", [])
+            if nuclei_paths and not all_payloads:
+                all_payloads = nuclei_paths
             if all_payloads:
                 entry["payloads"] = all_payloads
             results.append(entry)
