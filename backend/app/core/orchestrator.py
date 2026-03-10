@@ -4,9 +4,12 @@ AI Orchestrator — the brain of PHANTOM.
 Uses local LLM for routine tasks and Claude as mentor for complex decisions.
 """
 import json
+import logging
 
 from app.ai.llm_engine import LLMEngine, LLMError
 from app.ai.claude_mentor import ClaudeMentor
+
+logger = logging.getLogger(__name__)
 
 
 class AIOrchestrator:
@@ -36,15 +39,15 @@ class AIOrchestrator:
                     if isinstance(mentor_strategy, dict):
                         mentor_strategy["source"] = "claude_mentor"
                         return mentor_strategy
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Claude mentor escalation failed: {e}")
                 strategy["source"] = "local_llm_low_confidence"
             else:
                 strategy["source"] = "local_llm"
 
             return strategy
-        except LLMError:
-            pass
+        except LLMError as e:
+            logger.debug(f"Local LLM strategy failed: {e}")
 
         # Fallback to Claude mentor
         try:
@@ -53,8 +56,8 @@ class AIOrchestrator:
             if isinstance(strategy, dict):
                 strategy["source"] = "claude_mentor_fallback"
                 return strategy
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Claude mentor fallback failed: {e}")
 
         # Ultimate fallback — build smart strategy from collected data
         return self._build_smart_fallback(context)
@@ -267,8 +270,8 @@ Is this a confirmed vulnerability? Respond ONLY in JSON:
                 if knowledge_lines:
                     return "\n\nKNOWLEDGE BASE (learned from past scans and training):\n" + "\n".join(knowledge_lines[:15])
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Knowledge context fetch failed: {e}")
         return ""
 
     def _build_analysis_prompt(self, context: dict) -> str:
@@ -277,12 +280,9 @@ Is this a confirmed vulnerability? Respond ONLY in JSON:
         knowledge = ""
         try:
             loop = asyncio.get_running_loop()
-            # We're already in async context, so create task
             knowledge_task = asyncio.ensure_future(self._get_knowledge_context(context))
-            # Can't await here in sync method, so knowledge will be empty
-            # We'll add it in analyze_and_plan instead
         except RuntimeError:
-            pass
+            logger.debug("No running event loop for knowledge context")
 
         return f"""You are PHANTOM, an expert penetration testing AI. Analyze the following reconnaissance data and create a detailed attack strategy.
 

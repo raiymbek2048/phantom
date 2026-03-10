@@ -232,8 +232,8 @@ class ScanPipeline:
         try:
             from app.api.websocket import publish_scan_event
             await publish_scan_event(self.scan_id, event)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"WebSocket publish failed (non-fatal): {e}")
 
     async def _filter_false_positives(self, findings: list[dict], db: AsyncSession, phase: str) -> list[dict]:
         """Filter out findings that match known false-positive patterns from the KnowledgeBase.
@@ -483,8 +483,8 @@ class ScanPipeline:
                     try:
                         from app.core.notifications import notify_scan_complete
                         notify_scan_complete(scan, target, scan.vulns_found or 0)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Scan complete notification failed: {e}")
 
                     # Notify for critical/high vulns found
                     await self._notify_critical_vulns(db, target)
@@ -494,8 +494,8 @@ class ScanPipeline:
                         from app.core.knowledge import KnowledgeBase
                         kb = KnowledgeBase()
                         await kb.learn_from_scan(db, self.scan_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Knowledge learning failed: {e}")
 
             except Exception as e:
                 scan.status = ScanStatus.FAILED
@@ -1808,8 +1808,8 @@ Respond in JSON:
                 try:
                     from app.modules.oob_server import stop_oob_server
                     await stop_oob_server()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"OOB server stop failed (non-fatal): {e}")
         except Exception as e:
             await self.log(db, "exploit", f"OOB check error: {e}", "warning")
 
@@ -2252,8 +2252,8 @@ Respond in JSON:
                     notify_critical_vuln(vuln, target)
                 elif vuln.severity == Severity.HIGH and settings.get("notify_high", True):
                     notify_critical_vuln(vuln, target)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Critical vuln notification failed: {e}")
 
     async def _get_knowledge_payloads(self, db: AsyncSession) -> list:
         """Query the knowledge base for effective payloads matching the target's technologies."""

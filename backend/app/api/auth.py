@@ -56,37 +56,37 @@ async def get_current_user(
     token: str = Depends(OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Auth disabled for development — always returns admin user.
+    """Authenticate via JWT token or API token (phnt_... header)."""
+    import hashlib
 
-    To re-enable auth, restore the original get_current_user that
-    validates JWT/API tokens (see git history).
-    """
-    # Always return the first admin user (no auth check)
-    result = await db.execute(
-        select(User).where(User.is_admin == True).limit(1)
-    )
-    user = result.scalar_one_or_none()
-    if user:
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    # API token auth (phnt_...)
+    if token.startswith("phnt_"):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        result = await db.execute(
+            select(User).where(User.api_token_hash == token_hash, User.is_active == True)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API token")
         return user
 
-    # Fallback: return any user
-    result = await db.execute(select(User).limit(1))
-    user = result.scalar_one_or_none()
-    if user:
-        return user
+    # JWT auth
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # No users at all — create a default admin
-    default_admin = User(
-        username="admin",
-        email="admin@phantom.local",
-        password_hash=hash_password("changeme"),
-        is_admin=True,
-        is_active=True,
-        role="ADMIN",
-    )
-    db.add(default_admin)
-    await db.flush()
-    return default_admin
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    return user
 
 
 @router.post("/register", response_model=UserResponse)
