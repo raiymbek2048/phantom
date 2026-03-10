@@ -563,6 +563,37 @@ async def validate_payloads(
     return {"status": "completed", **stats}
 
 
+@router.post("/h1-deep-analyze")
+async def h1_deep_analyze(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    limit: int = 20,
+):
+    """Deep-analyze disclosed H1 reports: regex payload extraction + Claude semantic analysis."""
+    from app.core.h1_report_parser import H1ReportParser
+
+    parser = H1ReportParser(db)
+    try:
+        # First collect fresh hacktivity
+        collect_stats = await parser.fetch_and_store_hacktivity(pages=5)
+        # Then deep-analyze disclosed reports
+        analyze_stats = await parser.analyze_disclosed_reports(limit=limit)
+        h1_stats = await parser.get_stats()
+        return {
+            "status": "completed",
+            "collection": collect_stats,
+            "analysis": analyze_stats,
+            "kb_stats": {
+                "total_reports": h1_stats["total_reports"],
+                "disclosed": h1_stats["disclosed_reports"],
+                "analyzed": h1_stats["analyzed_reports"],
+                "insights": h1_stats["h1_insights"],
+            },
+        }
+    finally:
+        await parser.close()
+
+
 @router.get("/modules")
 async def list_training_modules(
     user: User = Depends(get_current_user),
@@ -587,6 +618,7 @@ async def list_training_modules(
             {"id": "hacktivity", "name": "Live HackerOne Hacktivity", "description": "Learn from latest disclosed bug bounty reports", "category": "live", "endpoint": "/live-feed"},
             {"id": "payloads", "name": "PayloadsAllTheThings", "description": "5000+ community-vetted payloads from GitHub (XSS, SQLi, SSRF, SSTI, LFI, CMD, XXE)", "category": "live", "endpoint": "/live-feed"},
             {"id": "scan_feedback", "name": "Scan Feedback Analysis", "description": "Analyze completed scans to improve detection strategy", "category": "live", "endpoint": "/live-feed"},
+            {"id": "h1_deep", "name": "H1 Deep Report Analysis", "description": "Extract payloads, techniques, and endpoints from disclosed HackerOne reports (regex + Claude)", "category": "live", "endpoint": "/h1-deep-analyze"},
         ],
         "ai": [
             {"id": "mutate", "name": "AI Payload Mutation", "description": "Claude/Ollama generates new WAF-evading payload variants", "category": "ai", "endpoint": "/ai-mutate"},

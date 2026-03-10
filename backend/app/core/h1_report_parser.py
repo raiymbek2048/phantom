@@ -3,9 +3,14 @@ HackerOne Report Parser & Knowledge Extractor.
 
 Fetches disclosed reports from HackerOne, analyzes them with Claude,
 and saves extracted patterns into the Knowledge Base.
+
+Two-layer extraction:
+1. Regex-based: extract payloads, URLs, code blocks, HTTP requests from report text
+2. Claude-based: deep semantic analysis of attack methodology
 """
 import json
 import logging
+import re
 from datetime import datetime
 
 from sqlalchemy import select
@@ -16,6 +21,185 @@ from app.core.h1_client import H1Client
 from app.models.knowledge import KnowledgePattern
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Regex patterns for payload extraction from report text ----
+
+# Code blocks (markdown triple backticks or indented)
+_RE_CODE_BLOCK = re.compile(r"```[\w]*\n(.*?)```", re.DOTALL)
+_RE_INLINE_CODE = re.compile(r"`([^`]{5,200})`")
+
+# HTTP requests
+_RE_HTTP_REQUEST = re.compile(
+    r"(GET|POST|PUT|DELETE|PATCH|OPTIONS)\s+(https?://\S+|/\S+)",
+    re.IGNORECASE,
+)
+
+# URLs with injection markers
+_RE_PAYLOAD_URL = re.compile(
+    r"https?://[^\s\"'<>]+[?&][^\s\"'<>]*"
+    r"(?:['\"><;|`\{\}]|%[0-9a-fA-F]{2}|script|alert|union|select|sleep|concat"
+    r"|onerror|onload|img\s+src|iframe|eval\(|document\.|\.\.\/|etc\/passwd)",
+    re.IGNORECASE,
+)
+
+# Common payload patterns in text
+_RE_XSS_PAYLOAD = re.compile(
+    r"(<script[^>]*>.*?</script>|<img[^>]*onerror[^>]*>|<svg[^>]*onload[^>]*>"
+    r"|javascript:[^\s\"']+|<iframe[^>]*>|<details[^>]*open[^>]*ontoggle[^>]*>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_SQLI_PAYLOAD = re.compile(
+    r"(['\"]?\s*(?:OR|AND|UNION)\s+(?:SELECT|ALL|1\s*=\s*1|TRUE|SLEEP)|"
+    r"(?:WAITFOR\s+DELAY|BENCHMARK\s*\(|pg_sleep|EXTRACTVALUE|UPDATEXML)\s*\()",
+    re.IGNORECASE,
+)
+_RE_SSTI_PAYLOAD = re.compile(
+    r"(\{\{.*?\}\}|\$\{.*?\}|<%.*?%>|#\{.*?\}|\[\[.*?\]\])",
+)
+_RE_CMD_PAYLOAD = re.compile(
+    r"[;|`]\s*(cat|ls|id|whoami|ping|curl|wget|nc|nslookup)\s",
+    re.IGNORECASE,
+)
+_RE_SSRF_URL = re.compile(
+    r"(https?://(?:169\.254\.169\.254|127\.0\.0\.1|localhost|0\.0\.0\.0|"
+    r"internal|metadata|2130706433|0x7f000001|[:0]+1)[\S]*)",
+    re.IGNORECASE,
+)
+_RE_PATH_TRAVERSAL = re.compile(
+    r"((?:\.\./){2,}[\w/]+|(?:%2e%2e[/%]){2,}|(?:\.\.\\/){2,})",
+    re.IGNORECASE,
+)
+
+# Endpoint patterns
+_RE_API_ENDPOINT = re.compile(
+    r"(?:GET|POST|PUT|DELETE|PATCH)\s+(/api/\S+|/v[0-9]/\S+|/graphql\S*)",
+    re.IGNORECASE,
+)
+
+# Tool names
+_TOOLS_RE = re.compile(
+    r"\b(burp|sqlmap|ffuf|dirsearch|nuclei|nmap|nikto|wfuzz|gobuster|"
+    r"amass|subfinder|httpx|katana|dalfox|xsstrike|ssrfmap|tplmap|"
+    r"commix|ghauri|arjun|paramspider|waybackurls|gau)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_payloads_from_text(text: str, vuln_type: str | None = None) -> dict:
+    """Extract payloads, techniques, and patterns from report text using regex.
+
+    Returns: {payloads: [...], endpoints: [...], tools: [...], techniques: [...]}
+    """
+    payloads = []
+    endpoints = []
+    tools = set()
+    techniques = []
+
+    if not text:
+        return {"payloads": [], "endpoints": [], "tools": [], "techniques": []}
+
+    # Extract from code blocks first (highest quality)
+    for block in _RE_CODE_BLOCK.findall(text):
+        block = block.strip()
+        if len(block) < 5 or len(block) > 2000:
+            continue
+        # HTTP request in code block
+        if re.match(r"^(GET|POST|PUT|DELETE|PATCH|OPTIONS)\s+", block, re.IGNORECASE):
+            payloads.append(block)
+        # Curl command
+        elif block.startswith("curl "):
+            payloads.append(block)
+        # Contains injection markers
+        elif any(marker in block.lower() for marker in [
+            "script", "alert(", "onerror", "union select", "sleep(",
+            "{{", "${", "../", "127.0.0.1", "169.254", ";cat ", ";id",
+        ]):
+            payloads.append(block)
+
+    # Inline code
+    for code in _RE_INLINE_CODE.findall(text):
+        code = code.strip()
+        if any(marker in code.lower() for marker in [
+            "<script", "alert(", "onerror", "union", "select", "sleep(",
+            "{{", "${", "../", "127.0.0.1", ";cat", ";id", "eval(",
+        ]):
+            payloads.append(code)
+
+    # XSS payloads
+    for m in _RE_XSS_PAYLOAD.finditer(text):
+        payloads.append(m.group(0))
+
+    # SQLi payloads
+    for m in _RE_SQLI_PAYLOAD.finditer(text):
+        # Get surrounding context (50 chars each side)
+        start = max(0, m.start() - 50)
+        end = min(len(text), m.end() + 50)
+        context = text[start:end].strip()
+        # Clean to just the payload part
+        payloads.append(context)
+
+    # SSTI payloads
+    for m in _RE_SSTI_PAYLOAD.finditer(text):
+        payload = m.group(0)
+        if len(payload) > 4 and payload not in ("{{", "}}", "${}", "#{}", "[[]]"):
+            payloads.append(payload)
+
+    # CMD injection
+    for m in _RE_CMD_PAYLOAD.finditer(text):
+        start = max(0, m.start() - 30)
+        end = min(len(text), m.end() + 30)
+        payloads.append(text[start:end].strip())
+
+    # SSRF URLs
+    for m in _RE_SSRF_URL.finditer(text):
+        payloads.append(m.group(0))
+
+    # Path traversal
+    for m in _RE_PATH_TRAVERSAL.finditer(text):
+        payloads.append(m.group(0))
+
+    # URLs with injection
+    for m in _RE_PAYLOAD_URL.finditer(text):
+        payloads.append(m.group(0))
+
+    # API endpoints
+    for m in _RE_API_ENDPOINT.finditer(text):
+        endpoints.append(m.group(1))
+
+    # HTTP request lines
+    for m in _RE_HTTP_REQUEST.finditer(text):
+        path = m.group(2)
+        if path.startswith("/"):
+            endpoints.append(path)
+
+    # Tools mentioned
+    for m in _TOOLS_RE.finditer(text):
+        tools.add(m.group(1).lower())
+
+    # Deduplicate
+    seen = set()
+    unique_payloads = []
+    for p in payloads:
+        p_clean = p.strip()[:500]
+        if p_clean and p_clean not in seen:
+            seen.add(p_clean)
+            unique_payloads.append(p_clean)
+
+    seen_ep = set()
+    unique_endpoints = []
+    for e in endpoints:
+        e_clean = e.strip()[:200]
+        if e_clean and e_clean not in seen_ep:
+            seen_ep.add(e_clean)
+            unique_endpoints.append(e_clean)
+
+    return {
+        "payloads": unique_payloads[:50],
+        "endpoints": unique_endpoints[:20],
+        "tools": sorted(tools)[:10],
+        "techniques": techniques[:10],
+    }
 
 # Map H1 CWE names to our vuln_types
 CWE_TO_VULN_TYPE = {
@@ -171,7 +355,52 @@ class H1ReportParser:
                             full_report.get("data", {}), indent=2
                         )[:10000]
 
-                # Analyze with Claude
+                vuln_type = normalize_vuln_type(
+                    report.pattern_data.get("cwe"), title
+                )
+
+                # Layer 1: Regex-based extraction (fast, no LLM needed)
+                if report_text:
+                    extracted = extract_payloads_from_text(report_text, vuln_type)
+                    if extracted["payloads"]:
+                        # Save directly as effective_payload
+                        pattern = KnowledgePattern(
+                            pattern_type="effective_payload",
+                            technology=report.pattern_data.get("program", "generic"),
+                            vuln_type=vuln_type or "other",
+                            pattern_data={
+                                "payload": extracted["payloads"][0],
+                                "payloads": extracted["payloads"][:30],
+                                "source": "h1_report_regex",
+                                "h1_id": h1_id,
+                                "title": title,
+                                "bounty": report.pattern_data.get("bounty"),
+                                "endpoints": extracted["endpoints"][:10],
+                                "tools": extracted["tools"],
+                            },
+                            confidence=0.6 if report.pattern_data.get("bounty") else 0.45,
+                            sample_count=1,
+                        )
+                        self.db.add(pattern)
+                        stats["patterns_created"] += 1
+
+                    if extracted["endpoints"]:
+                        pattern = KnowledgePattern(
+                            pattern_type="endpoint_pattern",
+                            technology=report.pattern_data.get("program", "generic"),
+                            vuln_type=vuln_type or "other",
+                            pattern_data={
+                                "paths": extracted["endpoints"],
+                                "source": "h1_report_regex",
+                                "h1_id": h1_id,
+                            },
+                            confidence=0.5,
+                            sample_count=1,
+                        )
+                        self.db.add(pattern)
+                        stats["patterns_created"] += 1
+
+                # Layer 2: Claude-based analysis (deep, semantic)
                 patterns = await self._analyze_report_with_claude(
                     title=title,
                     cwe=report.pattern_data.get("cwe"),
