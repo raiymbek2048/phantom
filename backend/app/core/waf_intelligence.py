@@ -71,9 +71,9 @@ class WAFIntelligence:
 
         if existing:
             await self.update_confidence(waf_key, payload, success, db, _pattern=existing)
-        else:
-            # Create new record
-            confidence = 0.6 if success else 0.15
+        elif success:
+            # Only create new KB patterns for SUCCESSFUL bypasses
+            # Failed attempts are too numerous and create junk patterns
             db.add(KnowledgePattern(
                 pattern_type="waf_bypass",
                 technology=waf_key,
@@ -81,13 +81,13 @@ class WAFIntelligence:
                 pattern_data={
                     "payload": payload,
                     "waf": waf_key,
-                    "success_count": 1 if success else 0,
-                    "fail_count": 0 if success else 1,
+                    "success_count": 1,
+                    "fail_count": 0,
                     "total_attempts": 1,
                     "last_response_code": response_code,
-                    "success_rate": 1.0 if success else 0.0,
+                    "success_rate": 1.0,
                 },
-                confidence=confidence,
+                confidence=0.6,
                 sample_count=1,
             ))
 
