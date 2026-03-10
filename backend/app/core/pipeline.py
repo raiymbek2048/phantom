@@ -177,6 +177,12 @@ class ScanPipeline:
         if existing.scalar_one_or_none():
             return None  # Duplicate — skip
 
+        # Sanitize: AI sometimes returns list instead of str for text fields
+        for attr in ("remediation", "description", "impact", "payload_used", "ai_analysis"):
+            val = getattr(vuln, attr, None)
+            if isinstance(val, list):
+                setattr(vuln, attr, "\n".join(str(v) for v in val))
+
         db.add(vuln)
         await db.flush()
 
