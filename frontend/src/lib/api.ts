@@ -17,7 +17,13 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    // Auth disabled — no redirect to login
+    if (err.response?.status === 401 && typeof window !== "undefined") {
+      localStorage.removeItem("token");
+      // Reload to show login form
+      if (window.location.pathname !== "/") {
+        window.location.href = "/";
+      }
+    }
     return Promise.reject(err);
   }
 );
