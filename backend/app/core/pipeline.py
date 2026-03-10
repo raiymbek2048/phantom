@@ -8,12 +8,74 @@ import asyncio
 import json
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib.parse import urlparse
 
 import app.models.database as _db
 from app.models.scan import Scan, ScanLog, ScanStatus
 from app.models.target import Target
+from app.models.vulnerability import Vulnerability, Severity, VulnType
+
+# Extended mapping: raw string → VulnType (covers AI-generated aliases)
+VULN_TYPE_ALIASES: dict[str, VulnType] = {
+    # Exact enum values
+    **{v.value: v for v in VulnType},
+    # Common aliases from Claude / AI modules
+    "xss": VulnType.XSS_REFLECTED,
+    "reflected_xss": VulnType.XSS_REFLECTED,
+    "stored_xss": VulnType.XSS_STORED,
+    "dom_xss": VulnType.XSS_DOM,
+    "sql_injection": VulnType.SQLI,
+    "sqli_error": VulnType.SQLI,
+    "sqli_union": VulnType.SQLI,
+    "sqli_time": VulnType.SQLI_BLIND,
+    "blind_sqli": VulnType.SQLI_BLIND,
+    "nosql_injection": VulnType.SQLI,
+    "nosql": VulnType.SQLI,
+    "injection": VulnType.SQLI,
+    "command_injection": VulnType.CMD_INJECTION,
+    "os_command_injection": VulnType.CMD_INJECTION,
+    "server_side_request_forgery": VulnType.SSRF,
+    "server_side_template_injection": VulnType.SSTI,
+    "template_injection": VulnType.SSTI,
+    "remote_code_execution": VulnType.RCE,
+    "code_execution": VulnType.RCE,
+    "local_file_inclusion": VulnType.LFI,
+    "file_inclusion": VulnType.LFI,
+    "remote_file_inclusion": VulnType.RFI,
+    "xml_external_entity": VulnType.XXE,
+    "insecure_direct_object_reference": VulnType.IDOR,
+    "broken_access_control": VulnType.AUTH_BYPASS,
+    "broken_auth": VulnType.AUTH_BYPASS,
+    "authentication_bypass": VulnType.AUTH_BYPASS,
+    "authorization_bypass": VulnType.AUTH_BYPASS,
+    "rate_limit_bypass": VulnType.MISCONFIGURATION,
+    "rate_limiting": VulnType.MISCONFIGURATION,
+    "information_disclosure": VulnType.INFO_DISCLOSURE,
+    "sensitive_data_exposure": VulnType.INFO_DISCLOSURE,
+    "cors": VulnType.CORS_MISCONFIGURATION,
+    "cors_misconfiguration": VulnType.CORS_MISCONFIGURATION,
+    "misconfig": VulnType.MISCONFIGURATION,
+    "security_misconfiguration": VulnType.MISCONFIGURATION,
+    "open_redirect": VulnType.OPEN_REDIRECT,
+    "redirect": VulnType.OPEN_REDIRECT,
+    "url_redirect": VulnType.OPEN_REDIRECT,
+    "path_traversal": VulnType.PATH_TRAVERSAL,
+    "directory_traversal": VulnType.PATH_TRAVERSAL,
+    "jwt": VulnType.JWT_VULN,
+    "jwt_vulnerability": VulnType.JWT_VULN,
+    "race_condition": VulnType.RACE_CONDITION,
+    "toctou": VulnType.RACE_CONDITION,
+    "file_upload": VulnType.FILE_UPLOAD,
+    "unrestricted_file_upload": VulnType.FILE_UPLOAD,
+    "deserialization": VulnType.DESERIALIZATION,
+    "insecure_deserialization": VulnType.DESERIALIZATION,
+    "subdomain_takeover": VulnType.SUBDOMAIN_TAKEOVER,
+    "privilege_escalation": VulnType.PRIVILEGE_ESCALATION,
+    "business_logic": VulnType.BUSINESS_LOGIC,
+    "csrf": VulnType.CSRF,
+}
 from app.modules.recon import ReconModule
 from app.modules.subdomain import SubdomainModule
 from app.modules.portscan import PortScanModule
@@ -72,6 +134,65 @@ class ScanPipeline:
         self._idor_seen: set = set()  # Dedup proven IDOR findings
         self.realtime_learner = RealtimeLearner()
         self.cross_scan_intel = CrossScanIntel()
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Strip query params and fragment for dedup comparison."""
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/").lower()
+
+    async def _save_vuln_deduped(
+        self,
+        db: AsyncSession,
+        vuln: Vulnerability,
+        scan: Scan = None,
+        track_context: bool = False,
+        finding_dict: dict = None,
+    ) -> Vulnerability | None:
+        """Save a vulnerability only if no duplicate exists for this target.
+
+        Dedup key: (target_id, vuln_type, normalized_url, parameter).
+        Returns the vuln if saved, None if duplicate.
+        """
+        norm_url = self._normalize_url(vuln.url or "")
+
+        conditions = [
+            Vulnerability.target_id == vuln.target_id,
+            Vulnerability.vuln_type == vuln.vuln_type,
+        ]
+        # Match on normalized URL path
+        if norm_url:
+            parsed = urlparse(vuln.url or "")
+            url_path = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            conditions.append(Vulnerability.url.like(f"{url_path}%"))
+        # Match on parameter if present
+        if vuln.parameter:
+            conditions.append(Vulnerability.parameter == vuln.parameter)
+
+        existing = await db.execute(
+            select(Vulnerability.id).where(and_(*conditions)).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            return None  # Duplicate — skip
+
+        db.add(vuln)
+        await db.flush()
+
+        # Update scan vulns_found counter
+        if not scan and vuln.scan_id:
+            result = await db.execute(select(Scan).where(Scan.id == vuln.scan_id))
+            scan = result.scalar_one_or_none()
+        if scan:
+            scan.vulns_found = (scan.vulns_found or 0) + 1
+            await db.flush()
+
+        # Track in context for downstream phases
+        if track_context and finding_dict:
+            self.context.setdefault("vulnerabilities", []).append(finding_dict)
+
+        return vuln
 
     async def log(self, db: AsyncSession, phase: str, message: str, level: str = "info", data: dict = None):
         log_entry = ScanLog(
@@ -989,7 +1110,6 @@ Respond in JSON:
             # Report API keys as findings (save as Vulnerability DB records)
             api_keys = js_result.get("api_keys_found", [])
             if api_keys:
-                from app.models.vulnerability import Vulnerability, Severity, VulnType
                 for key_info in api_keys:
                     vuln = Vulnerability(
                         target_id=self.context["target_id"],
@@ -1006,14 +1126,12 @@ Respond in JSON:
                         impact="Leaked credentials or API keys in client-side code can lead to unauthorized access.",
                         remediation="Move secrets to server-side configuration. Use environment variables or a secrets manager.",
                     )
-                    db.add(vuln)
-                await db.flush()
+                    await self._save_vuln_deduped(db, vuln)
 
             # Report source maps as findings
             source_maps = js_result.get("source_maps", [])
             accessible_maps = [sm for sm in source_maps if sm.get("accessible")]
             if accessible_maps:
-                from app.models.vulnerability import Vulnerability, Severity, VulnType
                 for smap in accessible_maps:
                     orig_count = len(smap.get("original_files", []))
                     orig_files_str = ', '.join(smap.get('original_files', [])[:10])
@@ -1033,8 +1151,7 @@ Respond in JSON:
                         impact="Source maps expose original unminified source code, revealing internal application logic, comments, and potentially sensitive information.",
                         remediation="Remove source map files from production or restrict access via server configuration.",
                     )
-                    db.add(vuln)
-                await db.flush()
+                    await self._save_vuln_deduped(db, vuln)
 
             await self.log(
                 db, "endpoint",
@@ -1061,8 +1178,7 @@ Respond in JSON:
                     api_added += 1
 
             # Save findings as Vulnerability DB records
-            from app.models.vulnerability import Vulnerability, Severity as SevEnum, VulnType
-            severity_map = {"critical": SevEnum.CRITICAL, "high": SevEnum.HIGH, "medium": SevEnum.MEDIUM, "low": SevEnum.LOW, "info": SevEnum.INFO}
+            severity_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH, "medium": Severity.MEDIUM, "low": Severity.LOW, "info": Severity.INFO}
             vuln_type_map = {"misconfiguration": VulnType.MISCONFIGURATION, "info_disclosure": VulnType.INFO_DISCLOSURE}
             for finding in api_disc.get("findings", []):
                 vuln = Vulnerability(
@@ -1070,15 +1186,12 @@ Respond in JSON:
                     scan_id=self.context["scan_id"],
                     title=finding["title"][:500],
                     vuln_type=vuln_type_map.get(finding.get("vuln_type"), VulnType.MISCONFIGURATION),
-                    severity=severity_map.get(finding.get("severity", "low"), SevEnum.LOW),
+                    severity=severity_map.get(finding.get("severity", "low"), Severity.LOW),
                     url=(finding.get("endpoint") or api_base)[:2000],
                     description=finding.get("description", ""),
-                    evidence=finding.get("evidence", ""),
                     remediation=finding.get("remediation", ""),
                 )
-                db.add(vuln)
-            if api_disc.get("findings"):
-                await db.flush()
+                await self._save_vuln_deduped(db, vuln)
 
             # Store GraphQL schema in context for AI analysis
             if api_disc.get("graphql_schema"):
@@ -1164,15 +1277,14 @@ Respond in JSON:
             sec_findings = await run_security_analysis(base_url, endpoints, self.context)
 
             if sec_findings:
-                from app.models.vulnerability import Vulnerability, Severity as SevEnum, VulnType
                 severity_map = {
-                    "critical": SevEnum.CRITICAL, "high": SevEnum.HIGH,
-                    "medium": SevEnum.MEDIUM, "low": SevEnum.LOW, "info": SevEnum.INFO,
+                    "critical": Severity.CRITICAL, "high": Severity.HIGH,
+                    "medium": Severity.MEDIUM, "low": Severity.LOW, "info": Severity.INFO,
                 }
                 vt_map = {v.value: v for v in VulnType}
                 saved = 0
                 for f in sec_findings:
-                    sev = severity_map.get(f.get("severity", "info"), SevEnum.INFO)
+                    sev = severity_map.get(f.get("severity", "info"), Severity.INFO)
                     vt = vt_map.get(f.get("vuln_type", "misconfiguration"), VulnType.MISCONFIGURATION)
                     vuln = Vulnerability(
                         target_id=self.context["target_id"],
@@ -1186,9 +1298,9 @@ Respond in JSON:
                         remediation=f.get("remediation", ""),
                         ai_analysis=f.get("csp_grade", ""),
                     )
-                    db.add(vuln)
-                    saved += 1
-                await db.flush()
+                    result = await self._save_vuln_deduped(db, vuln)
+                    if result:
+                        saved += 1
 
                 csp_grade = self.context.get("csp_analysis", {}).get("grade", "N/A")
                 cors_count = self.context.get("cors_analysis", {}).get("findings_count", 0)
@@ -1374,16 +1486,14 @@ Respond in JSON:
             idor_findings = await idor_engine.test_all(endpoints, self.context)
             if idor_findings:
                 # Save proven IDOR findings directly as Vulnerability records
-                # (bypass LLM evaluation which incorrectly rejects brute-force-proven findings)
-                from app.models.vulnerability import Vulnerability, Severity as SevEnum, VulnType
-                severity_map = {"critical": SevEnum.CRITICAL, "high": SevEnum.HIGH, "medium": SevEnum.MEDIUM, "low": SevEnum.LOW, "info": SevEnum.INFO}
+                severity_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH, "medium": Severity.MEDIUM, "low": Severity.LOW, "info": Severity.INFO}
                 idor_saved = 0
                 idor_types = {}
                 for f in idor_findings:
                     proof = f.get("proof", {})
                     if not proof.get("proven") and not f.get("proven"):
                         continue  # Skip unproven findings
-                    # Deduplicate
+                    # In-memory dedup
                     dedup_key = f"{f.get('url', '')}|{f.get('param', '')}|{f.get('idor_type', '')}"
                     if dedup_key in self._idor_seen:
                         continue
@@ -1394,7 +1504,7 @@ Respond in JSON:
                         scan_id=self.context["scan_id"],
                         title=f.get("title", "IDOR vulnerability")[:500],
                         vuln_type=VulnType.AUTH_BYPASS,
-                        severity=severity_map.get(f.get("severity", "high"), SevEnum.HIGH),
+                        severity=severity_map.get(f.get("severity", "high"), Severity.HIGH),
                         url=f.get("url", "")[:2000],
                         parameter=f.get("param"),
                         method=f.get("method", "GET"),
@@ -1404,15 +1514,13 @@ Respond in JSON:
                         payload_used=f.get("payload", f.get("tampered_value")),
                         request_data=proof.get("request"),
                         response_data=proof.get("response"),
-                        ai_confidence=0.9,  # Proven by brute-force
+                        ai_confidence=0.9,
                     )
-                    db.add(vuln)
-                    idor_saved += 1
+                    result = await self._save_vuln_deduped(db, vuln)
+                    if result:
+                        idor_saved += 1
                     t = f.get("idor_type", "unknown")
                     idor_types[t] = idor_types.get(t, 0) + 1
-
-                if idor_saved > 0:
-                    await db.flush()
                 await self.log(
                     db, "exploit",
                     f"Smart IDOR: {idor_saved} proven findings ({idor_types})",
@@ -1525,7 +1633,6 @@ Respond in JSON:
         if self.context.get("vulnerabilities"):
             try:
                 from app.modules.attack_chain import AttackChainModule, select_chains
-                from app.models.vulnerability import Vulnerability, Severity, VulnType
 
                 chain_mod = AttackChainModule()
                 chain_results = await chain_mod.run_chains(self.context)
@@ -1603,13 +1710,9 @@ Respond in JSON:
                                 "evidence": chain.get("evidence", []),
                             },
                         )
-                        db.add(vuln)
-                        chains_saved += 1
-                        if scan_obj:
-                            scan_obj.vulns_found = (scan_obj.vulns_found or 0) + 1
-
-                    if chains_saved:
-                        await db.flush()
+                        result = await self._save_vuln_deduped(db, vuln, scan=scan_obj)
+                        if result:
+                            chains_saved += 1
 
                     succeeded = sum(
                         1 for c in chain_results if c.get("verified")
@@ -1637,8 +1740,7 @@ Respond in JSON:
             prover = AccessControlProver(self.context)
             ac_findings = await prover.prove_all(self.context.get("endpoints", []), db)
 
-            from app.models.vulnerability import Vulnerability, Severity as SevEnum, VulnType
-            severity_map = {"critical": SevEnum.CRITICAL, "high": SevEnum.HIGH, "medium": SevEnum.MEDIUM, "low": SevEnum.LOW}
+            severity_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH, "medium": Severity.MEDIUM, "low": Severity.LOW}
 
             for finding in ac_findings:
                 vuln = Vulnerability(
@@ -1646,7 +1748,7 @@ Respond in JSON:
                     scan_id=self.context["scan_id"],
                     title=finding["title"][:500],
                     vuln_type=VulnType.AUTH_BYPASS,
-                    severity=severity_map.get(finding.get("severity", "high"), SevEnum.HIGH),
+                    severity=severity_map.get(finding.get("severity", "high"), Severity.HIGH),
                     url=finding.get("url", "")[:2000],
                     parameter=finding.get("param"),
                     method=finding.get("method", "GET"),
@@ -1656,11 +1758,8 @@ Respond in JSON:
                     payload_used=finding.get("payload_used"),
                     request_data=finding.get("proof", {}).get("request"),
                     response_data=finding.get("proof", {}).get("response"),
-                    evidence=json.dumps(finding.get("proof", {}))[:10000] if finding.get("proof") else None,
                 )
-                db.add(vuln)
-            if ac_findings:
-                await db.flush()
+                await self._save_vuln_deduped(db, vuln)
 
             await self.log(db, "exploit", f"Access control prover: {len(ac_findings)} proven vulnerabilities")
         except Exception as e:
@@ -1675,7 +1774,6 @@ Respond in JSON:
 
                 oob_results = await check_oob_results(self.scan_id, db)
                 if oob_results:
-                    from app.models.vulnerability import Vulnerability, Severity, VulnType
                     scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
                     scan_obj = scan_result.scalar_one_or_none()
                     sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
@@ -1698,12 +1796,7 @@ Respond in JSON:
                             description=oob_vuln.get("description", ""),
                             ai_confidence=oob_vuln.get("ai_confidence", 0.95),
                         )
-                        db.add(vuln)
-                        self.context.setdefault("vulnerabilities", []).append(oob_vuln)
-                        if scan_obj:
-                            scan_obj.vulns_found = (scan_obj.vulns_found or 0) + 1
-
-                    await db.flush()
+                        await self._save_vuln_deduped(db, vuln, scan=scan_obj, track_context=True, finding_dict=oob_vuln)
                     await self.log(db, "exploit",
                         f"OOB: confirmed {len(oob_results)} blind vulnerabilities via callbacks!", "success")
                 else:
@@ -1727,12 +1820,12 @@ Respond in JSON:
         if findings:
             findings = await self._filter_false_positives(findings, db, "sensitive_files")
         if findings:
-            from app.models.vulnerability import Vulnerability, Severity, VulnType
             scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
             scan = scan_result.scalar_one_or_none()
             sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                        "medium": Severity.MEDIUM, "low": Severity.LOW}
 
+            saved = 0
             for f in findings:
                 vuln = Vulnerability(
                     target_id=self.context["target_id"],
@@ -1747,14 +1840,12 @@ Respond in JSON:
                     remediation=f.get("remediation"),
                     ai_confidence=0.9,
                 )
-                db.add(vuln)
-                self.context.setdefault("vulnerabilities", []).append(f)
-                if scan:
-                    scan.vulns_found = (scan.vulns_found or 0) + 1
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
 
-            await db.flush()
             await self.log(db, "sensitive_files",
-                f"Found {len(findings)} exposed sensitive files/configs", "warning")
+                f"Found {len(findings)} sensitive files ({saved} new, {len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "sensitive_files", "No exposed sensitive files found")
 
@@ -1768,15 +1859,14 @@ Respond in JSON:
             findings = await self._filter_false_positives(findings, db, "service_attack")
         if findings:
             # Service attack findings are confirmed vulns — add directly
-            from app.models.vulnerability import Vulnerability, Severity, VulnType
             scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
             scan = scan_result.scalar_one_or_none()
+            sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                       "medium": Severity.MEDIUM, "low": Severity.LOW}
+            vt_map = {v.value: v for v in VulnType}
 
+            saved = 0
             for f in findings:
-                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
-                           "medium": Severity.MEDIUM, "low": Severity.LOW}
-                vt_map = {v.value: v for v in VulnType}
-
                 vuln = Vulnerability(
                     target_id=self.context["target_id"],
                     scan_id=self.context["scan_id"],
@@ -1790,14 +1880,12 @@ Respond in JSON:
                     remediation=f.get("remediation"),
                     ai_confidence=0.95,
                 )
-                db.add(vuln)
-                self.context.setdefault("vulnerabilities", []).append(f)
-                if scan:
-                    scan.vulns_found = (scan.vulns_found or 0) + 1
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
 
-            await db.flush()
             await self.log(db, "service_attack",
-                f"Service attacks found {len(findings)} vulnerabilities", "warning")
+                f"Service attacks found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "service_attack", "No service vulnerabilities found")
 
@@ -1810,14 +1898,14 @@ Respond in JSON:
         if findings:
             findings = await self._filter_false_positives(findings, db, "auth_attack")
         if findings:
-            from app.models.vulnerability import Vulnerability, Severity, VulnType
             scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
             scan = scan_result.scalar_one_or_none()
-
             vt_map = {v.value: v for v in VulnType}
+            sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                       "medium": Severity.MEDIUM, "low": Severity.LOW}
+
+            saved = 0
             for f in findings:
-                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
-                           "medium": Severity.MEDIUM, "low": Severity.LOW}
                 vuln = Vulnerability(
                     target_id=self.context["target_id"],
                     scan_id=self.context["scan_id"],
@@ -1831,14 +1919,12 @@ Respond in JSON:
                     remediation=f.get("remediation"),
                     ai_confidence=0.9,
                 )
-                db.add(vuln)
-                self.context.setdefault("vulnerabilities", []).append(f)
-                if scan:
-                    scan.vulns_found = (scan.vulns_found or 0) + 1
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
 
-            await db.flush()
             await self.log(db, "auth_attack",
-                f"Auth attacks found {len(findings)} vulnerabilities", "warning")
+                f"Auth attacks found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "auth_attack", "No auth vulnerabilities found")
 
@@ -1855,13 +1941,13 @@ Respond in JSON:
         if findings:
             findings = await self._filter_false_positives(findings, db, "stress_test")
         if findings:
-            from app.models.vulnerability import Vulnerability, Severity, VulnType
             scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
             scan = scan_result.scalar_one_or_none()
             vt_map = {v.value: v for v in VulnType}
             sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                        "medium": Severity.MEDIUM, "low": Severity.LOW}
 
+            saved = 0
             for f in findings:
                 vuln = Vulnerability(
                     target_id=self.context["target_id"],
@@ -1876,14 +1962,12 @@ Respond in JSON:
                     remediation=f.get("remediation"),
                     ai_confidence=0.85,
                 )
-                db.add(vuln)
-                self.context.setdefault("vulnerabilities", []).append(f)
-                if scan:
-                    scan.vulns_found = (scan.vulns_found or 0) + 1
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
 
-            await db.flush()
             await self.log(db, "stress_test",
-                f"Resilience testing found {len(findings)} issues", "warning")
+                f"Resilience testing found {saved} new issues ({len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "stress_test", "Server passed resilience tests")
 
@@ -1895,7 +1979,6 @@ Respond in JSON:
             return
 
         from app.ai.claude_collab import ClaudeCollaboration
-        from app.models.vulnerability import Vulnerability, Severity, VulnType
 
         collab = ClaudeCollaboration()
         await self.log(db, "claude_collab",
@@ -1905,7 +1988,6 @@ Respond in JSON:
         try:
             from app.core.knowledge import KnowledgeBase
             from app.models.knowledge import KnowledgePattern
-            from sqlalchemy import select, and_
 
             kb = KnowledgeBase()
             techs = list((self.context.get("technologies") or {}).get("summary", {}).keys())
@@ -1987,7 +2069,6 @@ Respond in JSON:
             "success" if findings else "info")
 
         # Mapping helpers for Claude finding fields → our enums
-        _VULN_TYPE_MAP = {v.value: v for v in VulnType}
         _SEVERITY_MAP = {v.value: v for v in Severity}
 
         # Add any new findings from Claude collaboration
@@ -2005,8 +2086,8 @@ Respond in JSON:
                     "warning")
 
                 # --- Map vuln_type ---
-                raw_type = str(f.get("type", f.get("vuln_type", ""))).lower().strip()
-                vuln_type = _VULN_TYPE_MAP.get(raw_type, VulnType.INFO_DISCLOSURE)
+                raw_type = str(f.get("type", f.get("vuln_type", ""))).lower().strip().replace(" ", "_").replace("-", "_")
+                vuln_type = VULN_TYPE_ALIASES.get(raw_type, VulnType.INFO_DISCLOSURE)
 
                 # --- Map severity ---
                 raw_sev = str(f.get("severity", "medium")).lower().strip()
@@ -2040,22 +2121,18 @@ Respond in JSON:
                     ai_confidence=0.7,
                     ai_analysis=json.dumps(f, default=str),
                 )
-                db.add(vuln)
-                await db.flush()
-
-                # Track in context so final count is correct
-                self.context.setdefault("vulnerabilities", []).append({
-                    "id": vuln.id,
+                finding_dict = {
                     "vuln_type": vuln_type.value,
                     "severity": severity.value,
                     "url": url,
                     "title": title,
                     "source": "claude_collab",
-                })
-
-                # Increment live counter
-                if scan:
-                    scan.vulns_found = (scan.vulns_found or 0) + 1
+                }
+                saved = await self._save_vuln_deduped(
+                    db, vuln, scan=scan, track_context=True, finding_dict=finding_dict,
+                )
+                if saved:
+                    finding_dict["id"] = saved.id
 
                 # Publish WebSocket event per finding
                 await self._publish({
@@ -2080,8 +2157,7 @@ Respond in JSON:
         - LFI: read sensitive files
         - IDOR: access multiple users' data
         """
-        from sqlalchemy import select
-        from app.models.vulnerability import Vulnerability
+
 
         # Get all vulns for this scan that haven't been confirmed yet
         result = await db.execute(
@@ -2157,7 +2233,6 @@ Respond in JSON:
         """Send notifications for critical/high severity vulnerabilities found in this scan."""
         try:
             from app.core.notifications import notify_critical_vuln, get_notification_settings
-            from app.models.vulnerability import Vulnerability, Severity
 
             settings = get_notification_settings()
             if not settings.get("enabled_channels"):
