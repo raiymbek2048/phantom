@@ -495,13 +495,20 @@ class ScanPipeline:
                     # Notify for critical/high vulns found
                     await self._notify_critical_vulns(db, target)
 
-                    # Learn from classic scans too
+                    # Learn from scan results
                     try:
                         from app.core.knowledge import KnowledgeBase
                         kb = KnowledgeBase()
                         await kb.learn_from_scan(db, self.scan_id)
                     except Exception as e:
                         logger.warning(f"Knowledge learning failed: {e}")
+
+                    # Deep scan feedback analysis (tech-vuln correlations, strategy learning)
+                    try:
+                        from app.core.live_feeds import analyze_scan_feedback
+                        await analyze_scan_feedback(db, max_scans=1)
+                    except Exception as e:
+                        logger.debug(f"Scan feedback analysis failed (non-fatal): {e}")
 
             except Exception as e:
                 scan.status = ScanStatus.FAILED
