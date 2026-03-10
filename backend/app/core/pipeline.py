@@ -1285,6 +1285,8 @@ Respond in JSON:
                 saved = 0
                 for f in sec_findings:
                     sev = severity_map.get(f.get("severity", "info"), Severity.INFO)
+                    if sev == Severity.INFO:
+                        continue  # Skip info-level findings — they're noise
                     vt = vt_map.get(f.get("vuln_type", "misconfiguration"), VulnType.MISCONFIGURATION)
                     vuln = Vulnerability(
                         target_id=self.context["target_id"],

