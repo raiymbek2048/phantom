@@ -33,8 +33,8 @@ phantom/
 └── sync-claude-token.sh
 ```
 
-## 19-Phase Scan Pipeline
-recon → subdomain → portscan → fingerprint → **attack_routing** → endpoint → **sensitive_files** → vuln_scan → nuclei → ai_analysis → payload_gen → waf → exploit → **service_attack** → **auth_attack** → **stress_test** → claude_collab → evidence → report
+## 20-Phase Scan Pipeline
+recon → subdomain → portscan → fingerprint → **attack_routing** → endpoint → **sensitive_files** → vuln_scan → nuclei → ai_analysis → payload_gen → waf → exploit → **service_attack** → **auth_attack** → **stress_test** → **vuln_confirm** → claude_collab → evidence → report
 
 ## Key Development Rules
 1. **VulnType enum**: Always use `.value` for string comparison. Values: `xss`, `sqli`, `ssrf`, `info_disclosure`, `auth_bypass`, `misconfiguration` (NOT "misconfig" or "broken_auth")
@@ -45,6 +45,11 @@ recon → subdomain → portscan → fingerprint → **attack_routing** → endp
 6. **Route ordering**: Static routes (`/export`, `/lifecycle`) BEFORE dynamic `/{id}` in FastAPI
 7. **Pipeline findings**: New attack modules save findings directly as Vulnerability DB records (not to scan_results list)
 8. **Docker**: Rebuild with `docker compose build backend celery_worker frontend`, then `docker compose up -d`, then `docker compose restart nginx`
+
+## CI/CD
+- **GitHub Actions** + self-hosted runner on VM (10.99.7.53)
+- Push to `main` → auto build + deploy
+- Runner label: `phantom`
 
 ## How to Run
 ```bash
