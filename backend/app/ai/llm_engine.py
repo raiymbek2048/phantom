@@ -56,15 +56,18 @@ class LLMEngine:
         }
 
     def _refresh_key(self):
-        """Re-read API key from Redis/env (used on 401 retry)."""
+        """Re-read API key from Redis/env (used on 401 retry).
+        Always re-reads; returns True if a new key was found."""
         from app.ai.get_claude_key import get_claude_api_key
         new_key = get_claude_api_key() or settings.anthropic_api_key
         if new_key and new_key != self.claude_api_key:
-            logger.info("LLM key refreshed from Redis")
+            logger.info("LLM key refreshed from Redis (%s...)", new_key[:20])
             self.claude_api_key = new_key
             self._is_oauth = self._detect_oauth()
             self._provider = None  # force re-detect
             return True
+        # Even if key unchanged, reset provider cache so next detect re-probes
+        self._provider = None
         return False
 
     @property
