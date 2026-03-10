@@ -1091,8 +1091,11 @@ async def fetch_live_hacktivity(
 # Feed 5: Scan Feedback Analysis
 # ---------------------------------------------------------------------------
 
-async def analyze_scan_feedback(db: AsyncSession) -> dict:
+async def analyze_scan_feedback(db: AsyncSession, max_scans: int = 0) -> dict:
     """Analyze completed scans to learn what works and what doesn't.
+
+    Args:
+        max_scans: Limit number of scans to analyze (0 = unlimited).
 
     Returns: {fetched, created, skipped, updated, errors}
     """
@@ -1116,9 +1119,10 @@ async def analyze_scan_feedback(db: AsyncSession) -> dict:
         Scan.completed_at > last_date,
     ]
 
-    result = await db.execute(
-        select(Scan).where(and_(*conditions)).order_by(Scan.completed_at.asc())
-    )
+    query = select(Scan).where(and_(*conditions)).order_by(Scan.completed_at.asc())
+    if max_scans > 0:
+        query = query.limit(max_scans)
+    result = await db.execute(query)
     scans = result.scalars().all()
 
     if not scans:
