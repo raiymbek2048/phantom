@@ -1371,7 +1371,7 @@ def _extract_payloads_from_markdown(content: str, max_payloads: int = 150) -> li
 
 
 async def fetch_payloads_all_the_things(
-    db: AsyncSession, max_sources: int = 30
+    db: AsyncSession, max_sources: int = 50
 ) -> dict:
     """Fetch payloads from PayloadsAllTheThings GitHub repo and inject into KB.
 
