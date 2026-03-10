@@ -431,17 +431,32 @@ function CommandCenter() {
               </div>
             ))}
           </div>
+          {status?.avg_confidence != null && (
+            <div className="mt-3 pt-2 border-t border-gray-800 flex items-center justify-between">
+              <span className="text-xs text-gray-500">KB Confidence</span>
+              <span className={cn("text-sm font-mono", status.avg_confidence > 0.6 ? "text-green-400" : status.avg_confidence > 0.4 ? "text-yellow-400" : "text-red-400")}>
+                {(status.avg_confidence * 100).toFixed(1)}%
+              </span>
+            </div>
+          )}
           {status?.pattern_types && Object.keys(status.pattern_types).length > 0 && (
-            <div className="mt-3 pt-2 border-t border-gray-800">
+            <div className="mt-2 pt-2 border-t border-gray-800">
               <p className="text-xs text-gray-600 mb-1.5">Pattern Types</p>
               {Object.entries(status.pattern_types)
                 .filter(([k]) => k !== "training_session")
-                .map(([type, count]) => (
-                  <div key={type} className="flex justify-between text-xs py-0.5">
-                    <span className="text-gray-500">{type.replace(/_/g, " ")}</span>
-                    <span className="text-gray-400">{count as number}</span>
-                  </div>
-                ))}
+                .sort(([,a]: any, [,b]: any) => (b?.count || b) - (a?.count || a))
+                .map(([type, data]: [string, any]) => {
+                  const count = typeof data === "object" ? data.count : data;
+                  const conf = typeof data === "object" ? data.avg_confidence : null;
+                  return (
+                    <div key={type} className="flex justify-between text-xs py-0.5">
+                      <span className="text-gray-500">{type.replace(/_/g, " ")}</span>
+                      <span className="text-gray-400">
+                        {count}{conf != null && <span className={cn("ml-1.5", conf > 0.7 ? "text-green-500/60" : conf > 0.4 ? "text-yellow-500/60" : "text-red-500/60")}>({(conf * 100).toFixed(0)}%)</span>}
+                      </span>
+                    </div>
+                  );
+                })}
             </div>
           )}
         </div>

@@ -89,15 +89,20 @@ async def training_status(
         select(func.count(KnowledgePattern.id))
     )).scalar() or 0
 
+    avg_confidence = (await db.execute(
+        select(func.avg(KnowledgePattern.confidence))
+    )).scalar() or 0
+
     pattern_types = {}
     type_result = await db.execute(
         select(
             KnowledgePattern.pattern_type,
             func.count(KnowledgePattern.id),
+            func.avg(KnowledgePattern.confidence),
         ).group_by(KnowledgePattern.pattern_type)
     )
-    for pt, count in type_result.all():
-        pattern_types[pt] = count
+    for pt, count, avg_conf in type_result.all():
+        pattern_types[pt] = {"count": count, "avg_confidence": round(float(avg_conf or 0), 3)}
 
     # Last training session
     last_session = (await db.execute(
@@ -118,6 +123,7 @@ async def training_status(
         "training_active": _training_state["active"],
         "started_at": _training_state["started_at"],
         "total_patterns": total_patterns,
+        "avg_confidence": round(float(avg_confidence), 3),
         "pattern_types": pattern_types,
         "last_training": last_training,
     }
