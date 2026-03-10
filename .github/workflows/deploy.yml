@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  DEPLOY_DIR: /mnt/docker/phantom
+
 jobs:
   deploy:
     runs-on: self-hosted
@@ -14,14 +17,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Sync to deploy directory
+        run: |
+          rsync -a --delete \
+            --exclude='.env' \
+            --exclude='results/' \
+            --exclude='node_modules/' \
+            --exclude='.next/' \
+            --exclude='__pycache__/' \
+            ${{ github.workspace }}/ $DEPLOY_DIR/
+
       - name: Build Docker images
         run: |
-          cd ${{ github.workspace }}
+          cd $DEPLOY_DIR
           docker compose build backend celery_worker frontend
 
       - name: Deploy
         run: |
-          cd ${{ github.workspace }}
+          cd $DEPLOY_DIR
           docker compose up -d
           docker compose restart nginx
 
@@ -38,6 +51,7 @@ jobs:
       - name: Show status
         if: always()
         run: |
+          cd $DEPLOY_DIR
           docker compose ps
           echo "---"
           docker compose logs --tail 5 backend celery_worker 2>&1 | tail -20
