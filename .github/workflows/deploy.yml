@@ -1,0 +1,43 @@
+name: Deploy PHANTOM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker images
+        run: |
+          cd ${{ github.workspace }}
+          docker compose build backend celery_worker frontend
+
+      - name: Deploy
+        run: |
+          cd ${{ github.workspace }}
+          docker compose up -d
+          docker compose restart nginx
+
+      - name: Health check
+        run: |
+          sleep 10
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/api/health || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "Deploy OK - API responding"
+          else
+            echo "WARNING: API returned $STATUS (may still be starting)"
+          fi
+
+      - name: Show status
+        if: always()
+        run: |
+          docker compose ps
+          echo "---"
+          docker compose logs --tail 5 backend celery_worker 2>&1 | tail -20

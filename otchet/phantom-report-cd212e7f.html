@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PHANTOM Report - emgekcontrol.minjust.gov.kg</title>
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --card: #12121a;
+            --border: #1e1e2e;
+            --text: #e4e4e7;
+            --muted: #71717a;
+            --accent: #8b5cf6;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 40px;
+        }
+        .header {
+            text-align: center;
+            padding: 40px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 40px;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #8b5cf6, #06b6d4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+        .subtitle { color: var(--muted); font-size: 1.1rem; }
+        .section {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            margin-bottom: 24px;
+        }
+        .section h2 {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            color: var(--accent);
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        .summary-card {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .summary-label { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        .summary-value { font-size: 1.3rem; font-weight: 600; margin-top: 4px; }
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: white;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .vuln-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+        }
+        .vuln-table th {
+            background: var(--bg);
+            padding: 12px;
+            text-align: left;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+        }
+        .vuln-table td {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+        .vuln-table a { color: var(--accent); text-decoration: none; }
+        .vuln-table a:hover { text-decoration: underline; }
+        .vuln-detail {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+        .vuln-detail h3 {
+            font-size: 1.2rem;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .vuln-detail h4 {
+            font-size: 1rem;
+            color: var(--accent);
+            margin: 16px 0 8px;
+        }
+        .detail-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .detail-table td {
+            padding: 6px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+        .detail-table td:first-child { width: 140px; color: var(--muted); }
+        code {
+            background: rgba(139, 92, 246, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            word-break: break-all;
+        }
+        .code-block {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            margin: 8px 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+        }
+        .code-block pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin-top: 8px;
+            color: var(--muted);
+        }
+        .footer {
+            text-align: center;
+            padding: 32px 0;
+            color: var(--muted);
+            border-top: 1px solid var(--border);
+            margin-top: 40px;
+        }
+        .disclaimer { font-size: 0.8rem; margin-top: 8px; font-style: italic; }
+        @media print {
+            body { background: white; color: #1a1a1a; padding: 20px; }
+            .section { border-color: #e5e5e5; }
+            .header h1 { background: none; -webkit-text-fill-color: #8b5cf6; }
+            .vuln-detail { background: #f9f9f9; }
+            code { background: #f3f4f6; }
+            .code-block { background: #f9f9f9; border-color: #e5e5e5; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>PHANTOM Security Assessment Report</h1>
+        <p class="subtitle">Automated Penetration Test Results</p>
+    </div>
+
+    <div class="section">
+        <h2>Executive Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-label">Target</div>
+                <div class="summary-value">emgekcontrol.minjust.gov.kg</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Scan Date</div>
+                <div class="summary-value">2026-03-08 16:28</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Duration</div>
+                <div class="summary-value">6 min</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Risk Score</div>
+                <div class="summary-value" style="color:#dc2626">91/100 (Critical)</div>
+            </div>
+        </div>
+        <div style="margin-top:16px">
+            <strong>Findings:</strong> 11 vulnerabilities &mdash; <span class="badge" style="background:#ea580c">HIGH: 2</span> <span class="badge" style="background:#d97706">MEDIUM: 4</span> <span class="badge" style="background:#2563eb">LOW: 3</span> <span class="badge" style="background:#6b7280">INFO: 2</span> 
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Vulnerability Summary</h2>
+        <table class="vuln-table">
+            <thead>
+                <tr>
+                    <th>Severity</th>
+                    <th>Type</th>
+                    <th>Title</th>
+                    <th>URL</th>
+                    <th>Method</th>
+                </tr>
+            </thead>
+            <tbody>
+        <tr>
+            <td><span class="badge" style="background:#ea580c">HIGH</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-1">CSP: unsafe-inline in script-src</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#ea580c">HIGH</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-2">CSP: unsafe-eval in script-src</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#d97706">MEDIUM</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-3">Server errors under moderate load: https://emgekcontrol.minjust.gov.kg</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#d97706">MEDIUM</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-4">Server errors under moderate load: https://emgekcontrol.minjust.gov.kg/manifest.json</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg/manifest.json</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#d97706">MEDIUM</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-5">Server errors under moderate load: https://emgekcontrol.minjust.gov.kg</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#d97706">MEDIUM</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-6">Vulnerable to slow HTTP attacks (Slowloris-style)</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#2563eb">LOW</span></td>
+            <td>info_disclosure</td>
+            <td><a href="#vuln-7">Exposed password in JavaScript (Profile--5C8OO2l.js)</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#2563eb">LOW</span></td>
+            <td>info_disclosure</td>
+            <td><a href="#vuln-8">Exposed password in JavaScript (Users-C0RfXRPA.js)</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#2563eb">LOW</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-9">CSP: unsafe-inline in style-src</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#6b7280">INFO</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-10">Missing Cross-Origin-Opener-Policy</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr>
+        <tr>
+            <td><span class="badge" style="background:#6b7280">INFO</span></td>
+            <td>misconfiguration</td>
+            <td><a href="#vuln-11">Missing Cross-Origin-Embedder-Policy</a></td>
+            <td><code>https://emgekcontrol.minjust.gov.kg</code></td>
+            <td>GET</td>
+        </tr></tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>Detailed Findings</h2>
+        
+        <div class="vuln-detail" id="vuln-1">
+            <h3><span class="badge" style="background:#ea580c">HIGH</span> CSP: unsafe-inline in script-src</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Allows inline <script> tags and event handlers to execute. Attackers can inject XSS payloads that run despite CSP.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self';</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Remove 'unsafe-inline' from script-src. Use nonces (script-src 'nonce-<random>') or hashes for inline scripts.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-2">
+            <h3><span class="badge" style="background:#ea580c">HIGH</span> CSP: unsafe-eval in script-src</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Allows eval(), Function(), and setTimeout(string) execution. Attackers can compile and run arbitrary code.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self';</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Remove 'unsafe-eval'. Refactor code to avoid eval(). Use strict CSP with nonces.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-3">
+            <h3><span class="badge" style="background:#d97706">MEDIUM</span> Server errors under moderate load: https://emgekcontrol.minjust.gov.kg</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>0.85</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Server returned 48 errors out of 50 concurrent requests. The server may have stability issues under load.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>48/50 requests returned 5xx errors</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Improve server capacity, add connection pooling, and implement graceful degradation.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-4">
+            <h3><span class="badge" style="background:#d97706">MEDIUM</span> Server errors under moderate load: https://emgekcontrol.minjust.gov.kg/manifest.json</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg/manifest.json</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>0.85</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Server returned 43 errors out of 50 concurrent requests. The server may have stability issues under load.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>43/50 requests returned 5xx errors</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Improve server capacity, add connection pooling, and implement graceful degradation.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-5">
+            <h3><span class="badge" style="background:#d97706">MEDIUM</span> Server errors under moderate load: https://emgekcontrol.minjust.gov.kg</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>0.85</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Server returned 39 errors out of 50 concurrent requests. The server may have stability issues under load.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>39/50 requests returned 5xx errors</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Improve server capacity, add connection pooling, and implement graceful degradation.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-6">
+            <h3><span class="badge" style="background:#d97706">MEDIUM</span> Vulnerable to slow HTTP attacks (Slowloris-style)</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>0.85</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Server kept 20 slow/incomplete connections alive for the full test duration. An attacker could exhaust connection pool with many slow connections, causing denial of service.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>Held 20/20 slow connections for full 10s</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Configure timeouts: client_header_timeout (nginx), RequestReadTimeout (Apache). Use a reverse proxy with connection timeout enforcement. Consider mod_reqtimeout or nginx limit_conn.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-7">
+            <h3><span class="badge" style="background:#2563eb">LOW</span> Exposed password in JavaScript (Profile--5C8OO2l.js)</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>info_disclosure</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>A potential password was found in client-side JavaScript file 'Profile--5C8OO2l.js'. Prefix: ,y),i.er.... Client-side secrets can be extracted by anyone viewing the page source.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>N/A</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Move secrets to server-side configuration. Use environment variables or a secrets manager.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-8">
+            <h3><span class="badge" style="background:#2563eb">LOW</span> Exposed password in JavaScript (Users-C0RfXRPA.js)</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>info_disclosure</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>A potential password was found in client-side JavaScript file 'Users-C0RfXRPA.js'. Prefix: ,a);cons.... Client-side secrets can be extracted by anyone viewing the page source.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>N/A</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Move secrets to server-side configuration. Use environment variables or a secrets manager.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-9">
+            <h3><span class="badge" style="background:#2563eb">LOW</span> CSP: unsafe-inline in style-src</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Allows inline styles. While less dangerous than script-src unsafe-inline, it can enable CSS-based data exfiltration attacks.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self';</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Remove 'unsafe-inline' from style-src. Use nonces or hashes for inline styles.</p>
+        </div>
+        <div class="vuln-detail" id="vuln-10">
+            <h3><span class="badge" style="background:#6b7280">INFO</span> Missing Cross-Origin-Opener-Policy</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Without COOP, the page shares a browsing context group with cross-origin popups, potentially allowing Spectre-type side-channel attacks.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>N/A</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Add Cross-Origin-Opener-Policy: same-origin</p>
+        </div>
+        <div class="vuln-detail" id="vuln-11">
+            <h3><span class="badge" style="background:#6b7280">INFO</span> Missing Cross-Origin-Embedder-Policy</h3>
+            <table class="detail-table">
+                <tr><td><strong>Type</strong></td><td>misconfiguration</td></tr>
+                <tr><td><strong>URL</strong></td><td><code>https://emgekcontrol.minjust.gov.kg</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>N/A</code></td></tr>
+                <tr><td><strong>Method</strong></td><td>GET</td></tr>
+                <tr><td><strong>Confidence</strong></td><td>N/A</td></tr>
+            </table>
+            <h4>Description</h4>
+            <p>Without COEP, the page cannot use SharedArrayBuffer and high-resolution timers, and is not fully isolated from cross-origin resources.</p>
+            <h4>Proof of Concept</h4>
+            <div class="code-block"><strong>Payload:</strong> <code>N/A</code></div>
+            
+            
+            <h4>Remediation</h4>
+            <p>Add Cross-Origin-Embedder-Policy: require-corp</p>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Generated by <strong>PHANTOM</strong> AI Pentester &mdash; 2026-03-08 16:35 UTC</p>
+        <p class="disclaimer">This report is confidential. Unauthorized distribution is prohibited.</p>
+    </div>
+    
+</body>
+</html>

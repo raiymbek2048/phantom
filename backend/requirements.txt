@@ -1,0 +1,51 @@
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+python-multipart>=0.0.18
+
+# Database
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+alembic>=1.14.0
+
+# Redis & Celery
+redis>=5.2.0
+celery[redis]>=5.4.0
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.0.0
+pydantic[email]>=2.10.0
+pydantic-settings>=2.7.0
+
+# AI
+anthropic>=0.40.0
+httpx>=0.28.0
+
+# Security Tools Python Wrappers
+python-nmap>=0.7.1
+paramiko>=3.4.0
+asyncssh>=2.17.0
+
+# Headless Browser
+playwright>=1.49.0
+
+# Utilities
+aiofiles>=24.1.0
+jinja2>=3.1.5
+python-dotenv>=1.0.1
+pyyaml>=6.0.2
+beautifulsoup4>=4.12.3
+
+# WebSocket
+websockets>=14.1
+
+# OOB Callback Server
+aiohttp>=3.9.0
+
+# Report Generation
+markdown>=3.7
+weasyprint>=62.0
+
+# Logging
+structlog>=24.4.0
