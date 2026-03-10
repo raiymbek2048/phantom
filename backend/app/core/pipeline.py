@@ -181,10 +181,12 @@ class ScanPipeline:
             return None  # Duplicate — skip
 
         # Sanitize: AI sometimes returns list instead of str for text fields
-        for attr in ("remediation", "description", "impact", "payload_used", "ai_analysis"):
+        for attr in ("remediation", "description", "impact", "payload_used", "ai_analysis", "title"):
             val = getattr(vuln, attr, None)
             if isinstance(val, list):
                 setattr(vuln, attr, "\n".join(str(v) for v in val))
+            elif isinstance(val, dict):
+                setattr(vuln, attr, json.dumps(val, default=str))
 
         db.add(vuln)
         await db.flush()
