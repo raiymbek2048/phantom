@@ -63,10 +63,10 @@ class KnowledgeBase:
         }
 
     async def get_effective_payloads(self, db: AsyncSession, vuln_type: str, technology: str = None) -> list[dict]:
-        """Get payloads that have historically been effective."""
+        """Get payloads that have historically been effective (from PATT, nuclei, scans)."""
         query = select(KnowledgePattern).where(
             and_(
-                KnowledgePattern.pattern_type == "effective_payload",
+                KnowledgePattern.pattern_type.in_(["effective_payload", "nuclei_live"]),
                 KnowledgePattern.vuln_type == vuln_type,
                 KnowledgePattern.confidence > 0.4,
             )

@@ -1,7 +1,11 @@
+import logging
+
 from celery import Celery
+from celery.signals import worker_ready
 from app.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "phantom",
@@ -47,6 +51,51 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_ready.connect
+def recover_stuck_scans(sender=None, **kwargs):
+    """On worker startup, recover scans stuck in RUNNING status (from previous crash/restart)."""
+    import asyncio
+
+    async def _recover():
+        from app.models.database import reset_engine
+        reset_engine()
+        from datetime import datetime
+        from sqlalchemy import select
+        from app.models.database import async_session
+        from app.models.scan import Scan, ScanStatus
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(Scan).where(Scan.status == ScanStatus.RUNNING)
+            )
+            stuck_scans = result.scalars().all()
+
+            if not stuck_scans:
+                logger.info("Scan recovery: no stuck scans found")
+                return
+
+            for scan in stuck_scans:
+                scan.status = ScanStatus.QUEUED
+                scan.current_phase = f"recovery (was: {scan.current_phase})"
+                logger.info(f"Scan recovery: requeueing scan {scan.id} (was at {scan.current_phase})")
+
+            await db.commit()
+            logger.info(f"Scan recovery: requeued {len(stuck_scans)} stuck scans")
+
+            # Re-dispatch each scan as a new celery task
+            for scan in stuck_scans:
+                run_scan_task.delay(scan.id)
+                logger.info(f"Scan recovery: dispatched scan {scan.id}")
+
+        from app.models.database import engine
+        await engine.dispose()
+
+    try:
+        asyncio.run(_recover())
+    except Exception as e:
+        logger.error(f"Scan recovery failed: {e}")
 
 
 @celery_app.task(bind=True, name="phantom.run_scan", soft_time_limit=None, time_limit=None)
@@ -111,7 +160,7 @@ def check_schedules_task():
 
                 run_scan_task.delay(scan.id)
 
-        # --- Detect and clean up stuck scans ---
+        # --- Detect and restart stuck scans (>2h without progress) ---
         try:
             stuck_cutoff = now - timedelta(hours=2)
             stuck_result = await db.execute(
@@ -122,12 +171,15 @@ def check_schedules_task():
             )
             stuck_scans = stuck_result.scalars().all()
             for stuck in stuck_scans:
-                stuck.status = ScanStatus.FAILED
-                stuck.completed_at = now
+                stuck.status = ScanStatus.QUEUED
+                stuck.current_phase = f"auto-restart (was: {stuck.current_phase})"
             if stuck_scans:
                 await db.commit()
-        except Exception:
-            pass
+                for stuck in stuck_scans:
+                    run_scan_task.delay(stuck.id)
+                logger.info(f"Auto-restarted {len(stuck_scans)} stuck scans (>2h)")
+        except Exception as e:
+            logger.debug(f"Stuck scan check failed: {e}")
 
         from app.models.database import engine
         await engine.dispose()

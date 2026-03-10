@@ -730,6 +730,8 @@ async def _process_nuclei_template(
     matchers = []
     headers = {}
 
+    payloads = []
+
     for req_block in template.get("http", template.get("requests", [])):
         if isinstance(req_block, dict):
             # Paths
@@ -749,6 +751,31 @@ async def _process_nuclei_template(
             hdrs = req_block.get("headers", {})
             if isinstance(hdrs, dict):
                 headers.update(hdrs)
+
+            # Body payloads
+            body = req_block.get("body", "")
+            if body and isinstance(body, str) and len(body) > 5:
+                payloads.append(body.strip())
+
+            # Raw requests — extract payload from raw HTTP
+            for raw in req_block.get("raw", []):
+                if isinstance(raw, str) and len(raw) > 10:
+                    # Extract body (after double newline)
+                    parts = raw.split("\n\n", 1)
+                    if len(parts) == 2 and len(parts[1].strip()) > 3:
+                        payloads.append(parts[1].strip())
+                    # Also extract path with injected payloads
+                    first_line = raw.strip().split("\n")[0]
+                    if " " in first_line:
+                        raw_path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else ""
+                        raw_path = re.sub(r'\{\{BaseURL\}\}', '', raw_path)
+                        if raw_path and any(c in raw_path for c in ["'", '"', "<", "{", "|", ".."]):
+                            payloads.append(raw_path)
+
+            # Payloads from fuzzing wordlists
+            for p in req_block.get("payloads", {}).values():
+                if isinstance(p, list):
+                    payloads.extend(str(v) for v in p[:20])
 
             # Matchers
             for matcher in req_block.get("matchers", []):
@@ -817,6 +844,11 @@ async def _process_nuclei_template(
         pattern_data["matchers"] = matchers[:20]
     if headers:
         pattern_data["headers"] = dict(list(headers.items())[:10])
+    if payloads:
+        # Deduplicate and store payloads for use by payload_gen
+        unique_payloads = list(dict.fromkeys(payloads))[:30]
+        pattern_data["payloads"] = unique_payloads
+        pattern_data["payload"] = unique_payloads[0]  # Primary payload for compat
 
     action = await _upsert_pattern(
         db,
