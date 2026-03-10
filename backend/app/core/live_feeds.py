@@ -1238,45 +1238,67 @@ async def analyze_scan_feedback(db: AsyncSession) -> dict:
 
 # Mapping of GitHub raw file paths → (vuln_type, technology)
 _PATT_SOURCES: list[tuple[str, str, str]] = [
-    # XSS
+    # XSS (Intruders/ — plural)
     ("XSS Injection/Intruders/IntrudersXSS.txt", "xss_reflected", "generic"),
+    ("XSS Injection/Intruders/JHADDIX_XSS.txt", "xss_reflected", "generic"),
+    ("XSS Injection/Intruders/BRUTELOGIC-XSS-JS.txt", "xss_reflected", "generic"),
+    ("XSS Injection/Intruders/XSS_Polyglots.txt", "xss_reflected", "generic"),
+    ("XSS Injection/Intruders/xss_payloads_quick.txt", "xss_reflected", "generic"),
     ("XSS Injection/1 - XSS Filter Bypass.md", "xss_reflected", "generic"),
-    ("XSS Injection/2 - XSS WAF Bypass.md", "xss_reflected", "generic"),
-    # SQLi
+    ("XSS Injection/3 - XSS Common WAF Bypass.md", "xss_reflected", "generic"),
+    # SQLi (Intruder/ — singular!)
     ("SQL Injection/MySQL Injection.md", "sqli", "mysql"),
     ("SQL Injection/PostgreSQL Injection.md", "sqli", "postgresql"),
     ("SQL Injection/MSSQL Injection.md", "sqli", "mssql"),
     ("SQL Injection/SQLite Injection.md", "sqli", "sqlite"),
-    ("SQL Injection/Intruders/Auth_Bypass.txt", "sqli", "generic"),
-    ("SQL Injection/Intruders/FUZZ_SQLi.txt", "sqli", "generic"),
-    # SSRF
-    ("Server Side Request Forgery/Intruders/SSRF.txt", "ssrf", "generic"),
+    ("SQL Injection/Intruder/Auth_Bypass.txt", "sqli", "generic"),
+    ("SQL Injection/Intruder/Generic_Fuzz.txt", "sqli", "generic"),
+    ("SQL Injection/Intruder/Generic_TimeBased.txt", "sqli", "generic"),
+    ("SQL Injection/Intruder/Generic_UnionSelect.txt", "sqli", "generic"),
+    ("SQL Injection/Intruder/Generic_ErrorBased.txt", "sqli", "generic"),
+    ("SQL Injection/Intruder/SQLi_Polyglots.txt", "sqli", "generic"),
+    # SSRF (no Intruders/ folder — use markdown)
     ("Server Side Request Forgery/README.md", "ssrf", "generic"),
-    # SSTI
-    ("Server Side Template Injection/Intruders/SST-Injection FuzzList.txt", "ssti", "generic"),
-    ("Server Side Template Injection/README.md", "ssti", "generic"),
-    # LFI
-    ("File Inclusion/Intruders/Traversals.txt", "lfi", "generic"),
-    ("File Inclusion/Intruders/LFI-LFD_Linux.txt", "lfi", "linux"),
-    ("File Inclusion/Intruders/LFI-LFD_Windows.txt", "lfi", "windows"),
-    # Command Injection
-    ("Command Injection/Intruders/CommandBlind-Linux.txt", "cmd_injection", "linux"),
-    ("Command Injection/Intruders/CommandBlind-Windows.txt", "cmd_injection", "windows"),
-    ("Command Injection/Intruders/FUZZ_CMD-Injectable.txt", "cmd_injection", "generic"),
-    # XXE
+    ("Server Side Request Forgery/SSRF-Cloud-Instances.md", "ssrf", "cloud"),
+    # SSTI (Intruder/ — singular!)
+    ("Server Side Template Injection/Intruder/ssti.fuzz", "ssti", "generic"),
+    ("Server Side Template Injection/Python.md", "ssti", "python"),
+    ("Server Side Template Injection/Java.md", "ssti", "java"),
+    ("Server Side Template Injection/PHP.md", "ssti", "php"),
+    ("Server Side Template Injection/JavaScript.md", "ssti", "node"),
+    # LFI (Intruders/ — plural)
+    ("File Inclusion/Intruders/JHADDIX_LFI.txt", "lfi", "generic"),
+    ("File Inclusion/Intruders/Linux-files.txt", "lfi", "linux"),
+    ("File Inclusion/Intruders/Windows-files.txt", "lfi", "windows"),
+    ("File Inclusion/Intruders/dot-slash-PathTraversal_and_LFI_pairing.txt", "lfi", "generic"),
+    ("File Inclusion/Intruders/List_Of_File_To_Include.txt", "lfi", "generic"),
+    # Command Injection (Intruder/ — singular!)
+    ("Command Injection/Intruder/command-execution-unix.txt", "cmd_injection", "linux"),
+    ("Command Injection/Intruder/command_exec.txt", "cmd_injection", "generic"),
+    ("Command Injection/README.md", "cmd_injection", "generic"),
+    # XXE (Intruders/ — plural)
     ("XXE Injection/Intruders/XXE_Fuzzing.txt", "xxe", "generic"),
-    # Open Redirect
-    ("Open Redirect/Intruders/OpenRedirectPayloads.txt", "open_redirect", "generic"),
-    # CSRF
-    ("CSRF Injection/Intruders/JsonCSRF.txt", "csrf", "generic"),
-    # Directory Traversal
-    ("Directory Traversal/Intruders/Traversals.txt", "path_traversal", "generic"),
+    ("XXE Injection/README.md", "xxe", "generic"),
+    # Open Redirect (Intruder/ — singular!)
+    ("Open Redirect/Intruder/Open-Redirect-payloads.txt", "open_redirect", "generic"),
+    ("Open Redirect/Intruder/openredirects.txt", "open_redirect", "generic"),
+    # CSRF (no Intruders folder)
+    ("Cross-Site Request Forgery/README.md", "csrf", "generic"),
+    # Directory Traversal (Intruder/ — singular!)
+    ("Directory Traversal/Intruder/deep_traversal.txt", "path_traversal", "generic"),
+    ("Directory Traversal/Intruder/directory_traversal.txt", "path_traversal", "generic"),
     # CORS
     ("CORS Misconfiguration/README.md", "cors_misconfiguration", "generic"),
     # JWT
     ("JSON Web Token/README.md", "jwt_vuln", "generic"),
     # Deserialization
     ("Insecure Deserialization/README.md", "deserialization", "generic"),
+    # NoSQL Injection
+    ("NoSQL Injection/README.md", "sqli", "mongodb"),
+    # GraphQL
+    ("GraphQL Injection/README.md", "misconfiguration", "graphql"),
+    # IDOR
+    ("Insecure Direct Object References/README.md", "idor", "generic"),
 ]
 
 _PATT_BASE_URL = "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/"
