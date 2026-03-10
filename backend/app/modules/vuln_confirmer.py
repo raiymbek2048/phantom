@@ -115,6 +115,33 @@ class VulnConfirmer:
 
         result = await confirmer(vuln, base_url)
 
+        # If initial confirmation failed, try KB-sourced payloads as retry
+        if not result.get("confirmed") and vuln.url and vuln_type in (
+            "xss_reflected", "xss_stored", "sqli", "ssti", "cmd_injection", "ssrf"
+        ):
+            try:
+                from app.core.knowledge import KnowledgeBase
+                kb = KnowledgeBase()
+                # Map confirmer vuln_type to KB vuln_type
+                kb_type = vuln_type.split("_")[0] if "_" in vuln_type else vuln_type
+                kb_payloads = await kb.get_effective_payloads(db, kb_type)
+                if kb_payloads:
+                    original_payload = vuln.payload_used
+                    for kp in kb_payloads[:5]:  # Try top 5 KB payloads
+                        alt_payload = kp.get("payload", "")
+                        if not alt_payload or alt_payload == original_payload:
+                            continue
+                        vuln.payload_used = alt_payload
+                        retry = await confirmer(vuln, base_url)
+                        if retry.get("confirmed"):
+                            result = retry
+                            result["method"] = f"KB retry ({result.get('method', '')})"
+                            break
+                    if not result.get("confirmed"):
+                        vuln.payload_used = original_payload  # Restore original
+            except Exception as e:
+                logger.debug(f"KB retry failed for {vuln.id}: {e}")
+
         if result.get("confirmed"):
             # Update vulnerability with confirmation proof
             response_data = vuln.response_data or {}
@@ -146,6 +173,14 @@ class VulnConfirmer:
                 vuln.impact = (vuln.impact or "") + "\n\n**Exploitation Proof:**\n" + result["impact_addition"]
 
             await db.flush()
+
+            # Record confirmed payload to KB
+            try:
+                from app.core.knowledge import KnowledgeBase
+                kb = KnowledgeBase()
+                await kb.record_successful_payload(db, vuln_type, vuln.payload_used, vuln.url)
+            except Exception:
+                pass
 
         return result
 

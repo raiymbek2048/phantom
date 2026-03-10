@@ -506,36 +506,123 @@ class KnowledgeBase:
                 ))
 
     async def decay_old_patterns(self, db: AsyncSession, days_threshold: int = 30):
-        """Automatically decay confidence of old, low-sample patterns.
+        """Exponential decay with pattern-type-aware rates and sample-count resistance.
         Called periodically to keep knowledge base fresh."""
         from datetime import datetime, timedelta
+        import math
+
         cutoff = datetime.utcnow() - timedelta(days=days_threshold)
 
         result = await db.execute(
             select(KnowledgePattern).where(
                 KnowledgePattern.updated_at < cutoff,
-                KnowledgePattern.confidence > 0.2,
+                KnowledgePattern.confidence > 0.15,
             )
         )
         patterns = result.scalars().all()
 
+        # Pattern types that stay relevant longer get slower decay (higher half-life)
+        HALF_LIFE_DAYS = {
+            "effective_payload": 90,   # Payloads stay valid long
+            "nuclei_live": 90,
+            "nuclei_template": 120,
+            "cve_live": 60,
+            "cve_exploit": 60,
+            "owasp_test": 120,
+            "ctf_technique": 120,
+            "discovery_pattern": 90,
+            "tech_vuln_correlation": 60,
+            "scan_strategy": 45,
+            "scan_feedback": 45,
+            "scan_insight": 45,
+            "h1_report": 60,
+            "h1_insight": 60,
+            "disclosed_report": 90,
+            "endpoint_pattern": 45,
+            "false_positive": 30,      # FPs go stale fast
+            "waf_bypass": 30,
+            "waf_evasion": 30,
+            "ai_mutation": 45,
+            "payload_mutation": 45,
+        }
+        DEFAULT_HALF_LIFE = 45
+
+        now = datetime.utcnow()
         decayed = 0
         deleted = 0
         for p in patterns:
-            if p.sample_count <= 1 and p.confidence < 0.4:
-                # Very low evidence + old = delete
+            age_days = (now - p.updated_at).days
+            half_life = HALF_LIFE_DAYS.get(p.pattern_type, DEFAULT_HALF_LIFE)
+
+            # High sample count = more resistance to decay (up to 2x half-life)
+            sample_boost = min(2.0, 1.0 + math.log2(max(1, p.sample_count)) * 0.15)
+            effective_half_life = half_life * sample_boost
+
+            # Exponential decay: conf * 0.5^(age/half_life)
+            decay_factor = 0.5 ** (age_days / effective_half_life)
+            new_conf = p.confidence * decay_factor
+
+            if new_conf < 0.15 or (p.sample_count <= 1 and new_conf < 0.25):
                 await db.delete(p)
                 deleted += 1
-            else:
-                # Reduce confidence by 10%
-                p.confidence = max(0.15, p.confidence * 0.9)
+            elif new_conf < p.confidence - 0.01:  # Only update if meaningful change
+                p.confidence = round(new_conf, 4)
                 decayed += 1
 
         if decayed or deleted:
             await db.commit()
-            logger.info(f"Knowledge decay: {decayed} patterns decayed, {deleted} deleted")
+            logger.info(f"Knowledge decay: {decayed} decayed, {deleted} deleted (exponential, type-aware)")
 
         return {"decayed": decayed, "deleted": deleted}
+
+    async def record_successful_payload(self, db: AsyncSession, vuln_type: str,
+                                        payload: str, url: str, technology: str = None):
+        """Record a payload that successfully exploited a vulnerability.
+        Boosts existing pattern or creates new effective_payload entry."""
+        if not payload or len(payload) < 3:
+            return
+
+        # Try to find existing pattern with same payload
+        result = await db.execute(
+            select(KnowledgePattern).where(
+                and_(
+                    KnowledgePattern.pattern_type == "effective_payload",
+                    KnowledgePattern.vuln_type == vuln_type,
+                    KnowledgePattern.pattern_data["payload"].astext == payload,
+                )
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            existing.sample_count += 1
+            existing.confidence = min(0.99, existing.confidence + 0.05)
+            urls = (existing.pattern_data or {}).get("confirmed_urls", [])
+            if url not in urls:
+                urls.append(url)
+                urls = urls[-10:]  # Keep last 10
+            existing.pattern_data = {**(existing.pattern_data or {}), "confirmed_urls": urls}
+        else:
+            from urllib.parse import urlparse
+            domain = urlparse(url).netloc
+            db.add(KnowledgePattern(
+                pattern_type="effective_payload",
+                vuln_type=vuln_type,
+                technology=technology,
+                pattern_data={
+                    "payload": payload,
+                    "source": "exploit_confirmed",
+                    "confirmed_urls": [url],
+                    "domain": domain,
+                },
+                confidence=0.8,
+                sample_count=1,
+            ))
+
+        try:
+            await db.flush()
+        except Exception as e:
+            logger.debug(f"Failed to record successful payload: {e}")
 
     async def record_false_positive(self, db: AsyncSession, vuln_type: str, indicator: str):
         """Record a false positive pattern for future avoidance."""
