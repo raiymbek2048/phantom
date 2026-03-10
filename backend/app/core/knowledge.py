@@ -78,15 +78,22 @@ class KnowledgeBase:
         result = await db.execute(query)
         patterns = result.scalars().all()
 
-        return [
-            {
+        results = []
+        for p in patterns:
+            if not p.pattern_data.get("payload"):
+                continue
+            entry = {
                 "payload": p.pattern_data.get("payload", ""),
                 "success_count": p.sample_count,
                 "confidence": p.confidence,
                 "technology": p.technology,
             }
-            for p in patterns if p.pattern_data.get("payload")
-        ]
+            # Include full payload list if available (from PayloadsAllTheThings etc.)
+            all_payloads = p.pattern_data.get("payloads", [])
+            if all_payloads:
+                entry["payloads"] = all_payloads
+            results.append(entry)
+        return results
 
     async def get_false_positive_patterns(self, db: AsyncSession, vuln_type: str = None) -> list[dict]:
         """Get known false positive patterns to avoid."""

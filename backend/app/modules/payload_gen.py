@@ -132,7 +132,14 @@ class PayloadGenerator:
                     vt_norm = VULN_TYPE_ALIASES.get(vt.lower().strip(), vt)
                     effective = await kb.get_effective_payloads(db, vt_norm, technology=tech)
                     if effective:
-                        self._kb_payloads[vt_norm] = [p["payload"] for p in effective[:10]]
+                        # Flatten payloads: use the full list when available (from PATT etc.)
+                        all_p = []
+                        for p in effective:
+                            if p.get("payloads"):
+                                all_p.extend(p["payloads"][:30])
+                            elif p.get("payload"):
+                                all_p.append(p["payload"])
+                        self._kb_payloads[vt_norm] = all_p[:50]
             except Exception:
                 pass
 

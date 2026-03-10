@@ -1233,6 +1233,208 @@ async def analyze_scan_feedback(db: AsyncSession) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Feed 6: PayloadsAllTheThings (GitHub raw → effective_payload KB patterns)
+# ---------------------------------------------------------------------------
+
+# Mapping of GitHub raw file paths → (vuln_type, technology)
+_PATT_SOURCES: list[tuple[str, str, str]] = [
+    # XSS
+    ("XSS Injection/Intruders/IntrudersXSS.txt", "xss_reflected", "generic"),
+    ("XSS Injection/1 - XSS Filter Bypass.md", "xss_reflected", "generic"),
+    ("XSS Injection/2 - XSS WAF Bypass.md", "xss_reflected", "generic"),
+    # SQLi
+    ("SQL Injection/MySQL Injection.md", "sqli", "mysql"),
+    ("SQL Injection/PostgreSQL Injection.md", "sqli", "postgresql"),
+    ("SQL Injection/MSSQL Injection.md", "sqli", "mssql"),
+    ("SQL Injection/SQLite Injection.md", "sqli", "sqlite"),
+    ("SQL Injection/Intruders/Auth_Bypass.txt", "sqli", "generic"),
+    ("SQL Injection/Intruders/FUZZ_SQLi.txt", "sqli", "generic"),
+    # SSRF
+    ("Server Side Request Forgery/Intruders/SSRF.txt", "ssrf", "generic"),
+    ("Server Side Request Forgery/README.md", "ssrf", "generic"),
+    # SSTI
+    ("Server Side Template Injection/Intruders/SST-Injection FuzzList.txt", "ssti", "generic"),
+    ("Server Side Template Injection/README.md", "ssti", "generic"),
+    # LFI
+    ("File Inclusion/Intruders/Traversals.txt", "lfi", "generic"),
+    ("File Inclusion/Intruders/LFI-LFD_Linux.txt", "lfi", "linux"),
+    ("File Inclusion/Intruders/LFI-LFD_Windows.txt", "lfi", "windows"),
+    # Command Injection
+    ("Command Injection/Intruders/CommandBlind-Linux.txt", "cmd_injection", "linux"),
+    ("Command Injection/Intruders/CommandBlind-Windows.txt", "cmd_injection", "windows"),
+    ("Command Injection/Intruders/FUZZ_CMD-Injectable.txt", "cmd_injection", "generic"),
+    # XXE
+    ("XXE Injection/Intruders/XXE_Fuzzing.txt", "xxe", "generic"),
+    # Open Redirect
+    ("Open Redirect/Intruders/OpenRedirectPayloads.txt", "open_redirect", "generic"),
+    # CSRF
+    ("CSRF Injection/Intruders/JsonCSRF.txt", "csrf", "generic"),
+    # Directory Traversal
+    ("Directory Traversal/Intruders/Traversals.txt", "path_traversal", "generic"),
+    # CORS
+    ("CORS Misconfiguration/README.md", "cors_misconfiguration", "generic"),
+    # JWT
+    ("JSON Web Token/README.md", "jwt_vuln", "generic"),
+    # Deserialization
+    ("Insecure Deserialization/README.md", "deserialization", "generic"),
+]
+
+_PATT_BASE_URL = "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/"
+
+
+def _extract_payloads_from_text(content: str, max_payloads: int = 200) -> list[str]:
+    """Extract actual payloads from a raw file (txt or markdown)."""
+    payloads = []
+    in_code_block = False
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Toggle code block state
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+
+        # Skip markdown headers, comments, descriptions
+        if stripped.startswith(("#", "##", "###", ">")):
+            continue
+        if stripped.startswith(("*", "-", "//", "/*", "Note:", "Reference")):
+            # But allow payload-like lines starting with - or *
+            if len(stripped) < 10 or not any(c in stripped for c in "<'\"`;/\\{"):
+                continue
+            # Strip the leading - or * for payload extraction
+            stripped = stripped.lstrip("-* ").strip()
+
+        # Must look like a payload (has special chars or is in code block)
+        if in_code_block or any(c in stripped for c in "<'\"`;/\\{}()[]|&$%"):
+            # Skip very long lines (likely descriptions) and very short ones
+            if 3 <= len(stripped) <= 2000:
+                payloads.append(stripped)
+
+        if len(payloads) >= max_payloads:
+            break
+
+    return payloads
+
+
+def _extract_payloads_from_markdown(content: str, max_payloads: int = 150) -> list[str]:
+    """Extract payloads from markdown README files (code blocks + inline code)."""
+    payloads = []
+
+    # Extract from code blocks
+    code_blocks = re.findall(r'```[\w]*\n(.*?)```', content, re.DOTALL)
+    for block in code_blocks:
+        for line in block.strip().splitlines():
+            line = line.strip()
+            if 3 <= len(line) <= 2000 and not line.startswith(("#", "//")):
+                payloads.append(line)
+
+    # Extract inline code with payload-like content
+    inline_codes = re.findall(r'`([^`]{3,500})`', content)
+    for code in inline_codes:
+        if any(c in code for c in "<'\"`;/\\{}()[]|&$%"):
+            payloads.append(code)
+
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for p in payloads:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+
+    return unique[:max_payloads]
+
+
+async def fetch_payloads_all_the_things(
+    db: AsyncSession, max_sources: int = 30
+) -> dict:
+    """Fetch payloads from PayloadsAllTheThings GitHub repo and inject into KB.
+
+    Returns: {fetched, created, skipped, updated, errors, sources_processed}
+    """
+    stats = {"fetched": 0, "created": 0, "updated": 0, "skipped": 0, "errors": 0,
+             "sources_processed": 0}
+
+    redis_key = "phantom:live_feeds:patt_last_run"
+    last_run = _redis_get(redis_key)
+
+    # Rate limit: don't hammer GitHub more than once per hour
+    if last_run:
+        try:
+            last_dt = datetime.fromisoformat(last_run)
+            if (datetime.utcnow() - last_dt).total_seconds() < 3600:
+                logger.info("PayloadsAllTheThings: skipping, ran less than 1 hour ago")
+                return stats
+        except ValueError:
+            pass
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for path, vuln_type, technology in _PATT_SOURCES[:max_sources]:
+            url = _PATT_BASE_URL + path.replace(" ", "%20")
+            try:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    logger.debug(f"PATT: {path} → HTTP {resp.status_code}")
+                    stats["errors"] += 1
+                    continue
+
+                content = resp.text
+                stats["sources_processed"] += 1
+
+                # Extract payloads based on file type
+                if path.endswith(".md"):
+                    payloads = _extract_payloads_from_markdown(content)
+                else:
+                    payloads = _extract_payloads_from_text(content)
+
+                if not payloads:
+                    stats["skipped"] += 1
+                    continue
+
+                stats["fetched"] += len(payloads)
+
+                # Store as effective_payload pattern
+                unique_key = f"patt-{vuln_type}-{technology}-{path.split('/')[-1]}"
+                action = await _upsert_pattern(
+                    db,
+                    pattern_type="effective_payload",
+                    technology=technology,
+                    vuln_type=vuln_type,
+                    pattern_data={
+                        "_unique_key": unique_key,
+                        "payload": payloads[0],
+                        "payloads": payloads[:200],
+                        "source": "PayloadsAllTheThings",
+                        "source_file": path,
+                        "payload_count": len(payloads),
+                    },
+                    confidence=0.65,  # Community-vetted = decent confidence
+                )
+                stats[action] += 1
+
+                # Small delay to be nice to GitHub
+                await asyncio.sleep(0.3)
+
+            except httpx.TimeoutException:
+                logger.warning(f"PATT timeout: {path}")
+                stats["errors"] += 1
+            except Exception as e:
+                logger.error(f"PATT error for {path}: {e}")
+                stats["errors"] += 1
+
+    await db.commit()
+    _redis_set(redis_key, datetime.utcnow().isoformat())
+
+    logger.info(f"PayloadsAllTheThings: sources={stats['sources_processed']}, "
+                f"payloads={stats['fetched']}, created={stats['created']}, "
+                f"updated={stats['updated']}")
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Master function
 # ---------------------------------------------------------------------------
 
@@ -1262,6 +1464,7 @@ async def run_all_live_feeds(db: AsyncSession) -> dict:
         ("exploitdb", lambda: fetch_live_exploits(db)),
         ("nuclei_templates", lambda: fetch_live_nuclei_templates(db)),
         ("hacktivity", lambda: fetch_live_hacktivity(db)),
+        ("payloads_all_the_things", lambda: fetch_payloads_all_the_things(db)),
         ("scan_feedback", lambda: analyze_scan_feedback(db)),
     ]
 

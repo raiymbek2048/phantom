@@ -483,7 +483,8 @@ async def run_live_feed(
     """Fetch fresh data from live security feeds (NVD, ExploitDB, Nuclei, HackerOne)."""
     from app.core.live_feeds import (
         fetch_live_cves, fetch_live_exploits, fetch_live_nuclei_templates,
-        fetch_live_hacktivity, analyze_scan_feedback, run_all_live_feeds,
+        fetch_live_hacktivity, fetch_payloads_all_the_things,
+        analyze_scan_feedback, run_all_live_feeds,
     )
 
     feed_map = {
@@ -491,6 +492,7 @@ async def run_live_feed(
         "exploitdb": ("ExploitDB", fetch_live_exploits),
         "nuclei": ("Nuclei Templates", fetch_live_nuclei_templates),
         "hacktivity": ("HackerOne Hacktivity", fetch_live_hacktivity),
+        "payloads": ("PayloadsAllTheThings", fetch_payloads_all_the_things),
         "scan_feedback": ("Scan Feedback", analyze_scan_feedback),
     }
 
@@ -583,6 +585,7 @@ async def list_training_modules(
             {"id": "exploitdb", "name": "Live ExploitDB", "description": "Pull latest exploits from ExploitDB GitLab mirror", "category": "live", "endpoint": "/live-feed"},
             {"id": "nuclei", "name": "Live Nuclei Templates", "description": "Sync latest nuclei detection templates from GitHub", "category": "live", "endpoint": "/live-feed"},
             {"id": "hacktivity", "name": "Live HackerOne Hacktivity", "description": "Learn from latest disclosed bug bounty reports", "category": "live", "endpoint": "/live-feed"},
+            {"id": "payloads", "name": "PayloadsAllTheThings", "description": "5000+ community-vetted payloads from GitHub (XSS, SQLi, SSRF, SSTI, LFI, CMD, XXE)", "category": "live", "endpoint": "/live-feed"},
             {"id": "scan_feedback", "name": "Scan Feedback Analysis", "description": "Analyze completed scans to improve detection strategy", "category": "live", "endpoint": "/live-feed"},
         ],
         "ai": [
