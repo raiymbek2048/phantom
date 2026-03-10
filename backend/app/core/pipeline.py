@@ -6,9 +6,12 @@ Each phase runs sequentially, with AI making decisions between phases.
 """
 import asyncio
 import json
+import logging
 from datetime import datetime
 
 from sqlalchemy import select, and_
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import urlparse
 
