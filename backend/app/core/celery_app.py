@@ -111,6 +111,24 @@ def check_schedules_task():
 
                 run_scan_task.delay(scan.id)
 
+        # --- Detect and clean up stuck scans ---
+        try:
+            stuck_cutoff = now - timedelta(hours=2)
+            stuck_result = await db.execute(
+                select(Scan).where(
+                    Scan.status == ScanStatus.RUNNING,
+                    Scan.started_at < stuck_cutoff,
+                )
+            )
+            stuck_scans = stuck_result.scalars().all()
+            for stuck in stuck_scans:
+                stuck.status = ScanStatus.FAILED
+                stuck.completed_at = now
+            if stuck_scans:
+                await db.commit()
+        except Exception:
+            pass
+
         from app.models.database import engine
         await engine.dispose()
 

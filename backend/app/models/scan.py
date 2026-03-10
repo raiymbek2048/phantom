@@ -32,9 +32,9 @@ class Scan(Base):
     __tablename__ = "scans"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    target_id: Mapped[str] = mapped_column(String, ForeignKey("targets.id"))
+    target_id: Mapped[str] = mapped_column(String, ForeignKey("targets.id"), index=True)
     user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
-    status: Mapped[ScanStatus] = mapped_column(Enum(ScanStatus), default=ScanStatus.QUEUED)
+    status: Mapped[ScanStatus] = mapped_column(Enum(ScanStatus), default=ScanStatus.QUEUED, index=True)
     scan_type: Mapped[ScanType] = mapped_column(Enum(ScanType), default=ScanType.FULL)
 
     # Progress
