@@ -326,7 +326,16 @@ class ClaudeCollaboration:
                 })
 
         except Exception as e:
-            logger.error(f"Claude collab error: {e}")
+            logger.error(f"Claude collab error for {domain}: {type(e).__name__}: {e}", exc_info=True)
+            return {
+                "domain": domain,
+                "rounds": self.rounds,
+                "findings": self.findings,
+                "action_evidence": self._action_evidence,
+                "actions_taken": len(self.actions_taken),
+                "conversation_length": len(self.conversation),
+                "error": f"{type(e).__name__}: {e}",
+            }
         finally:
             if http_client:
                 await http_client.aclose()
@@ -457,75 +466,85 @@ What should I test to confirm? Give me specific actions."""
     def _parse_actions(self, response: str) -> list[dict]:
         """Extract action blocks from Claude's response."""
         actions = []
-        parts = response.split("```action")
 
-        for part in parts[1:]:  # Skip everything before first ```action
+        # Primary: ```action blocks
+        parts = response.split("```action")
+        for part in parts[1:]:
             try:
                 json_str = part.split("```")[0].strip()
                 action = json.loads(json_str)
                 actions.append(action)
             except (json.JSONDecodeError, IndexError):
-                continue
+                # Try fixing common JSON issues (trailing commas)
+                try:
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', json_str)
+                    action = json.loads(cleaned)
+                    actions.append(action)
+                except Exception:
+                    logger.warning(f"Claude collab: unparseable action block: {json_str[:200]}")
+
+        # Fallback: try ```json blocks if no ```action found
+        if not actions and "```json" in response:
+            for part in response.split("```json")[1:]:
+                try:
+                    json_str = part.split("```")[0].strip()
+                    action = json.loads(json_str)
+                    if isinstance(action, dict) and "type" in action:
+                        actions.append(action)
+                except (json.JSONDecodeError, IndexError):
+                    pass
 
         return actions
 
     async def _execute_actions(
         self, actions: list[dict], http_client, domain: str
     ) -> list[dict]:
-        """Execute actions requested by Claude."""
+        """Execute actions requested by Claude with per-action timeout."""
         results = []
 
         for action in actions:
             atype = action.get("type", "")
             self._track_action(action)
 
+            # Per-action timeout: fuzz/chain get more time
+            timeout = 60.0 if atype in ("fuzz_parameter", "chain_attack") else 30.0
+
             try:
+                coro = None
                 if atype == "http_get":
-                    result = await self._exec_http_get(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_http_get(action, http_client, domain)
                 elif atype == "http_post":
-                    result = await self._exec_http_post(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_http_post(action, http_client, domain)
                 elif atype == "test_payload":
-                    result = await self._exec_test_payload(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_test_payload(action, http_client, domain)
                 elif atype == "generate_payload":
-                    result = await self._exec_generate_payload(action)
-                    results.append(result)
-
+                    coro = self._exec_generate_payload(action)
                 elif atype == "chain_attack":
-                    result = await self._exec_chain_attack(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_chain_attack(action, http_client, domain)
                 elif atype == "fuzz_parameter":
-                    result = await self._exec_fuzz_parameter(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_fuzz_parameter(action, http_client, domain)
                 elif atype == "extract_info":
-                    result = await self._exec_extract_info(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_extract_info(action, http_client, domain)
                 elif atype == "compare_responses":
-                    result = await self._exec_compare_responses(action, http_client, domain)
-                    results.append(result)
-
+                    coro = self._exec_compare_responses(action, http_client, domain)
                 elif atype == "analyze_response":
-                    # Claude wants to analyze previous results more deeply
                     results.append({
                         "action": action,
                         "note": "Analysis requested — review previous results above",
                     })
-
+                    continue
                 elif atype == "conclusion":
-                    # Handled by caller
-                    pass
-
+                    continue
                 else:
                     results.append({"action": action, "error": f"Unknown action type: {atype}"})
+                    continue
 
+                result = await asyncio.wait_for(coro, timeout=timeout)
+                results.append(result)
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Claude collab: action {atype} timed out after {timeout}s")
+                results.append({"action": action, "error": f"Action timed out after {timeout:.0f}s"})
             except Exception as e:
                 results.append({"action": action, "error": str(e)})
 

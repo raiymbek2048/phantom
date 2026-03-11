@@ -2103,12 +2103,39 @@ Respond in JSON:
                 **event,
             })
 
+        # Load ALL vulns found so far from DB (not just exploit phase context)
+        try:
+            vuln_rows = (await db.execute(
+                select(Vulnerability).where(Vulnerability.scan_id == self.scan_id)
+            )).scalars().all()
+            if vuln_rows:
+                self.context["vulnerabilities"] = [
+                    {
+                        "vuln_type": v.vuln_type.value if v.vuln_type else "",
+                        "severity": v.severity.value if v.severity else "",
+                        "url": v.url or "",
+                        "title": v.title or "",
+                        "parameter": v.parameter or "",
+                        "payload_used": v.payload_used or "",
+                    }
+                    for v in vuln_rows
+                ]
+                await self.log(db, "claude_collab",
+                    f"Loaded {len(vuln_rows)} vulns from DB for Claude context")
+        except Exception as e:
+            logger.warning(f"Failed to load vulns for Claude context: {e}")
+
         result = await collab.start_analysis(self.context, on_event=on_claude_event)
 
         rounds = result.get("rounds", 0)
         findings = result.get("findings", [])
         actions = result.get("actions_taken", 0)
         action_evidence = result.get("action_evidence", {})
+
+        if result.get("error"):
+            await self.log(db, "claude_collab",
+                f"Claude collab error: {result['error']} ({rounds} rounds completed)",
+                "warning")
 
         await self.log(db, "claude_collab",
             f"Claude collab: {rounds} rounds, {actions} actions, "
