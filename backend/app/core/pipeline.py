@@ -410,10 +410,33 @@ class ScanPipeline:
             # --- Reachability pre-check ---
             try:
                 import httpx
-                async with httpx.AsyncClient(verify=False, timeout=10.0, follow_redirects=True) as probe:
-                    resp = await probe.head(base_url)
-                    self.context["reachable"] = True
-                    await self.log(db, "reachability", f"Target reachable: {base_url} (HTTP {resp.status_code})")
+                reachable = False
+                probe_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                async with httpx.AsyncClient(verify=False, timeout=15.0, follow_redirects=True, headers=probe_headers) as probe:
+                    # Try base_url first, then fallback to alternate scheme
+                    urls_to_try = [base_url]
+                    if base_url.startswith("http://"):
+                        urls_to_try.append(base_url.replace("http://", "https://", 1))
+                    elif base_url.startswith("https://"):
+                        urls_to_try.append(base_url.replace("https://", "http://", 1))
+
+                    for try_url in urls_to_try:
+                        try:
+                            # Use GET instead of HEAD — some servers/LBs reject HEAD
+                            resp = await probe.get(try_url)
+                            reachable = True
+                            # Update base_url if alternate scheme worked
+                            if try_url != base_url:
+                                base_url = try_url
+                                self.context["base_url"] = base_url
+                            await self.log(db, "reachability", f"Target reachable: {try_url} (HTTP {resp.status_code})")
+                            break
+                        except Exception:
+                            continue
+
+                self.context["reachable"] = reachable
+                if not reachable:
+                    raise Exception(f"All URLs failed: {urls_to_try}")
             except Exception as e:
                 self.context["reachable"] = False
                 await self.log(db, "reachability", f"Target unreachable: {base_url} ({e})", "warning")
