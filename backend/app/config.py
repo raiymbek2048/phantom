@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     hackerone_api_token: str = ""
 
     # Scanning
-    max_concurrent_scans: int = 10
+    max_concurrent_scans: int = 20
     max_requests_per_second: int = 10
     scan_timeout_minutes: int = 120
 
