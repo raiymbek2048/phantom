@@ -686,7 +686,7 @@ def health_check_task():
                 try:
                     hb_time = datetime.fromisoformat(last_hb)
                     gap_min = (now - hb_time).total_seconds() / 60
-                    if gap_min > 30:
+                    if gap_min > 90:  # Long scans (Claude collab) can take >60 min
                         alerts.append(f"Training heartbeat stale: {gap_min:.0f}m ago")
                 except Exception:
                     pass
