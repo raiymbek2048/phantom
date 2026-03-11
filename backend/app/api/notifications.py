@@ -94,3 +94,17 @@ async def notification_history(
     """List recent notifications sent (last 100)."""
     history = get_notification_history(min(limit, 100))
     return history
+
+
+@router.get("/health")
+async def system_health(user: User = Depends(get_current_user)):
+    """Get latest system health check results."""
+    import json
+    import redis as redis_lib
+    from app.config import get_settings as get_app_settings
+
+    r = redis_lib.from_url(get_app_settings().redis_url, decode_responses=True)
+    raw = r.get("phantom:health:latest")
+    if raw:
+        return json.loads(raw)
+    return {"status": "unknown", "alerts": [], "message": "No health data yet (check runs every 5 min)"}

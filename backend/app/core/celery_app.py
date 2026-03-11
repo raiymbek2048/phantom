@@ -49,6 +49,10 @@ celery_app.conf.update(
             "task": "phantom.h1_collect",
             "schedule": 43200.0,  # every 12 hours
         },
+        "health-check": {
+            "task": "phantom.health_check",
+            "schedule": 300.0,  # every 5 minutes
+        },
     },
 )
 
@@ -287,9 +291,14 @@ def run_training_task(self):
             return True
         return False
 
+    r.set("phantom:training:active", "1")
+
     while True:
         cycle += 1
         logger.info(f"=== Training cycle {cycle} ===")
+        # Heartbeat for health monitor
+        from datetime import datetime
+        r.set("phantom:training:heartbeat", datetime.utcnow().isoformat(), ex=3600)
 
         # --- Study Phase: learn from data sources (fast, ~2-5s) ---
         if cycle == 1 or cycle % 5 == 0:
@@ -303,6 +312,7 @@ def run_training_task(self):
 
         if _should_stop():
             logger.info(f"Training stopped by user after cycle {cycle}")
+            r.delete("phantom:training:active", "phantom:training:heartbeat")
             return {"stopped_at_cycle": cycle}
 
         # --- Hunt Phase: scan a real bug bounty target ---
@@ -327,6 +337,7 @@ def run_training_task(self):
 
         if _should_stop():
             logger.info(f"Training stopped by user after cycle {cycle}")
+            r.delete("phantom:training:active", "phantom:training:heartbeat")
             return {"stopped_at_cycle": cycle}
 
         # No fixed wait — immediately start next cycle
@@ -604,3 +615,125 @@ def h1_collect_task():
             await engine.dispose()
 
     asyncio.run(_run())
+
+
+@celery_app.task(name="phantom.health_check")
+def health_check_task():
+    """Periodic health check: detect stuck scans, dead training, DB issues.
+    Sends notifications via configured channels (Telegram/webhook/email).
+    """
+    import asyncio
+    import json
+    import logging
+    import redis as redis_lib
+
+    logger = logging.getLogger(__name__)
+
+    async def _check():
+        from app.models.database import reset_engine
+        reset_engine()
+
+        from datetime import datetime, timedelta
+        from sqlalchemy import select, func
+        from app.models.database import async_session
+        from app.models.scan import Scan, ScanStatus
+        from app.models.vulnerability import Vulnerability
+        from app.models.knowledge import KnowledgePattern
+        from app.core.notifications import _dispatch
+
+        r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        alerts = []
+        total_vulns = 0
+        total_patterns = 0
+        recent_failures = 0
+
+        async with async_session() as db:
+            now = datetime.utcnow()
+
+            # 1. Detect stuck scans (running > 3 hours)
+            stuck_cutoff = now - timedelta(hours=3)
+            stuck_result = await db.execute(
+                select(Scan).where(
+                    Scan.status == ScanStatus.RUNNING,
+                    Scan.started_at < stuck_cutoff,
+                )
+            )
+            stuck_scans = stuck_result.scalars().all()
+            for scan in stuck_scans:
+                hours = (now - scan.started_at).total_seconds() / 3600
+                alerts.append(
+                    f"Stuck scan {str(scan.id)[:8]}... "
+                    f"phase={scan.current_phase} running {hours:.1f}h"
+                )
+
+            # 2. Check training heartbeat
+            last_hb = r.get("phantom:training:heartbeat")
+            if last_hb:
+                try:
+                    hb_time = datetime.fromisoformat(last_hb)
+                    gap_min = (now - hb_time).total_seconds() / 60
+                    if gap_min > 30:
+                        alerts.append(f"Training heartbeat stale: {gap_min:.0f}m ago")
+                except Exception:
+                    pass
+
+            # 3. DB health + stats
+            try:
+                total_vulns = (await db.execute(
+                    select(func.count(Vulnerability.id))
+                )).scalar() or 0
+                total_patterns = (await db.execute(
+                    select(func.count(KnowledgePattern.id))
+                )).scalar() or 0
+            except Exception as e:
+                alerts.append(f"DB error: {str(e)[:100]}")
+
+            # 4. Recent failures spike (>3 in last hour)
+            failure_cutoff = now - timedelta(hours=1)
+            recent_failures = (await db.execute(
+                select(func.count(Scan.id)).where(
+                    Scan.status == ScanStatus.FAILED,
+                    Scan.completed_at > failure_cutoff,
+                )
+            )).scalar() or 0
+            if recent_failures >= 3:
+                alerts.append(f"{recent_failures} scan failures in last hour")
+
+        # Store health in Redis
+        health = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "alerts": alerts,
+            "total_vulns": total_vulns,
+            "total_patterns": total_patterns,
+            "stuck_scans": len(stuck_scans),
+            "recent_failures": recent_failures,
+            "status": "degraded" if alerts else "healthy",
+        }
+        r.set("phantom:health:latest", json.dumps(health), ex=600)
+
+        # Send alerts (rate limited: 1 per 30 min)
+        if alerts:
+            alert_key = "phantom:health:last_alert"
+            if not r.get(alert_key):
+                alert_text = "\n".join(f"- {a}" for a in alerts)
+                _dispatch(
+                    "health_alert",
+                    {
+                        "event": "health_alert",
+                        "summary": f"PHANTOM Health: {len(alerts)} issue(s)",
+                        "alerts": alerts,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                    f"PHANTOM Health Alert: {len(alerts)} issue(s)",
+                    f"PHANTOM Health Alert\n{'=' * 40}\n\n{alert_text}\n",
+                    f"<b>PHANTOM Health Alert</b>\n{alert_text}",
+                )
+                r.set(alert_key, "1", ex=1800)
+                logger.warning(f"Health alerts: {alerts}")
+        else:
+            logger.debug("Health check: all OK")
+
+        from app.models.database import engine
+        await engine.dispose()
+
+    asyncio.run(_check())

@@ -117,6 +117,7 @@ class EndpointModule:
             self._extract_js_endpoints(base_url),
             self._check_graphql(base_url),
             self._check_http_methods(base_url),
+            self._spa_render_discovery(base_url),
         ]
 
         # Also crawl top subdomains
@@ -694,6 +695,177 @@ class EndpointModule:
         ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp",
         ".mp4", ".webm", ".mp3", ".pdf", ".zip", ".gz", ".br",
     ])
+
+    async def _spa_render_discovery(self, base_url: str) -> list[dict]:
+        """Use Playwright to render SPA pages and intercept API calls + discover routes."""
+        import re
+        endpoints = []
+
+        try:
+            from playwright.async_api import async_playwright
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+                )
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    ignore_https_errors=True,
+                )
+
+                # Intercept network requests to capture API calls
+                api_calls = []
+
+                async def on_request(request):
+                    url = request.url
+                    if any(p in url for p in ["/api/", "/v1/", "/v2/", "/rest/", "/graphql"]):
+                        api_calls.append({
+                            "url": url,
+                            "method": request.method,
+                        })
+
+                page = await context.new_page()
+                page.on("request", on_request)
+
+                # Set auth if available
+                if self._auth_cookie:
+                    if self._auth_cookie.startswith("token="):
+                        token = self._auth_cookie.split("=", 1)[1]
+                        await context.set_extra_http_headers({"Authorization": f"Bearer {token}"})
+                    else:
+                        cookies = []
+                        from urllib.parse import urlparse
+                        domain = urlparse(base_url).hostname
+                        for part in self._auth_cookie.split(";"):
+                            part = part.strip()
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                cookies.append({"name": k.strip(), "value": v.strip(), "domain": domain, "path": "/"})
+                        if cookies:
+                            await context.add_cookies(cookies)
+
+                # Visit main page and wait for SPA to render
+                try:
+                    await page.goto(base_url, wait_until="networkidle", timeout=30000)
+                    await page.wait_for_timeout(3000)  # Extra wait for lazy-loaded content
+                except Exception:
+                    try:
+                        await page.goto(base_url, wait_until="domcontentloaded", timeout=15000)
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        await browser.close()
+                        return []
+
+                # Extract all links from rendered DOM (SPA routes)
+                rendered_links = await page.evaluate("""() => {
+                    const links = new Set();
+                    // href links
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        const href = a.getAttribute('href');
+                        if (href && !href.startsWith('javascript:') && !href.startsWith('#'))
+                            links.add(href);
+                    });
+                    // React Router / Vue Router: data-href, to attributes
+                    document.querySelectorAll('[data-href], [to]').forEach(el => {
+                        const val = el.getAttribute('data-href') || el.getAttribute('to');
+                        if (val) links.add(val);
+                    });
+                    // Buttons with onclick navigation
+                    document.querySelectorAll('[onclick]').forEach(el => {
+                        const onclick = el.getAttribute('onclick');
+                        const match = onclick.match(/(?:location|href|navigate|push).*?['"](\/[^'"]+)['"]/);
+                        if (match) links.add(match[1]);
+                    });
+                    return [...links];
+                }""")
+
+                for link in rendered_links:
+                    if link.startswith("http"):
+                        full_url = link
+                    elif link.startswith("/"):
+                        full_url = base_url.rstrip("/") + link
+                    else:
+                        continue
+                    ep = self._classify_endpoint(full_url)
+                    ep["discovery"] = "spa_render"
+                    endpoints.append(ep)
+
+                # Extract forms from rendered DOM
+                forms_data = await page.evaluate("""() => {
+                    const forms = [];
+                    document.querySelectorAll('form').forEach(form => {
+                        const fields = [];
+                        form.querySelectorAll('input, textarea, select').forEach(inp => {
+                            const name = inp.getAttribute('name') || inp.getAttribute('id');
+                            const type = inp.getAttribute('type') || inp.tagName.toLowerCase();
+                            if (name && type !== 'submit' && type !== 'hidden')
+                                fields.push({name, type});
+                        });
+                        if (fields.length > 0) {
+                            forms.push({
+                                action: form.getAttribute('action') || '',
+                                method: (form.getAttribute('method') || 'GET').toUpperCase(),
+                                fields: fields,
+                            });
+                        }
+                    });
+                    return forms;
+                }""")
+
+                for form in forms_data:
+                    action = form["action"]
+                    if not action or action == "#":
+                        form_url = base_url
+                    elif action.startswith("http"):
+                        form_url = action
+                    elif action.startswith("/"):
+                        form_url = base_url.rstrip("/") + action
+                    else:
+                        form_url = base_url.rstrip("/") + "/" + action
+
+                    endpoints.append({
+                        "url": form_url,
+                        "type": "form",
+                        "interest": "high",
+                        "method": form["method"],
+                        "fields": [f["name"] for f in form["fields"]],
+                        "field_details": form["fields"],
+                        "params": [f["name"] for f in form["fields"]],
+                        "discovery": "spa_render",
+                    })
+
+                # Add intercepted API calls
+                for call in api_calls:
+                    ep = self._classify_endpoint(call["url"])
+                    ep["discovery"] = "spa_api_intercept"
+                    ep["method"] = call["method"]
+                    endpoints.append(ep)
+
+                # Try clicking navigation elements to discover more routes
+                try:
+                    nav_links = await page.query_selector_all("nav a, [role='navigation'] a, .sidebar a, .menu a")
+                    for link in nav_links[:10]:
+                        try:
+                            href = await link.get_attribute("href")
+                            if href and href.startswith("/"):
+                                full_url = base_url.rstrip("/") + href
+                                ep = self._classify_endpoint(full_url)
+                                ep["discovery"] = "spa_nav"
+                                endpoints.append(ep)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                await browser.close()
+
+        except ImportError:
+            pass  # Playwright not installed
+        except Exception:
+            pass
+
+        return endpoints
 
     def _classify_endpoint(self, url: str) -> dict:
         """Classify an endpoint by type and interest level."""
