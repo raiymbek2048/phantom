@@ -688,6 +688,13 @@ class EndpointModule:
 
         return endpoints
 
+    # Static file extensions — not useful for exploit testing
+    _STATIC_EXTS = frozenset([
+        ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp",
+        ".mp4", ".webm", ".mp3", ".pdf", ".zip", ".gz", ".br",
+    ])
+
     def _classify_endpoint(self, url: str) -> dict:
         """Classify an endpoint by type and interest level."""
         endpoint = {
@@ -698,9 +705,17 @@ class EndpointModule:
         }
 
         url_lower = url.lower()
+        # Strip query string for extension check
+        path_lower = url_lower.split("?")[0]
+
+        # Skip static assets — never useful for exploitation
+        if any(path_lower.endswith(ext) for ext in self._STATIC_EXTS):
+            endpoint["type"] = "static"
+            endpoint["interest"] = "none"
+            return endpoint
 
         # Classify type
-        if "/api/" in url_lower or "/v1/" in url_lower or "/v2/" in url_lower or "/graphql" in url_lower:
+        if "/api/" in url_lower or "/rest/" in url_lower or "/v1/" in url_lower or "/v2/" in url_lower or "/graphql" in url_lower:
             endpoint["type"] = "api"
             endpoint["interest"] = "high"
         elif any(p in url_lower for p in ["/admin", "/panel", "/dashboard", "/login"]):
