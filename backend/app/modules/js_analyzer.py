@@ -35,6 +35,10 @@ RE_FETCH_AXIOS = [
     re.compile(r"""axios\.\w+\(\s*['"](/[^'"]+)['"]"""),
     re.compile(r"""axios\(\s*\{[^}]*url:\s*['"](/[^'"]+)['"]"""),
     re.compile(r"""\$\.(?:get|post|ajax)\(\s*['"](/[^'"]+)['"]"""),
+    # Minified axios/http client dot-method calls: t.get("/path"), api.post("/path")
+    re.compile(r"""\b\w+\.(?:get|post|put|delete|patch|head|options)\(\s*["']([^"']{2,})["']"""),
+    # Template literal paths in axios-like calls: t.get(`/users/${id}`)
+    re.compile(r"""\b\w+\.(?:get|post|put|delete|patch|head|options)\(\s*`(/[^`]{1,})(?:`|\$\{)"""),
 ]
 
 # Route definitions (generic)
@@ -50,6 +54,17 @@ RE_URL_STRINGS = [
     re.compile(r"""BASE_URL\s*[:=]\s*['"](https?://[^'"]+)['"]"""),
     re.compile(r"""apiUrl\s*[:=]\s*['"](https?://[^'"]+)['"]"""),
 ]
+
+# Pattern to detect API base URL constants (e.g. const o=()=>"https://host/api" or const API_URL="https://host/api")
+RE_API_BASE_CONST = re.compile(
+    r"""(?:const|let|var)\s+\w+\s*=\s*(?:\(\)\s*=>\s*)?["'](https?://[^"']+/api(?:/v\d+)?)["']"""
+)
+# Also detect baseURL: variable where variable was previously assigned an https:// URL
+RE_API_BASE_URL_STRING = re.compile(r"""["'](https?://[^"']+/api(?:/v\d+)?)["']""")
+
+# Pattern to find secondary JS asset references within JS files
+# e.g. "assets/api-DiqRirRg.js" or './api-DiqRirRg.js'
+RE_JS_ASSET_REFS = re.compile(r"""["']((?:assets/|\./)[\w/\-\.]+\.js)["']""")
 
 # Template literals with API paths
 RE_TEMPLATE_API = [
@@ -162,15 +177,35 @@ class JSAnalyzer:
         js_urls = self._find_js_urls(base_url, endpoints)
 
         # 2. Fetch main page HTML for inline scripts and additional JS refs
-        inline_scripts, page_js_urls = await self._extract_from_html(base_url)
+        inline_scripts, page_js_urls, actual_base = await self._extract_from_html(base_url)
         js_urls.update(page_js_urls)
+
+        # Use the actual base URL (from redirect) if we discovered it
+        effective_base = actual_base or base_url
 
         # Limit to MAX_JS_FILES
         js_urls_list = list(js_urls)[:MAX_JS_FILES]
         logger.info(f"JS Analyzer: found {len(js_urls_list)} JS files to analyze")
 
-        # 3. Download and analyze each JS file
+        # 3. Download first batch of JS files
         js_contents = await self._download_js_files(js_urls_list)
+
+        # 3b. Scan downloaded JS for secondary JS asset references (e.g. "assets/api-*.js")
+        secondary_urls = set()
+        for filename, content in js_contents.items():
+            for ref in RE_JS_ASSET_REFS.findall(content):
+                # Normalize: assets/foo.js -> effective_base/assets/foo.js
+                # ./foo.js -> effective_base/<dirname>/foo.js (treat as assets-relative)
+                if ref.startswith("./"):
+                    ref = "assets/" + ref[2:]
+                candidate = effective_base.rstrip("/") + "/" + ref.lstrip("/")
+                if candidate not in js_urls:
+                    secondary_urls.add(candidate)
+
+        if secondary_urls:
+            logger.info(f"JS Analyzer: found {len(secondary_urls)} secondary JS file references in JS content")
+            secondary_contents = await self._download_js_files(list(secondary_urls)[:MAX_JS_FILES])
+            js_contents.update(secondary_contents)
 
         # Add inline scripts as pseudo-files
         for i, script in enumerate(inline_scripts):
@@ -179,8 +214,18 @@ class JSAnalyzer:
         all_endpoints = set()
         all_routes = set()
         all_ws = set()
+        api_base_paths: list[str] = []  # Detected API base URL paths (e.g. "/api")
 
         for filename, content in js_contents.items():
+            # Detect API base URL from constants in this JS file
+            for m in RE_API_BASE_URL_STRING.findall(content):
+                parsed = urlparse(m)
+                if parsed.path and parsed.path != "/":
+                    base_path = parsed.path.rstrip("/")
+                    if base_path not in api_base_paths:
+                        api_base_paths.append(base_path)
+                        logger.info(f"JS Analyzer: detected API base path '{base_path}' in {filename}")
+
             # Extract endpoints
             found_endpoints = self._extract_endpoints(content)
             all_endpoints.update(found_endpoints)
@@ -202,17 +247,35 @@ class JSAnalyzer:
             if source_map:
                 result["source_maps"].append(source_map)
 
-        # 4. Resolve relative endpoints to full URLs
-        result["js_endpoints"] = sorted(all_endpoints)
+        # 4. Resolve relative endpoints to full paths, prepending API base if needed
+        # If we found an API base like "/api", prepend it to short relative paths
+        # that don't already have an /api prefix but look like API endpoints
+        resolved_endpoints: set[str] = set()
+        for ep in all_endpoints:
+            if ep.startswith("http"):
+                resolved_endpoints.add(ep)
+                continue
+            # If there's a known API base path and the endpoint doesn't start with it,
+            # add a version WITH the base path prepended (the JS calls are relative to baseURL)
+            if api_base_paths:
+                for api_base_path in api_base_paths:
+                    if not ep.startswith(api_base_path):
+                        resolved_endpoints.add(api_base_path + ep)
+                    else:
+                        resolved_endpoints.add(ep)
+            else:
+                resolved_endpoints.add(ep)
+
+        result["js_endpoints"] = sorted(resolved_endpoints)
         result["spa_routes"] = sorted(all_routes)
         result["websocket_endpoints"] = sorted(all_ws)
 
         # 5. Try to download and parse source maps
-        await self._fetch_source_maps(base_url, result["source_maps"])
+        await self._fetch_source_maps(effective_base, result["source_maps"])
 
         # 6. Optional: SPA route discovery via Playwright
         try:
-            spa_network = await self._extract_spa_routes_playwright(base_url)
+            spa_network = await self._extract_spa_routes_playwright(effective_base)
             if spa_network:
                 for ep in spa_network.get("endpoints", []):
                     if ep not in result["js_endpoints"]:
@@ -248,55 +311,104 @@ class JSAnalyzer:
                 js_urls.add(url)
         return js_urls
 
-    async def _extract_from_html(self, base_url: str) -> tuple[list[str], set[str]]:
-        """Fetch main page and extract inline scripts + JS file references."""
+    async def _extract_from_html(self, base_url: str) -> tuple[list[str], set[str], str]:
+        """Fetch main page and extract inline scripts + JS file references.
+
+        Returns:
+            (inline_scripts, js_urls, actual_base_url) where actual_base_url is
+            derived from the final URL after redirects (important when the target
+            redirects to a non-standard port like :8443).
+        """
         inline_scripts = []
         js_urls = set()
+        actual_base = ""
 
-        try:
-            headers = dict(self.custom_headers)
-            if self.auth_cookie:
-                if self.auth_cookie.startswith("token="):
-                    headers["Authorization"] = f"Bearer {self.auth_cookie.split('=', 1)[1]}"
-                else:
-                    headers["Cookie"] = self.auth_cookie
+        headers = dict(self.custom_headers)
+        if self.auth_cookie:
+            if self.auth_cookie.startswith("token="):
+                headers["Authorization"] = f"Bearer {self.auth_cookie.split('=', 1)[1]}"
+            else:
+                headers["Cookie"] = self.auth_cookie
 
-            async with make_client(extra_headers=headers, timeout=DOWNLOAD_TIMEOUT) as client:
-                resp = await client.get(base_url, follow_redirects=True)
-                if resp.status_code != 200:
-                    return inline_scripts, js_urls
+        # Try the provided base_url first; if it fails or redirects to HTTPS, retry
+        urls_to_try = [base_url]
+        parsed_base = urlparse(base_url)
+        if parsed_base.scheme == "https":
+            # Also try HTTP in case HTTPS probe was wrong
+            http_url = "http://" + parsed_base.netloc + parsed_base.path
+            if http_url != base_url:
+                urls_to_try.append(http_url)
+        else:
+            # Try HTTPS first
+            https_url = "https://" + parsed_base.netloc + parsed_base.path
+            urls_to_try.insert(0, https_url)
 
-                html = resp.text
+        html = ""
+        for try_url in urls_to_try:
+            try:
+                async with make_client(extra_headers=headers, timeout=DOWNLOAD_TIMEOUT) as client:
+                    resp = await client.get(try_url, follow_redirects=True)
+                    if resp.status_code == 200 and resp.text.strip():
+                        html = resp.text
+                        # Derive actual_base from the final URL after all redirects
+                        final_url = str(resp.url)
+                        parsed_final = urlparse(final_url)
+                        actual_base = f"{parsed_final.scheme}://{parsed_final.netloc}"
+                        logger.debug(f"JS Analyzer: HTML fetched from {try_url} -> final URL {final_url}, base={actual_base}")
+                        break
+            except Exception as e:
+                logger.debug(f"HTML extraction error for {try_url}: {e}")
+                continue
 
-                # Extract <script src="..."> references
-                script_srcs = re.findall(
-                    r'<script[^>]+src=["\'](.*?)["\']', html, re.IGNORECASE
-                )
-                for src in script_srcs:
-                    if src.startswith("//"):
-                        src = "https:" + src
-                    elif src.startswith("/"):
-                        src = base_url + src
-                    elif not src.startswith("http"):
-                        src = base_url + "/" + src
-                    # Only include JS files from the same domain or CDNs
-                    js_urls.add(src)
+        if not html:
+            return inline_scripts, js_urls, actual_base
 
-                # Extract inline <script> content
-                inline_blocks = re.findall(
-                    r'<script(?:\s[^>]*)?>(.+?)</script>',
-                    html,
-                    re.DOTALL | re.IGNORECASE,
-                )
-                for block in inline_blocks:
-                    block = block.strip()
-                    if len(block) > 20:  # Skip trivial scripts
-                        inline_scripts.append(block)
+        # Use actual_base (post-redirect) for building JS URLs so we get the right host+port
+        url_base = actual_base or base_url.rstrip("/")
 
-        except Exception as e:
-            logger.debug(f"HTML extraction error: {e}")
+        # Extract <script src="..."> references
+        script_srcs = re.findall(
+            r'<script[^>]+src=["\'](.*?)["\']', html, re.IGNORECASE
+        )
+        for src in script_srcs:
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = url_base + src
+            elif not src.startswith("http"):
+                src = url_base + "/" + src
+            # Only add .js files (filter out .css, images, etc. that sneak in)
+            if src.endswith(".js") or src.endswith(".mjs") or ".js?" in src:
+                js_urls.add(src)
 
-        return inline_scripts, js_urls
+        # Also look for JS references in <link rel="modulepreload"> and similar
+        preload_srcs = re.findall(
+            r'<link[^>]+href=["\'](.*?)["\']', html, re.IGNORECASE
+        )
+        for src in preload_srcs:
+            if not (src.endswith(".js") or src.endswith(".mjs") or ".js?" in src):
+                continue
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = url_base + src
+            elif not src.startswith("http"):
+                src = url_base + "/" + src
+            js_urls.add(src)
+
+        # Extract inline <script> content
+        inline_blocks = re.findall(
+            r'<script(?:\s[^>]*)?>(.+?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        for block in inline_blocks:
+            block = block.strip()
+            if len(block) > 20:  # Skip trivial scripts
+                inline_scripts.append(block)
+
+        logger.debug(f"JS Analyzer: extracted {len(js_urls)} JS URLs from HTML, {len(inline_scripts)} inline scripts")
+        return inline_scripts, js_urls, actual_base
 
     async def _download_js_files(self, urls: list[str]) -> dict[str, str]:
         """Download JS files concurrently, respecting size limits."""
