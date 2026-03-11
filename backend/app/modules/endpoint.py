@@ -124,25 +124,50 @@ class EndpointModule:
         for sub in subdomains[:3]:
             tasks.append(self._crawl(sub))
 
+        task_names = [
+            "crawl", "gau", "fuzz", "js_extract", "graphql",
+            "http_methods", "spa_render",
+        ] + [f"crawl_{sub}" for sub in subdomains[:3]]
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         seen_urls = set()
-        for result in results:
-            if isinstance(result, list):
+        failed_tasks = []
+        for i, result in enumerate(results):
+            name = task_names[i] if i < len(task_names) else f"task_{i}"
+            if isinstance(result, Exception):
+                failed_tasks.append(f"{name}: {type(result).__name__}: {str(result)[:100]}")
+            elif isinstance(result, list):
                 for endpoint in result:
                     url = endpoint.get("url", "")
                     if url and url not in seen_urls:
                         seen_urls.add(url)
                         all_endpoints.append(endpoint)
 
-        # Always run link extraction with auth to find forms and authenticated pages
-        if self._auth_cookie:
+        if failed_tasks:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Endpoint discovery: {len(failed_tasks)} tasks failed: {'; '.join(failed_tasks)}")
+
+        # Always run link extraction as fallback (even without auth)
+        # This catches endpoints when external tools (katana/gau/ffuf) all fail
+        if len(all_endpoints) < 10:
             link_endpoints = await self._extract_links_with_auth(base_url)
             for endpoint in link_endpoints:
                 url = endpoint.get("url", "")
                 if not url:
                     continue
-                # Always add form endpoints (even if URL exists as non-form)
+                if endpoint.get("type") == "form":
+                    all_endpoints.append(endpoint)
+                elif url not in seen_urls:
+                    seen_urls.add(url)
+                    all_endpoints.append(endpoint)
+        elif self._auth_cookie:
+            link_endpoints = await self._extract_links_with_auth(base_url)
+            for endpoint in link_endpoints:
+                url = endpoint.get("url", "")
+                if not url:
+                    continue
                 if endpoint.get("type") == "form":
                     all_endpoints.append(endpoint)
                 elif url not in seen_urls:
@@ -329,7 +354,7 @@ class EndpointModule:
         proxy_url = get_proxy_url()
         if proxy_url:
             cmd.extend(["-proxy", proxy_url])
-        output = await run_command(cmd, timeout=120)
+        output = await run_command(cmd, timeout=180)
 
         endpoints = []
         if output:
@@ -337,13 +362,35 @@ class EndpointModule:
                 url = line.strip()
                 if url:
                     endpoints.append(self._classify_endpoint(url))
+
+        # Retry with longer timeout if katana found nothing
+        if not endpoints:
+            cmd_retry = [
+                "katana", "-u", crawl_url, "-d", "5", "-jc", "-kf", "all",
+                "-silent", "-nc", "-timeout", "15",
+            ]
+            if self._auth_cookie:
+                cmd_retry.extend(["-H", f"Cookie: {self._auth_cookie}"])
+            for hk, hv in self._custom_headers.items():
+                cmd_retry.extend(["-H", f"{hk}: {hv}"])
+            from app.utils.http_client import get_proxy_url
+            proxy_url = get_proxy_url()
+            if proxy_url:
+                cmd_retry.extend(["-proxy", proxy_url])
+            output = await run_command(cmd_retry, timeout=300)
+            if output:
+                for line in output.strip().split("\n"):
+                    url = line.strip()
+                    if url:
+                        endpoints.append(self._classify_endpoint(url))
+
         return endpoints
 
     async def _gau_urls(self, domain: str) -> list[dict]:
         """Get known URLs from various sources (Wayback, Common Crawl, etc.)."""
         output = await run_command(
             ["gau", "--threads", "5", domain],
-            timeout=60,
+            timeout=120,
         )
 
         endpoints = []

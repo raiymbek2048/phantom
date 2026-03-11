@@ -230,10 +230,11 @@ class ClaudeCollaboration:
         self.conversation = [{"role": "user", "content": initial_message}]
 
         http_client = None
+        consecutive_empty = 0  # Track rounds with no actions
         try:
             import httpx
             http_client = httpx.AsyncClient(
-                timeout=15.0,
+                timeout=25.0,
                 follow_redirects=True,
                 verify=False,
                 headers={
@@ -255,6 +256,15 @@ class ClaudeCollaboration:
                 # Ask Claude
                 response = await self._ask_claude()
                 if not response:
+                    logger.warning(f"Claude collab: no response in round {self.rounds}, retrying...")
+                    if self.rounds < self.max_rounds:
+                        # Remove failed assistant message if any, nudge again
+                        self.conversation.append({
+                            "role": "user",
+                            "content": "I didn't get your response. Please try again — "
+                                       "give me specific actions or a conclusion."
+                        })
+                        continue
                     break
 
                 # Parse actions from Claude's response
@@ -279,16 +289,23 @@ class ClaudeCollaboration:
 
                 # No actions = Claude is done talking
                 if not actions:
-                    # If Claude didn't give actions, ask it to be more specific
-                    if self.rounds < 3:
-                        self.conversation.append({
-                            "role": "user",
-                            "content": "Be more specific. What exactly should I test? "
-                                       "Give me concrete URLs and payloads to try, "
-                                       "or reach a conclusion."
-                        })
+                    consecutive_empty += 1
+                    # Give Claude up to 2 chances to produce actions before giving up
+                    if consecutive_empty <= 2:
+                        nudge = (
+                            "You didn't provide any action blocks. I need concrete actions "
+                            "in ```action ... ``` format. Either:\n"
+                            "1. Give me URLs to test with http_get/http_post/test_payload\n"
+                            "2. Use fuzz_parameter to test injection points\n"
+                            "3. Use extract_info to analyze a page\n"
+                            "4. Or give a conclusion if you've seen enough.\n\n"
+                            "Remember: wrap each action in ```action\\n{...}\\n```"
+                        )
+                        self.conversation.append({"role": "user", "content": nudge})
                         continue
                     break
+                else:
+                    consecutive_empty = 0  # Reset on successful actions
 
                 # Emit events for each action Claude wants to execute
                 for action in actions:
@@ -352,7 +369,7 @@ What should I test to confirm? Give me specific actions."""
         try:
             import httpx
             http_client = httpx.AsyncClient(
-                timeout=15.0, follow_redirects=True, verify=False,
+                timeout=25.0, follow_redirects=True, verify=False,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
 
@@ -395,23 +412,47 @@ What should I test to confirm? Give me specific actions."""
         }
 
     async def _ask_claude(self) -> str | None:
-        """Send conversation to Claude and get response."""
-        try:
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=COLLAB_SYSTEM,
-                messages=self.conversation,
-            )
-            response_text = message.content[0].text
-            self.conversation.append({
-                "role": "assistant",
-                "content": response_text
-            })
-            return response_text
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            return None
+        """Send conversation to Claude and get response, with retry on transient errors."""
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                # Re-fetch API key on retry (handles token refresh)
+                if attempt > 0:
+                    from app.ai.get_claude_key import get_claude_api_key
+                    api_key = get_claude_api_key()
+                    if api_key:
+                        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+                    else:
+                        logger.error("Claude API key unavailable on retry")
+                        return None
+
+                message = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=COLLAB_SYSTEM,
+                    messages=self.conversation,
+                )
+                response_text = message.content[0].text
+                self.conversation.append({
+                    "role": "assistant",
+                    "content": response_text
+                })
+                return response_text
+            except anthropic.AuthenticationError:
+                logger.warning(f"Claude API 401 (attempt {attempt + 1}/{max_retries + 1}), refreshing key...")
+                if attempt == max_retries:
+                    logger.error("Claude API auth failed after retries")
+                    return None
+                await asyncio.sleep(2)
+            except (anthropic.RateLimitError, anthropic.APIStatusError) as e:
+                logger.warning(f"Claude API error (attempt {attempt + 1}): {e}")
+                if attempt == max_retries:
+                    logger.error(f"Claude API failed after {max_retries + 1} attempts: {e}")
+                    return None
+                await asyncio.sleep(5 * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Claude API unexpected error: {e}")
+                return None
 
     def _parse_actions(self, response: str) -> list[dict]:
         """Extract action blocks from Claude's response."""
@@ -1153,14 +1194,20 @@ What should I test to confirm? Give me specific actions."""
         scan_results = context.get("scan_results", [])
         knowledge_context = context.get("_rag_context", "")
 
-        # Format interesting endpoints
+        # Format endpoints — show all when few, only high-interest when many
         endpoint_list = ""
-        for ep in endpoints[:30]:
+        high_interest = [
+            ep for ep in endpoints
+            if ep.get("interest") in ("high", "critical") or ep.get("type") in ("form", "api", "auth")
+        ]
+        # If we have few endpoints or few high-interest ones, show everything
+        show_all = len(endpoints) < 50 or len(high_interest) < 10
+        display_eps = endpoints[:60] if show_all else high_interest[:40]
+        for ep in display_eps:
             url = ep.get("url", "")
             etype = ep.get("type", "")
             interest = ep.get("interest", "")
-            if interest in ("high", "critical") or etype in ("form", "api", "auth"):
-                endpoint_list += f"\n  - [{interest}] {etype}: {url}"
+            endpoint_list += f"\n  - [{interest}] {etype}: {url}"
 
         # Format existing vulns
         vuln_list = ""
@@ -1184,7 +1231,7 @@ ENDPOINTS ({len(endpoints)} total, showing high-interest):
 {endpoint_list or "  (none marked high-interest yet)"}
 
 SCANNER FINDINGS ({len(scan_results)} raw results):
-{json.dumps(scan_results[:10], indent=2, default=str)[:3000]}
+{json.dumps(scan_results[:20], indent=2, default=str)[:5000]}
 
 VULNERABILITIES FOUND SO FAR ({len(vulns)}):
 {vuln_list or "  (none yet)"}
