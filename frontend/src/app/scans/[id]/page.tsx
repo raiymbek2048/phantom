@@ -141,7 +141,7 @@ function ScanDetail() {
     { id: "overview", label: "Overview", icon: Search },
     { id: "recon", label: "Recon", icon: Globe },
     { id: "endpoints", label: "Endpoints", icon: Network },
-    { id: "vulns", label: `Vulns (${scan.vulns_found})`, icon: Bug },
+    { id: "vulns", label: `Vulns (${vulns.length || scan.vulns_found})`, icon: Bug },
     { id: "logs", label: `Logs (${logs.length})`, icon: ScrollText },
     { id: "changes", label: "Changes", icon: ArrowLeftRight },
   ];
