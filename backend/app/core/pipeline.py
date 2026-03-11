@@ -407,6 +407,25 @@ class ScanPipeline:
                 timeout=config.get("timeout", 10.0),
             )
 
+            # --- Reachability pre-check ---
+            try:
+                import httpx
+                async with httpx.AsyncClient(verify=False, timeout=10.0, follow_redirects=True) as probe:
+                    resp = await probe.head(base_url)
+                    self.context["reachable"] = True
+                    await self.log(db, "reachability", f"Target reachable: {base_url} (HTTP {resp.status_code})")
+            except Exception as e:
+                self.context["reachable"] = False
+                await self.log(db, "reachability", f"Target unreachable: {base_url} ({e})", "warning")
+                # For non-training scans, fail early
+                if not (config or {}).get("training_mode"):
+                    scan.status = ScanStatus.FAILED
+                    scan.completed_at = datetime.utcnow()
+                    await self.log(db, "error", f"Scan aborted: target {domain} is unreachable", "error")
+                    await db.commit()
+                    return
+            await db.commit()
+
             # Determine phases based on scan type
             scan_type = scan.scan_type.value if hasattr(scan.scan_type, 'value') else str(scan.scan_type)
             self.context["scan_type"] = scan_type
@@ -475,12 +494,20 @@ class ScanPipeline:
                             db, scan, target, total_rounds, is_continuous
                         )
 
-                    # Complete
+                    # Complete — count vulns from DB (context list may miss deduped saves)
                     scan.status = ScanStatus.COMPLETED
                     scan.completed_at = datetime.utcnow()
                     scan.subdomains_found = len(self.context.get("subdomains", []))
                     scan.endpoints_found = len(self.context.get("endpoints", []))
-                    scan.vulns_found = len(self.context.get("vulnerabilities", []))
+                    # Count actual DB vulns (more accurate than context list)
+                    from sqlalchemy import func as sqlfunc
+                    db_vuln_count = (await db.execute(
+                        select(sqlfunc.count(Vulnerability.id)).where(
+                            Vulnerability.scan_id == self.scan_id
+                        )
+                    )).scalar() or 0
+                    ctx_vuln_count = len(self.context.get("vulnerabilities", []))
+                    scan.vulns_found = max(db_vuln_count, ctx_vuln_count)
                     await self.log(db, "complete", f"Scan completed. Found {scan.vulns_found} vulnerabilities.", "success")
                     await self._publish({
                         "type": "complete",

@@ -164,7 +164,8 @@ def check_schedules_task():
 
                 run_scan_task.delay(scan.id)
 
-        # --- Detect and restart stuck scans (>2h without progress) ---
+        # --- Detect and restart stuck scans (>2h without progress, max 3 retries) ---
+        MAX_AUTO_RESTARTS = 3
         try:
             stuck_cutoff = now - timedelta(hours=2)
             stuck_result = await db.execute(
@@ -174,14 +175,27 @@ def check_schedules_task():
                 )
             )
             stuck_scans = stuck_result.scalars().all()
+            restarted = 0
             for stuck in stuck_scans:
-                stuck.status = ScanStatus.QUEUED
-                stuck.current_phase = f"auto-restart (was: {stuck.current_phase})"
+                # Count previous auto-restarts from phase history
+                phase_str = stuck.current_phase or ""
+                restart_count = phase_str.count("auto-restart") + phase_str.count("recovery")
+                if restart_count >= MAX_AUTO_RESTARTS:
+                    # Too many retries — mark as failed
+                    stuck.status = ScanStatus.FAILED
+                    stuck.completed_at = now
+                    stuck.current_phase = f"failed: max retries ({restart_count}) exceeded (was: {phase_str})"
+                    logger.warning(f"Scan {stuck.id} exceeded max auto-restarts ({restart_count}), marking FAILED")
+                else:
+                    stuck.status = ScanStatus.QUEUED
+                    stuck.current_phase = f"auto-restart (was: {phase_str})"
+                    restarted += 1
             if stuck_scans:
                 await db.commit()
                 for stuck in stuck_scans:
-                    run_scan_task.delay(stuck.id)
-                logger.info(f"Auto-restarted {len(stuck_scans)} stuck scans (>2h)")
+                    if stuck.status == ScanStatus.QUEUED:
+                        run_scan_task.delay(stuck.id)
+                logger.info(f"Auto-restart check: {restarted} restarted, {len(stuck_scans) - restarted} failed (max retries)")
         except Exception as e:
             logger.debug(f"Stuck scan check failed: {e}")
 
