@@ -136,12 +136,14 @@ async def create_scan(
         raise HTTPException(status_code=409, detail="A scan is already running for this target")
 
     # Check concurrent scan limit
+    from app.config import get_settings as get_app_settings
+    max_scans = get_app_settings().max_concurrent_scans
     running = await db.execute(
         select(Scan).where(Scan.status.in_([ScanStatus.RUNNING, ScanStatus.QUEUED]))
     )
     running_count = len(running.scalars().all())
-    if running_count >= 10:
-        raise HTTPException(status_code=429, detail="Maximum concurrent scans reached")
+    if running_count >= max_scans:
+        raise HTTPException(status_code=429, detail=f"Maximum concurrent scans reached ({running_count}/{max_scans})")
 
     priority = max(1, min(10, scan_data.priority))
     # Merge multi-round config into scan config
@@ -189,6 +191,9 @@ async def create_campaign(
     if len(campaign_data.target_ids) > 50:
         raise HTTPException(status_code=400, detail="Maximum 50 targets per campaign")
 
+    from app.config import get_settings as get_app_settings
+    max_scans = get_app_settings().max_concurrent_scans
+
     # Verify all targets exist
     targets = []
     for tid in campaign_data.target_ids:
@@ -203,10 +208,10 @@ async def create_campaign(
         select(Scan).where(Scan.status.in_([ScanStatus.RUNNING, ScanStatus.QUEUED]))
     )
     running_count = len(running.scalars().all())
-    if running_count + len(targets) > 10:
+    if running_count + len(targets) > max_scans:
         raise HTTPException(
             status_code=429,
-            detail=f"Would exceed max concurrent scans (running: {running_count}, requested: {len(targets)}, limit: 10)"
+            detail=f"Would exceed max concurrent scans (running: {running_count}, requested: {len(targets)}, limit: {max_scans})"
         )
 
     campaign_id = str(uuid.uuid4())
@@ -347,15 +352,18 @@ async def create_campaign_by_tag(
     if len(targets) > 50:
         raise HTTPException(status_code=400, detail="Maximum 50 targets per campaign")
 
+    from app.config import get_settings as get_app_settings
+    max_scans = get_app_settings().max_concurrent_scans
+
     # Check concurrent scan limit
     running = await db.execute(
         select(Scan).where(Scan.status.in_([ScanStatus.RUNNING, ScanStatus.QUEUED]))
     )
     running_count = len(running.scalars().all())
-    if running_count + len(targets) > 10:
+    if running_count + len(targets) > max_scans:
         raise HTTPException(
             status_code=429,
-            detail=f"Would exceed max concurrent scans (running: {running_count}, requested: {len(targets)}, limit: 10)"
+            detail=f"Would exceed max concurrent scans (running: {running_count}, requested: {len(targets)}, limit: {max_scans})"
         )
 
     campaign_id = str(uuid.uuid4())
