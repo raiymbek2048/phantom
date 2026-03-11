@@ -10,6 +10,7 @@ A real hacker:
 6. Checks for rate limiting on auth endpoints
 """
 import asyncio
+import json
 import logging
 import re
 import time
@@ -562,38 +563,63 @@ class AuthAttackModule:
         if platform and platform in PLATFORM_CREDS:
             creds = PLATFORM_CREDS[platform] + creds
 
+        # Try multiple field name patterns for login
+        LOGIN_FIELD_VARIANTS = [
+            {"username": "{user}", "password": "{pass}"},
+            {"email": "{user}", "password": "{pass}"},
+            {"login": "{user}", "password": "{pass}"},
+            {"user": "{user}", "pass": "{pass}"},
+        ]
+
         async with httpx.AsyncClient(timeout=10.0, verify=False,
                                       follow_redirects=False) as client:
             for api_url in api_login_urls[:3]:
+                rate_limited = False
                 for username, password in creds[:15]:
-                    try:
-                        async with self.rate_limit:
-                            # Try JSON body
-                            resp = await client.post(api_url, json={
-                                "username": username,
-                                "password": password,
-                            })
+                    if rate_limited:
+                        break
+                    for body_template in LOGIN_FIELD_VARIANTS:
+                        if rate_limited:
+                            break
+                        payload = {k: v.replace("{user}", username).replace("{pass}", password)
+                                   for k, v in body_template.items()}
+                        try:
+                            async with self.rate_limit:
+                                resp = await client.post(api_url, json=payload)
 
                             if resp.status_code == 429:
-                                break  # Rate limited — good
+                                rate_limited = True
+                                findings.append({
+                                    "title": f"Rate limiting active on {api_url}",
+                                    "url": api_url,
+                                    "severity": "info",
+                                    "vuln_type": "misconfiguration",
+                                    "method": "POST",
+                                    "impact": "Rate limiting is enforced on login endpoint.",
+                                    "remediation": "Good — rate limiting is in place.",
+                                })
+                                break
+
+                            # 400 with validation error means wrong field names — skip this variant
+                            if resp.status_code == 400:
+                                continue
 
                             if resp.status_code == 200:
-                                body = resp.text
-                                # Check for JWT or access token in response
-                                if any(t in body for t in ['"token"', '"access_token"',
-                                                            '"jwt"', '"session"']):
-                                    # Verify it's a real token, not just field names
+                                resp_text = resp.text
+                                if any(t in resp_text for t in ['"token"', '"access_token"',
+                                                                '"jwt"', '"session"',
+                                                                '"success":true', '"success": true']):
                                     try:
                                         data = resp.json()
                                         token = (data.get("token") or data.get("access_token")
-                                                or data.get("jwt") or "")
+                                                or data.get("jwt") or data.get("data", {}).get("token", "") or "")
                                         if isinstance(token, str) and len(token) > 20:
                                             findings.append({
                                                 "title": f"API default credentials: {username}:{password}",
                                                 "url": api_url,
                                                 "severity": "critical",
                                                 "vuln_type": "auth_bypass",
-                                                "payload": f'{{"username":"{username}","password":"{password}"}}',
+                                                "payload": json.dumps(payload),
                                                 "method": "POST",
                                                 "impact": f"API login at {api_url} accepts "
                                                          f"default credentials {username}:{password}. "
@@ -601,34 +627,17 @@ class AuthAttackModule:
                                                 "remediation": "Change default API credentials. "
                                                               "Enforce strong passwords.",
                                             })
+                                            # Found valid creds — skip other field variants
+                                            break
                                     except Exception:
                                         pass
 
-                            # Also try form-encoded
-                            resp2 = await client.post(api_url, data={
-                                "username": username,
-                                "password": password,
-                            })
-                            if resp2.status_code == 200 and resp2.status_code != resp.status_code:
-                                try:
-                                    data = resp2.json()
-                                    token = (data.get("token") or data.get("access_token") or "")
-                                    if isinstance(token, str) and len(token) > 20:
-                                        findings.append({
-                                            "title": f"API default credentials (form): {username}:{password}",
-                                            "url": api_url,
-                                            "severity": "critical",
-                                            "vuln_type": "auth_bypass",
-                                            "payload": f"username={username}&password={password}",
-                                            "method": "POST",
-                                            "impact": f"API accepts form-encoded default creds. "
-                                                     f"Token: {token[:30]}...",
-                                            "remediation": "Change default credentials.",
-                                        })
-                                except Exception:
-                                    pass
+                            # If 401 with meaningful error (not validation), this field format works
+                            if resp.status_code == 401:
+                                # This field format is accepted — no need to try others
+                                break
 
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
 
         return findings
