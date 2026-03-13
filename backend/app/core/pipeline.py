@@ -144,6 +144,77 @@ class ScanPipeline:
         self.realtime_learner = RealtimeLearner()
         self.cross_scan_intel = CrossScanIntel()
 
+    # Context fields to persist in checkpoints (must be JSON-serializable)
+    CHECKPOINT_FIELDS = [
+        "endpoints", "technologies", "subdomains", "recon_data", "open_ports",
+        "scan_results", "vulnerabilities", "waf_info", "application_graph",
+        "stateful_crawl", "fingerprint_data", "base_url", "domain", "target_id",
+        "scan_id", "ports", "payloads", "evidence", "scope", "is_internal",
+        "reachable", "rate_limit", "scan_type", "stealth", "bounty_mode",
+        "custom_headers", "bounty_rules", "proxy_url", "cross_scan_intel",
+    ]
+
+    def _make_json_serializable(self, obj):
+        """Recursively convert sets and other non-JSON types to serializable forms."""
+        if isinstance(obj, set):
+            return list(obj)
+        if isinstance(obj, dict):
+            return {k: self._make_json_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self._make_json_serializable(v) for v in obj]
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        # Skip non-serializable objects (callables, modules, etc.)
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)
+
+    async def _save_checkpoint(self, db: AsyncSession, scan: Scan, phase_name: str, phase_index: int):
+        """Save checkpoint after a successful phase so scan can resume on crash."""
+        try:
+            context_snapshot = {}
+            for field in self.CHECKPOINT_FIELDS:
+                if field in self.context:
+                    context_snapshot[field] = self._make_json_serializable(self.context[field])
+
+            checkpoint = {
+                "last_completed_phase": phase_name,
+                "phase_index": phase_index,
+                "timestamp": datetime.utcnow().isoformat(),
+                "context_snapshot": context_snapshot,
+            }
+
+            config = scan.config or {}
+            config["_checkpoint"] = checkpoint
+            scan.config = config
+            # Force SQLAlchemy to detect the JSON mutation
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(scan, "config")
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"Checkpoint save failed for phase {phase_name}: {e}")
+            # Non-fatal — scan continues even if checkpoint fails
+
+    def _restore_checkpoint(self, scan: Scan) -> dict | None:
+        """Check if scan has a checkpoint to resume from. Returns checkpoint dict or None."""
+        config = scan.config or {}
+        checkpoint = config.get("_checkpoint")
+        if not checkpoint or not checkpoint.get("last_completed_phase"):
+            return None
+        return checkpoint
+
+    def _apply_checkpoint_context(self, checkpoint: dict):
+        """Restore context fields from checkpoint snapshot."""
+        snapshot = checkpoint.get("context_snapshot", {})
+        for field, value in snapshot.items():
+            # Don't overwrite fields that were already set during init (target_id, scan_id, etc.)
+            # But DO overwrite discovery data (endpoints, technologies, etc.)
+            self.context[field] = value
+
     @staticmethod
     def _normalize_url(url: str) -> str:
         """Strip query params and fragment for dedup comparison."""
@@ -491,28 +562,45 @@ class ScanPipeline:
                     await self.log(db, "start", f"Starting {scan_type} scan on {target.domain} ({len(phases)} phases)")
                     await db.commit()
 
-                    # --- Cross-Scan Intelligence: enrich context before phases ---
-                    try:
-                        await self.cross_scan_intel.enrich_context(self.context, db)
-                        intel = self.context.get("cross_scan_intel", {})
-                        preds = intel.get("predictions", [])
-                        xpayloads = intel.get("cross_scan_payloads_added", 0)
-                        if preds:
-                            top = preds[0]
-                            await self.log(db, "intel",
-                                f"Cross-scan intel: {'+'.join(top.get('technologies', [])[:3])} targets have "
-                                f"{top['probability']*100:.0f}% {top['vuln_type']} rate, "
-                                f"added {xpayloads} cross-scan payloads")
-                        elif xpayloads:
-                            await self.log(db, "intel",
-                                f"Cross-scan intel: added {xpayloads} payloads from similar targets")
-                        await db.commit()
-                    except Exception as e:
-                        await self.log(db, "intel", f"Cross-scan intel skipped: {e}", "warning")
+                    # --- Check for checkpoint (resume after crash) ---
+                    checkpoint = self._restore_checkpoint(scan)
+                    resume_from_index = -1
+                    if checkpoint:
+                        resume_from_index = checkpoint["phase_index"]
+                        self._apply_checkpoint_context(checkpoint)
+                        await self.log(db, "checkpoint",
+                            f"Resuming from checkpoint: phase '{checkpoint['last_completed_phase']}' "
+                            f"(index {resume_from_index}), skipping {resume_from_index + 1} completed phases",
+                            "success")
                         await db.commit()
 
-                    for phase_name, progress, phase_func in phases:
-                        await self._run_phase(db, scan, phase_name, progress, phase_func)
+                    # --- Cross-Scan Intelligence: enrich context before phases ---
+                    if resume_from_index < 0:
+                        # Only run cross-scan intel on fresh starts (not resumes)
+                        try:
+                            await self.cross_scan_intel.enrich_context(self.context, db)
+                            intel = self.context.get("cross_scan_intel", {})
+                            preds = intel.get("predictions", [])
+                            xpayloads = intel.get("cross_scan_payloads_added", 0)
+                            if preds:
+                                top = preds[0]
+                                await self.log(db, "intel",
+                                    f"Cross-scan intel: {'+'.join(top.get('technologies', [])[:3])} targets have "
+                                    f"{top['probability']*100:.0f}% {top['vuln_type']} rate, "
+                                    f"added {xpayloads} cross-scan payloads")
+                            elif xpayloads:
+                                await self.log(db, "intel",
+                                    f"Cross-scan intel: added {xpayloads} payloads from similar targets")
+                            await db.commit()
+                        except Exception as e:
+                            await self.log(db, "intel", f"Cross-scan intel skipped: {e}", "warning")
+                            await db.commit()
+
+                    for idx, (phase_name, progress, phase_func) in enumerate(phases):
+                        # Skip phases already completed before crash
+                        if idx <= resume_from_index:
+                            continue
+                        await self._run_phase(db, scan, phase_name, progress, phase_func, phase_index=idx)
 
                     # --- Multi-Round Scanning ---
                     total_rounds = config.get("rounds", 1)
@@ -522,6 +610,12 @@ class ScanPipeline:
                         await self._run_additional_rounds(
                             db, scan, target, total_rounds, is_continuous
                         )
+
+                    # Clear checkpoint on successful completion
+                    if scan.config and "_checkpoint" in scan.config:
+                        scan.config.pop("_checkpoint", None)
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(scan, "config")
 
                     # Complete — count vulns from DB (context list may miss deduped saves)
                     scan.status = ScanStatus.COMPLETED
@@ -967,7 +1061,7 @@ Respond in JSON:
         else:
             return all_phases
 
-    async def _run_phase(self, db, scan, phase_name, progress, phase_func):
+    async def _run_phase(self, db, scan, phase_name, progress, phase_func, phase_index: int = -1):
         # Check if scan was stopped/paused
         await db.refresh(scan)
         if scan.status in (ScanStatus.STOPPED, ScanStatus.PAUSED):
@@ -981,9 +1075,16 @@ Respond in JSON:
             await phase_func(db)
             await self.log(db, phase_name, f"Phase {phase_name} completed", "success")
             await db.commit()
+            # Save checkpoint after successful phase completion
+            if phase_index >= 0:
+                await self._save_checkpoint(db, scan, phase_name, phase_index)
         except Exception as e:
             await self.log(db, phase_name, f"Phase {phase_name} error: {str(e)}", "error")
             await db.commit()
+            # Save checkpoint even on failure so we skip this phase on resume
+            # (it already errored, retrying likely won't help)
+            if phase_index >= 0:
+                await self._save_checkpoint(db, scan, phase_name, phase_index)
             # Don't fail entire scan on single phase failure
             # AI will adapt strategy
 

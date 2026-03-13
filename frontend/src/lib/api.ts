@@ -434,6 +434,26 @@ export async function getDashboardStats() {
   return data;
 }
 
+export async function getVulnsOverTime() {
+  const { data } = await api.get('/dashboard/vulns-over-time');
+  return data;
+}
+
+export async function getTopVulnTypes() {
+  const { data } = await api.get('/dashboard/top-vuln-types');
+  return data;
+}
+
+export async function getRecentActivity() {
+  const { data } = await api.get('/dashboard/recent-activity');
+  return data;
+}
+
+export async function getTargetRisk() {
+  const { data } = await api.get('/dashboard/target-risk');
+  return data;
+}
+
 // Health
 export async function getHealth() {
   const { data } = await api.get("/health");

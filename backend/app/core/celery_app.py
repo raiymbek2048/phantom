@@ -82,13 +82,23 @@ def recover_stuck_scans(sender=None, **kwargs):
 
             for scan in stuck_scans:
                 scan.status = ScanStatus.QUEUED
+                has_checkpoint = bool(
+                    (scan.config or {}).get("_checkpoint", {}).get("last_completed_phase")
+                )
+                checkpoint_info = ""
+                if has_checkpoint:
+                    cp = scan.config["_checkpoint"]
+                    checkpoint_info = f" — will resume from phase '{cp['last_completed_phase']}'"
                 scan.current_phase = f"recovery (was: {scan.current_phase})"
-                logger.info(f"Scan recovery: requeueing scan {scan.id} (was at {scan.current_phase})")
+                logger.info(
+                    f"Scan recovery: requeueing scan {scan.id} "
+                    f"(was at {scan.current_phase}){checkpoint_info}"
+                )
 
             await db.commit()
             logger.info(f"Scan recovery: requeued {len(stuck_scans)} stuck scans")
 
-            # Re-dispatch each scan as a new celery task
+            # Re-dispatch each scan as a new celery task — they will resume from checkpoint
             for scan in stuck_scans:
                 run_scan_task.delay(scan.id)
                 logger.info(f"Scan recovery: dispatched scan {scan.id}")
