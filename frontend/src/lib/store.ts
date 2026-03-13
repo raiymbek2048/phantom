@@ -10,21 +10,16 @@ interface AuthStore {
 
 export const useAuthStore = create<AuthStore>((set) => ({
   token: null,
-  isLoggedIn: false,
+  isLoggedIn: true, // Auth disabled — internal server only
   setToken: (token) => {
     localStorage.setItem("token", token);
     set({ token, isLoggedIn: true });
   },
   logout: () => {
-    localStorage.removeItem("token");
-    set({ token: null, isLoggedIn: false });
+    // No-op — auth disabled
   },
   init: () => {
-    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    if (token) {
-      set({ token, isLoggedIn: true });
-    } else {
-      set({ token: null, isLoggedIn: false });
-    }
+    // Always logged in — no auth required
+    set({ isLoggedIn: true });
   },
 }));

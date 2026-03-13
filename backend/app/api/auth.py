@@ -56,36 +56,43 @@ async def get_current_user(
     token: str = Depends(OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Authenticate via JWT token or API token (phnt_... header)."""
+    """Auth disabled — internal server only. Returns first admin user.
+    Still supports token auth if provided (for API tokens, CI/CD)."""
     import hashlib
 
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    # If token provided, validate it (for API tokens / programmatic access)
+    if token:
+        if token.startswith("phnt_"):
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            result = await db.execute(
+                select(User).where(User.api_token_hash == token_hash, User.is_active == True)
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                return user
 
-    # API token auth (phnt_...)
-    if token.startswith("phnt_"):
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        result = await db.execute(
-            select(User).where(User.api_token_hash == token_hash, User.is_active == True)
-        )
-        user = result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API token")
-        return user
+        try:
+            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+            user_id: str = payload.get("sub")
+            if user_id:
+                result = await db.execute(select(User).where(User.id == user_id))
+                user = result.scalar_one_or_none()
+                if user and user.is_active:
+                    return user
+        except JWTError:
+            pass
 
-    # JWT auth
-    try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
-        user_id: str = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    result = await db.execute(select(User).where(User.id == user_id))
+    # No token or invalid token — return default admin user (no auth required)
+    result = await db.execute(
+        select(User).where(User.role == "admin", User.is_active == True).limit(1)
+    )
     user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    if not user:
+        # Fallback: return any active user
+        result = await db.execute(select(User).where(User.is_active == True).limit(1))
+        user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=500, detail="No users in database")
     return user
 
 

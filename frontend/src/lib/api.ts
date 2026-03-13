@@ -6,27 +6,8 @@ const api = axios.create({
   baseURL: API_BASE,
 });
 
-api.interceptors.request.use((config) => {
-  const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
-
-api.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    if (err.response?.status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem("token");
-      // Reload to show login form
-      if (window.location.pathname !== "/") {
-        window.location.href = "/";
-      }
-    }
-    return Promise.reject(err);
-  }
-);
+// Auth disabled — internal server only. No token injection needed.
+// Backend returns default admin user when no token is provided.
 
 // Auth
 export async function login(username: string, password: string) {
