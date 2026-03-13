@@ -617,6 +617,22 @@ class ScanPipeline:
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(scan, "config")
 
+                    # Save scan data (graph, technologies, etc.) for API access
+                    scan.data = {
+                        "application_graph": self.context.get("application_graph", {}),
+                        "technologies": self.context.get("technologies", []),
+                        "recon_data": self.context.get("recon_data", {}),
+                        "open_ports": self.context.get("open_ports", []),
+                        "waf_info": self.context.get("waf_info", {}),
+                        "stateful_crawl": {
+                            k: v for k, v in (self.context.get("stateful_crawl") or {}).items()
+                            if k in ("forms", "multi_step_flows", "authenticated_endpoints")
+                        },
+                        "phases_completed": [p[0] for p in phases],
+                    }
+                    from sqlalchemy.orm.attributes import flag_modified as _fm2
+                    _fm2(scan, "data")
+
                     # Complete — count vulns from DB (context list may miss deduped saves)
                     scan.status = ScanStatus.COMPLETED
                     scan.completed_at = datetime.utcnow()

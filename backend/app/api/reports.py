@@ -196,7 +196,7 @@ def _build_json_report(scan, target, vulns: list) -> dict:
         delta = scan.completed_at - scan.started_at
         scan_duration = int(delta.total_seconds() / 60)
 
-    scan_results = (scan.scan_results if scan and hasattr(scan, 'scan_results') and scan.scan_results else {}) or {}
+    scan_results = (scan.data if scan and hasattr(scan, 'data') and scan.data else {}) or {}
     recon_data = scan_results.get("recon") or {}
     fingerprint_data = scan_results.get("fingerprint") or {}
     technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
@@ -453,7 +453,7 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
     vuln_count_text = f"1 vulnerability" if len(vulns) == 1 else f"{len(vulns)} vulnerabilities"
 
     # Extract scan_results data safely
-    scan_results = (scan.scan_results if scan and hasattr(scan, 'scan_results') and scan.scan_results else {}) or {}
+    scan_results = (scan.data if scan and hasattr(scan, 'data') and scan.data else {}) or {}
     recon_data = scan_results.get("recon") or {}
     fingerprint_data = scan_results.get("fingerprint") or {}
     technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
