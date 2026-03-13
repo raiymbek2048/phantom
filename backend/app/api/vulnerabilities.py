@@ -129,6 +129,9 @@ async def list_vulnerabilities(
         query = query.where(Vulnerability.vuln_type == vuln_type)
     if status:
         query = query.where(Vulnerability.status == status)
+    else:
+        # By default hide false positives — user can still filter explicitly with ?status=false_positive
+        query = query.where(Vulnerability.status != VulnStatus.FALSE_POSITIVE)
     if target_id:
         query = query.where(Vulnerability.target_id == target_id)
     if scan_id:

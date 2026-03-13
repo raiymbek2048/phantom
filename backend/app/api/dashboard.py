@@ -5,7 +5,7 @@ from sqlalchemy import select, func, case, cast, Date, literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import get_db
-from app.models.vulnerability import Vulnerability, Severity, VulnType
+from app.models.vulnerability import Vulnerability, Severity, VulnType, VulnStatus
 from app.models.scan import Scan, ScanStatus
 from app.models.target import Target
 from app.models.knowledge import KnowledgePattern
@@ -13,6 +13,9 @@ from app.models.user import User
 from app.api.auth import get_current_user
 
 router = APIRouter()
+
+# Exclude false positives from all dashboard queries
+_not_fp = Vulnerability.status != VulnStatus.FALSE_POSITIVE
 
 
 @router.get("/stats")
@@ -24,11 +27,14 @@ async def dashboard_stats(
     # Total counts
     total_targets = (await db.execute(select(func.count(Target.id)))).scalar() or 0
     total_scans = (await db.execute(select(func.count(Scan.id)))).scalar() or 0
-    total_vulns = (await db.execute(select(func.count(Vulnerability.id)))).scalar() or 0
+    total_vulns = (await db.execute(
+        select(func.count(Vulnerability.id)).where(_not_fp)
+    )).scalar() or 0
 
-    # Vulns by severity
+    # Vulns by severity (excluding false positives)
     sev_rows = (await db.execute(
         select(Vulnerability.severity, func.count(Vulnerability.id))
+        .where(_not_fp)
         .group_by(Vulnerability.severity)
     )).all()
     vulns_by_severity = {
@@ -89,6 +95,7 @@ async def vulns_over_time(
             func.count(case((Vulnerability.severity == Severity.INFO, 1))).label("info"),
         )
         .where(Vulnerability.created_at >= thirty_days_ago)
+        .where(_not_fp)
         .group_by(cast(Vulnerability.created_at, Date))
         .order_by(cast(Vulnerability.created_at, Date))
     )).all()
@@ -139,6 +146,7 @@ async def top_vuln_types(
             func.count(Vulnerability.id).label("count"),
             func.avg(Vulnerability.ai_confidence).label("avg_confidence"),
         )
+        .where(_not_fp)
         .group_by(Vulnerability.vuln_type)
         .order_by(func.count(Vulnerability.id).desc())
         .limit(10)
@@ -160,10 +168,11 @@ async def recent_activity(
     user: User = Depends(get_current_user),
 ):
     """Last 20 events: mix of recent vulns and scan completions, sorted by time."""
-    # Recent vulns (last 20)
+    # Recent vulns (last 20, excluding false positives)
     vuln_rows = (await db.execute(
         select(Vulnerability, Target.domain)
         .join(Target, Vulnerability.target_id == Target.id, isouter=True)
+        .where(_not_fp)
         .order_by(Vulnerability.created_at.desc())
         .limit(20)
     )).all()
@@ -225,7 +234,7 @@ async def target_risk(
             func.count(case((Vulnerability.severity == Severity.LOW, 1))).label("low"),
             func.count(Vulnerability.id).label("total_vulns"),
         )
-        .join(Vulnerability, Vulnerability.target_id == Target.id, isouter=True)
+        .join(Vulnerability, (Vulnerability.target_id == Target.id) & _not_fp, isouter=True)
         .group_by(Target.id, Target.domain)
         .having(func.count(Vulnerability.id) > 0)
     )).all()
