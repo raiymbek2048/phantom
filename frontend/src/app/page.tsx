@@ -44,37 +44,9 @@ interface DashboardData {
   total_scans: number;
   total_vulns: number;
   active_scans: number;
-  monitored_targets: number;
   vulns_by_severity: Record<string, number>;
-  vulns_by_type: Record<string, number>;
-  recent_vulns: Array<{
-    id: string;
-    title: string;
-    severity: string;
-    vuln_type: string;
-    url: string;
-    created_at: string;
-    target_domain: string;
-  }>;
-  recent_scans: Array<{
-    id: string;
-    target_domain: string;
-    status: string;
-    scan_type: string;
-    vulns_found: number;
-    endpoints_found: number;
-    started_at: string | null;
-    completed_at: string | null;
-    created_at: string | null;
-  }>;
-  scan_activity: Array<{
-    date: string;
-    scans: number;
-    vulns: number;
-  }>;
-  llm_provider: string;
-  training_active: boolean;
-  kb_patterns?: number;
+  scans_by_status: Record<string, number>;
+  kb_patterns: number;
 }
 
 interface VulnOverTimeEntry {
@@ -330,7 +302,7 @@ function DashboardContent() {
         <StatCard
           icon={Database}
           label="KB Patterns"
-          value={data.kb_patterns ?? "---"}
+          value={data.kb_patterns || 0}
           color="cyan"
         />
       </div>
@@ -398,7 +370,7 @@ function DashboardContent() {
             </h2>
             <span className="text-xs text-gray-600">{t("dash.last_14")}</span>
           </div>
-          <VulnsOverTimeChart data={vulnsOverTime} fallback={data.scan_activity} />
+          <VulnsOverTimeChart data={vulnsOverTime} />
         </div>
 
         {/* Top Vuln Types */}
@@ -410,7 +382,7 @@ function DashboardContent() {
             </h2>
             <span className="text-xs text-gray-600">Top 10</span>
           </div>
-          <TopVulnTypesChart apiData={topVulnTypes} fallback={data.vulns_by_type} />
+          <TopVulnTypesChart apiData={topVulnTypes} />
         </div>
       </div>
 
@@ -424,7 +396,7 @@ function DashboardContent() {
               Recent Activity
             </h2>
           </div>
-          <RecentActivityFeed apiData={recentActivity} fallbackVulns={data.recent_vulns} fallbackScans={data.recent_scans} />
+          <RecentActivityFeed apiData={recentActivity} />
         </div>
 
         {/* Riskiest Targets */}
@@ -448,32 +420,18 @@ function DashboardContent() {
 // --- Vulns Over Time Bar Chart ---
 function VulnsOverTimeChart({
   data,
-  fallback,
 }: {
   data: VulnOverTimeEntry[];
-  fallback: DashboardData["scan_activity"];
 }) {
-  // Use API data if available, else build from fallback scan_activity
-  const entries: { date: string; critical: number; high: number; medium: number; low: number; info: number; total: number }[] =
-    data.length > 0
-      ? data.slice(-14).map((d) => ({
-          date: d.date,
-          critical: d.critical || 0,
-          high: d.high || 0,
-          medium: d.medium || 0,
-          low: d.low || 0,
-          info: d.info || 0,
-          total: d.count || 0,
-        }))
-      : fallback.slice(-14).map((d) => ({
-          date: d.date,
-          critical: 0,
-          high: 0,
-          medium: 0,
-          low: 0,
-          info: 0,
-          total: d.vulns,
-        }));
+  const entries = data.slice(-14).map((d) => ({
+    date: d.date,
+    critical: d.critical || 0,
+    high: d.high || 0,
+    medium: d.medium || 0,
+    low: d.low || 0,
+    info: d.info || 0,
+    total: d.count || 0,
+  }));
 
   const maxTotal = Math.max(...entries.map((e) => e.total), 1);
 
@@ -552,18 +510,10 @@ function VulnsOverTimeChart({
 // --- Top Vuln Types Horizontal Bar Chart ---
 function TopVulnTypesChart({
   apiData,
-  fallback,
 }: {
   apiData: TopVulnTypeEntry[];
-  fallback: Record<string, number>;
 }) {
-  const entries: { type: string; count: number }[] =
-    apiData.length > 0
-      ? apiData.slice(0, 10)
-      : Object.entries(fallback)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 10)
-          .map(([type, count]) => ({ type, count }));
+  const entries: { type: string; count: number }[] = apiData.slice(0, 10);
 
   const maxCount = Math.max(...entries.map((e) => e.count), 1);
 
@@ -604,37 +554,10 @@ function TopVulnTypesChart({
 // --- Recent Activity Feed ---
 function RecentActivityFeed({
   apiData,
-  fallbackVulns,
-  fallbackScans,
 }: {
   apiData: ActivityEntry[];
-  fallbackVulns: DashboardData["recent_vulns"];
-  fallbackScans: DashboardData["recent_scans"];
 }) {
-  // Merge from API or build from fallback
-  const items: ActivityEntry[] =
-    apiData.length > 0
-      ? apiData.slice(0, 15)
-      : [
-          ...fallbackVulns.map((v) => ({
-            type: "vuln" as const,
-            id: v.id,
-            title: v.title,
-            severity: v.severity,
-            target_domain: v.target_domain,
-            created_at: v.created_at,
-          })),
-          ...fallbackScans.map((s) => ({
-            type: "scan" as const,
-            id: s.id,
-            title: `${s.scan_type} scan`,
-            status: s.status,
-            target_domain: s.target_domain,
-            created_at: s.created_at || "",
-          })),
-        ]
-          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-          .slice(0, 15);
+  const items: ActivityEntry[] = apiData.slice(0, 15);
 
   if (items.length === 0) {
     return (

@@ -57,13 +57,16 @@ async def dashboard_stats(
         select(func.count(KnowledgePattern.id))
     )).scalar() or 0
 
+    active_scans = scans_by_status.get("running", 0) + scans_by_status.get("queued", 0)
+
     return {
         "total_targets": total_targets,
         "total_scans": total_scans,
         "total_vulns": total_vulns,
+        "active_scans": active_scans,
         "vulns_by_severity": vulns_by_severity,
         "scans_by_status": scans_by_status,
-        "kb_patterns_count": kb_patterns_count,
+        "kb_patterns": kb_patterns_count,
     }
 
 
@@ -179,28 +182,30 @@ async def recent_activity(
     for vuln, domain in vuln_rows:
         events.append({
             "type": "vuln",
+            "id": str(vuln.id),
             "title": vuln.title,
             "severity": vuln.severity.value if hasattr(vuln.severity, "value") else str(vuln.severity),
             "vuln_type": vuln.vuln_type.value if hasattr(vuln.vuln_type, "value") else str(vuln.vuln_type),
-            "domain": domain,
+            "target_domain": domain,
             "url": vuln.url,
-            "time": vuln.created_at.isoformat() if vuln.created_at else None,
+            "created_at": vuln.created_at.isoformat() if vuln.created_at else None,
         })
 
     for scan, domain in scan_rows:
         scan_time = scan.completed_at or scan.created_at
         events.append({
             "type": "scan",
+            "id": str(scan.id),
             "title": f"Scan {scan.status.value if hasattr(scan.status, 'value') else scan.status}",
-            "severity": None,
+            "status": scan.status.value if hasattr(scan.status, "value") else str(scan.status),
             "scan_type": scan.scan_type.value if hasattr(scan.scan_type, "value") else str(scan.scan_type),
-            "domain": domain,
+            "target_domain": domain,
             "vulns_found": scan.vulns_found or 0,
-            "time": scan_time.isoformat() if scan_time else None,
+            "created_at": scan_time.isoformat() if scan_time else None,
         })
 
     # Sort by time descending and take top 20
-    events.sort(key=lambda e: e["time"] or "", reverse=True)
+    events.sort(key=lambda e: e["created_at"] or "", reverse=True)
     return events[:20]
 
 
@@ -230,7 +235,7 @@ async def target_risk(
         # Risk score: critical=10, high=5, medium=2, low=0.5
         risk_score = (row.critical * 10) + (row.high * 5) + (row.medium * 2) + (row.low * 0.5)
         results.append({
-            "target_id": row.id,
+            "id": str(row.id),
             "domain": row.domain,
             "risk_score": round(risk_score, 1),
             "critical": row.critical,
