@@ -103,26 +103,32 @@ from app.core.cross_scan_intel import CrossScanIntel
 from app.modules.api_discovery import run_api_discovery
 from app.modules.security_analyzer import run_security_analysis
 from app.modules.vuln_confirmer import VulnConfirmer
+from app.modules.application_graph import ApplicationGraphBuilder
+from app.modules.stateful_crawler import StatefulCrawler
+from app.modules.business_logic import BusinessLogicTester
 
 # Phase definitions with progress percentages
 PHASES = [
-    ("recon", "Reconnaissance", 5),
-    ("subdomain", "Subdomain Discovery", 12),
-    ("portscan", "Port Scanning", 20),
-    ("fingerprint", "Technology Fingerprinting", 25),
-    ("attack_routing", "Adaptive Attack Routing", 28),
-    ("endpoint", "Endpoint Discovery", 35),
+    ("recon", "Reconnaissance", 4),
+    ("subdomain", "Subdomain Discovery", 9),
+    ("portscan", "Port Scanning", 15),
+    ("fingerprint", "Technology Fingerprinting", 20),
+    ("attack_routing", "Adaptive Attack Routing", 23),
+    ("endpoint", "Endpoint Discovery", 28),
+    ("app_graph", "Application Graph", 32),
+    ("stateful_crawl", "Stateful Crawling", 36),
     ("sensitive_files", "Sensitive File Discovery", 40),
-    ("vuln_scan", "Vulnerability Scanning", 48),
-    ("nuclei", "Nuclei Deep Scan", 55),
-    ("ai_analysis", "AI Analysis & Strategy", 60),
-    ("payload_gen", "Payload Generation", 63),
-    ("waf", "WAF Detection & Bypass", 67),
-    ("exploit", "Exploitation", 72),
-    ("service_attack", "Service & Port Attack", 78),
-    ("auth_attack", "Auth Brute Force", 83),
-    ("stress_test", "Resilience Testing", 86),
-    ("vuln_confirm", "Vulnerability Confirmation", 90),
+    ("vuln_scan", "Vulnerability Scanning", 46),
+    ("nuclei", "Nuclei Deep Scan", 52),
+    ("ai_analysis", "AI Analysis & Strategy", 56),
+    ("payload_gen", "Payload Generation", 59),
+    ("waf", "WAF Detection & Bypass", 63),
+    ("exploit", "Exploitation", 68),
+    ("service_attack", "Service & Port Attack", 73),
+    ("auth_attack", "Auth Brute Force", 77),
+    ("business_logic", "Business Logic Testing", 81),
+    ("stress_test", "Resilience Testing", 84),
+    ("vuln_confirm", "Vulnerability Confirmation", 88),
     ("claude_collab", "Claude Deep Analysis", 93),
     ("evidence", "Evidence Collection", 97),
     ("report", "Report Generation", 100),
@@ -592,7 +598,7 @@ class ScanPipeline:
         {
             "name": "Business Logic & API Abuse",
             "context_flags": {"round_focus": "business_logic", "test_race_conditions": True, "test_mass_assignment": True},
-            "phases": ["endpoint", "vuln_scan", "exploit", "vuln_confirm", "service_attack", "ai_analysis"],
+            "phases": ["endpoint", "app_graph", "stateful_crawl", "vuln_scan", "exploit", "business_logic", "vuln_confirm", "ai_analysis"],
         },
         {
             "name": "Auth & JWT Deep Dive",
@@ -636,6 +642,8 @@ class ScanPipeline:
 
         phase_map = {
             "endpoint": self._phase_endpoint,
+            "app_graph": self._phase_app_graph,
+            "stateful_crawl": self._phase_stateful_crawl,
             "sensitive_files": self._phase_sensitive_files,
             "vuln_scan": self._phase_vuln_scan,
             "nuclei": self._phase_nuclei,
@@ -645,6 +653,7 @@ class ScanPipeline:
             "exploit": self._phase_exploit,
             "service_attack": self._phase_service_attack,
             "auth_attack": self._phase_auth_attack,
+            "business_logic": self._phase_business_logic,
             "stress_test": self._phase_stress_test,
             "claude_collab": self._phase_claude_collab,
             "vuln_confirm": self._phase_vuln_confirm,
@@ -905,23 +914,26 @@ Respond in JSON:
     def _get_phases_for_type(self, scan_type: str) -> list[tuple]:
         """Return list of (phase_name, progress%, phase_func) for the scan type."""
         all_phases = [
-            ("recon", 5, self._phase_recon),
-            ("subdomain", 12, self._phase_subdomain),
-            ("portscan", 20, self._phase_portscan),
-            ("fingerprint", 25, self._phase_fingerprint),
-            ("attack_routing", 28, self._phase_attack_routing),
-            ("endpoint", 35, self._phase_endpoint),
+            ("recon", 4, self._phase_recon),
+            ("subdomain", 9, self._phase_subdomain),
+            ("portscan", 15, self._phase_portscan),
+            ("fingerprint", 20, self._phase_fingerprint),
+            ("attack_routing", 23, self._phase_attack_routing),
+            ("endpoint", 28, self._phase_endpoint),
+            ("app_graph", 32, self._phase_app_graph),
+            ("stateful_crawl", 36, self._phase_stateful_crawl),
             ("sensitive_files", 40, self._phase_sensitive_files),
-            ("vuln_scan", 48, self._phase_vuln_scan),
-            ("nuclei", 55, self._phase_nuclei),
-            ("ai_analysis", 60, self._phase_ai_analysis),
-            ("payload_gen", 63, self._phase_payload_gen),
-            ("waf", 67, self._phase_waf),
-            ("exploit", 72, self._phase_exploit),
-            ("service_attack", 78, self._phase_service_attack),
-            ("auth_attack", 83, self._phase_auth_attack),
-            ("stress_test", 86, self._phase_stress_test),
-            ("vuln_confirm", 90, self._phase_vuln_confirm),
+            ("vuln_scan", 46, self._phase_vuln_scan),
+            ("nuclei", 52, self._phase_nuclei),
+            ("ai_analysis", 56, self._phase_ai_analysis),
+            ("payload_gen", 59, self._phase_payload_gen),
+            ("waf", 63, self._phase_waf),
+            ("exploit", 68, self._phase_exploit),
+            ("service_attack", 73, self._phase_service_attack),
+            ("auth_attack", 77, self._phase_auth_attack),
+            ("business_logic", 81, self._phase_business_logic),
+            ("stress_test", 84, self._phase_stress_test),
+            ("vuln_confirm", 88, self._phase_vuln_confirm),
             ("claude_collab", 93, self._phase_claude_collab),
             ("evidence", 97, self._phase_evidence),
             ("report", 100, self._phase_report),
@@ -930,7 +942,8 @@ Respond in JSON:
         if scan_type == "quick":
             # Skip heavy phases for quick scan
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
-                    "evidence", "service_attack", "auth_attack", "stress_test"}
+                    "evidence", "service_attack", "auth_attack", "stress_test",
+                    "stateful_crawl", "business_logic"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
             # Recalculate progress evenly
             for i, (n, _, f) in enumerate(phases):
@@ -992,6 +1005,27 @@ Respond in JSON:
                 await self.log(db, "recon", f"External APIs enriched: {', '.join(enrichment['sources'])}")
 
         self.context["recon_data"] = result
+
+        # Extract WAF intel from recon for downstream phases
+        main_page_intel = result.get("main_page_intel", {})
+        waf_info = main_page_intel.get("waf", {})
+        if waf_info.get("detected"):
+            self.context["waf_info"] = waf_info
+            await self.log(db, "recon",
+                f"WAF detected: {waf_info.get('waf_name', 'unknown')} "
+                f"(confidence: {waf_info.get('confidence', 0):.0%})", "warning")
+
+        # Extract tech leaks
+        tech_leaks = main_page_intel.get("tech_leaks", [])
+        if tech_leaks:
+            leak_summary = ", ".join(f"{t['name']}={t['value']}" for t in tech_leaks[:5])
+            await self.log(db, "recon", f"Tech leaks: {leak_summary}")
+
+        # Secrets found on main page
+        secrets = main_page_intel.get("secrets", [])
+        if secrets:
+            await self.log(db, "recon",
+                f"Secrets found on main page: {len(secrets)} ({', '.join(s['type'] for s in secrets[:3])})", "warning")
 
         target_result = await db.execute(select(Target).where(Target.id == self.context["target_id"]))
         target = target_result.scalar_one()
@@ -1997,6 +2031,120 @@ Respond in JSON:
                 f"Auth attacks found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "auth_attack", "No auth vulnerabilities found")
+
+    async def _phase_app_graph(self, db: AsyncSession):
+        """Build application model / attack graph from discovered endpoints."""
+        try:
+            builder = ApplicationGraphBuilder(self.context)
+            graph = await builder.build()
+            self.context["application_graph"] = graph
+
+            entities_count = len(graph.get("entities", {}))
+            relationships_count = len(graph.get("relationships", []))
+            attack_paths_count = len(graph.get("attack_paths", []))
+
+            await self.log(db, "app_graph",
+                f"Application graph: {entities_count} entities, "
+                f"{relationships_count} relationships, "
+                f"{attack_paths_count} attack paths identified")
+
+            # Log high-risk attack paths
+            for path in graph.get("attack_paths", [])[:3]:
+                await self.log(db, "app_graph",
+                    f"Attack path [{path.get('risk', 'unknown')}]: {path.get('name', 'unnamed')}", "warning")
+        except Exception as e:
+            await self.log(db, "app_graph", f"Application graph error (non-fatal): {e}", "error")
+
+    async def _phase_stateful_crawl(self, db: AsyncSession):
+        """Deep stateful crawling with session management."""
+        try:
+            crawler = StatefulCrawler(self.context)
+            results = await crawler.crawl()
+            self.context["stateful_crawl"] = results
+
+            forms_count = len(results.get("forms", []))
+            transitions_count = len(results.get("state_transitions", []))
+            auth_endpoints = len(results.get("authenticated_endpoints", []))
+            flows_count = len(results.get("multi_step_flows", []))
+            ids_count = sum(len(v) for v in results.get("harvested_ids", {}).values())
+
+            # Merge harvested IDs into context for IDOR/auth tests
+            existing_ids = self.context.get("harvested_ids", {})
+            for key, values in results.get("harvested_ids", {}).items():
+                if key in existing_ids:
+                    if isinstance(existing_ids[key], list):
+                        existing_ids[key] = list(set(existing_ids[key] + list(values)))
+                    else:
+                        existing_ids[key] = list(values)
+                else:
+                    existing_ids[key] = list(values)
+            self.context["harvested_ids"] = existing_ids
+
+            # Merge newly discovered endpoints
+            new_endpoints = results.get("authenticated_endpoints", [])
+            if new_endpoints:
+                existing = self.context.get("endpoints", [])
+                existing_urls = {(ep.get("url") if isinstance(ep, dict) else ep) for ep in existing}
+                for ep_url in new_endpoints:
+                    if ep_url not in existing_urls:
+                        existing.append({"url": ep_url, "type": "authenticated", "method": "GET"})
+                self.context["endpoints"] = existing
+
+            await self.log(db, "stateful_crawl",
+                f"Stateful crawl: {forms_count} forms, {transitions_count} transitions, "
+                f"{auth_endpoints} auth-only endpoints, {flows_count} multi-step flows, "
+                f"{ids_count} harvested IDs")
+        except Exception as e:
+            await self.log(db, "stateful_crawl", f"Stateful crawl error (non-fatal): {e}", "error")
+
+    async def _phase_business_logic(self, db: AsyncSession):
+        """Test for business logic vulnerabilities."""
+        if self.context.get("stealth"):
+            await self.log(db, "business_logic", "Skipped in stealth mode")
+            return
+
+        try:
+            tester = BusinessLogicTester(self.context)
+            findings = await tester.test()
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "business_logic")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "Business logic issue")[:500],
+                        vuln_type=VulnType.BUSINESS_LOGIC,
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=f.get("url", "")[:2000],
+                        parameter=f.get("parameter"),
+                        method=f.get("method"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload_used"),
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data"),
+                        ai_confidence=f.get("ai_confidence", 0.7),
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "business_logic",
+                    f"Business logic testing: {saved} new issues ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "business_logic", "No business logic vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "business_logic", f"Business logic testing error (non-fatal): {e}", "error")
 
     async def _phase_stress_test(self, db: AsyncSession):
         """Test resilience — rate limiting, slow connections, large payloads."""

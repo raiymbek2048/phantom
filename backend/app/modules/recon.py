@@ -10,6 +10,7 @@ import re
 from app.utils.tool_runner import run_command
 from app.utils.http_client import make_client
 from app.config import get_settings
+from app.modules.response_analyzer import ResponseAnalyzer
 
 settings = get_settings()
 
@@ -26,8 +27,11 @@ class ReconModule:
 
         if is_internal:
             # Internal/IP target — skip DNS/whois, just check robots/sitemap
-            tasks = [self._check_robots_sitemap(domain, base_url)]
-            task_names = ["robots_sitemap"]
+            tasks = [
+                self._check_robots_sitemap(domain, base_url),
+                self._analyze_main_page(base_url),
+            ]
+            task_names = ["robots_sitemap", "main_page_intel"]
         else:
             tasks = [
                 self._whois(domain),
@@ -36,9 +40,10 @@ class ReconModule:
                 self._check_robots_sitemap(domain, base_url),
                 self._certificate_transparency(domain),
                 self._check_security_txt(base_url),
+                self._analyze_main_page(base_url),
             ]
             task_names = ["whois", "dns_records", "wayback_urls", "robots_sitemap",
-                         "ct_subdomains", "security_txt"]
+                         "ct_subdomains", "security_txt", "main_page_intel"]
             if settings.shodan_api_key:
                 tasks.append(self._shodan_lookup(domain))
                 task_names.append("shodan")
@@ -198,6 +203,28 @@ class ReconModule:
         except Exception:
             pass
         return None
+
+    async def _analyze_main_page(self, base_url: str) -> dict:
+        """Fetch main page and run ResponseAnalyzer for WAF, tech leaks, and secrets."""
+        result = {"waf": None, "tech_leaks": [], "secrets": []}
+        try:
+            async with make_client(extra_headers=dict(self._custom_headers)) as client:
+                resp = await client.get(base_url, follow_redirects=True)
+                headers = dict(resp.headers)
+                body = resp.text
+                status_code = resp.status_code
+
+                # 1. WAF detection
+                result["waf"] = ResponseAnalyzer.detect_waf(headers, body, status_code)
+
+                # 2. Technology leak extraction
+                result["tech_leaks"] = ResponseAnalyzer.extract_tech_leaks(headers, body)
+
+                # 3. Secret scan on main page body
+                result["secrets"] = ResponseAnalyzer.find_secrets(body)
+        except Exception:
+            pass
+        return result
 
     def _parse_whois(self, raw: str) -> dict:
         """Parse WHOIS output into structured data."""

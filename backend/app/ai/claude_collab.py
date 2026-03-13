@@ -1212,6 +1212,8 @@ What should I test to confirm? Give me specific actions."""
         ports = context.get("ports", {})
         scan_results = context.get("scan_results", [])
         knowledge_context = context.get("_rag_context", "")
+        application_graph = context.get("application_graph", {})
+        stateful_crawl = context.get("stateful_crawl", {})
 
         # Format endpoints — show all when few, only high-interest when many
         endpoint_list = ""
@@ -1236,6 +1238,89 @@ What should I test to confirm? Give me specific actions."""
             severity = v.get("severity", "")
             vuln_list += f"\n  - [{severity}] {vtype}: {vurl}"
 
+        # Format application graph (entities, attack paths, auth flows)
+        graph_section = ""
+        if application_graph:
+            graph_parts = []
+            # Entities summary — top entities with endpoint counts and methods
+            entities = application_graph.get("entities", [])
+            if entities:
+                graph_parts.append("Entities:")
+                for ent in entities[:15]:
+                    name = ent.get("name", ent.get("id", "?"))
+                    eps = ent.get("endpoints", [])
+                    methods = sorted(set(
+                        m for ep in eps for m in (
+                            [ep.get("method", "GET")] if isinstance(ep.get("method"), str)
+                            else ep.get("methods", ["GET"])
+                        )
+                    ))
+                    graph_parts.append(f"  - {name}: {len(eps)} endpoints, methods: {', '.join(methods)}")
+
+            # Attack paths — all paths with risk and steps
+            attack_paths = application_graph.get("attack_paths", [])
+            if attack_paths:
+                graph_parts.append("Attack Paths:")
+                for ap in attack_paths[:10]:
+                    risk = ap.get("risk", ap.get("risk_level", "?"))
+                    desc = ap.get("description", ap.get("name", "?"))
+                    steps = ap.get("steps", [])
+                    steps_str = " → ".join(str(s) if isinstance(s, str) else s.get("action", str(s)) for s in steps[:6])
+                    graph_parts.append(f"  - [{risk}] {desc}: {steps_str}")
+
+            # Auth flows
+            auth_flows = application_graph.get("auth_flows", [])
+            if auth_flows:
+                graph_parts.append("Auth Flows:")
+                for af in auth_flows[:5]:
+                    flow_type = af.get("type", af.get("name", "?"))
+                    login_url = af.get("login_url", af.get("url", "?"))
+                    token_type = af.get("token_type", af.get("mechanism", "?"))
+                    graph_parts.append(f"  - {flow_type}: {login_url} (token: {token_type})")
+
+            if graph_parts:
+                graph_section = "\n## Application Graph\n" + "\n".join(graph_parts)
+
+        # Format stateful crawl results (forms, multi-step flows, harvested IDs)
+        crawl_section = ""
+        if stateful_crawl:
+            crawl_parts = []
+
+            # Forms found
+            forms = stateful_crawl.get("forms", [])
+            if forms:
+                crawl_parts.append("Forms Found:")
+                for f in forms[:15]:
+                    action = f.get("action", f.get("url", "?"))
+                    method = f.get("method", "POST")
+                    fields = f.get("fields", f.get("inputs", []))
+                    field_names = [
+                        (fd.get("name", "?") if isinstance(fd, dict) else str(fd))
+                        for fd in fields[:8]
+                    ]
+                    crawl_parts.append(f"  - {method} {action} fields: {', '.join(field_names)}")
+
+            # Multi-step flows
+            flows = stateful_crawl.get("multi_step_flows", stateful_crawl.get("flows", []))
+            if flows:
+                crawl_parts.append("Multi-Step Flows:")
+                for fl in flows[:5]:
+                    name = fl.get("name", fl.get("description", "?"))
+                    step_count = len(fl.get("steps", []))
+                    crawl_parts.append(f"  - {name} ({step_count} steps)")
+
+            # Harvested IDs/tokens
+            harvested = stateful_crawl.get("harvested", stateful_crawl.get("tokens", stateful_crawl.get("ids", {})))
+            if harvested:
+                crawl_parts.append("Harvested IDs/Tokens:")
+                items = harvested.items() if isinstance(harvested, dict) else [(str(i), h) for i, h in enumerate(harvested)]
+                for key, val in list(items)[:10]:
+                    val_str = str(val)[:80]
+                    crawl_parts.append(f"  - {key}: {val_str}")
+
+            if crawl_parts:
+                crawl_section = "\n## Stateful Crawl Results\n" + "\n".join(crawl_parts)
+
         return f"""I'm PHANTOM, your AI hacking partner. Let's analyze this target together.
 
 TARGET: {domain}
@@ -1256,6 +1341,8 @@ VULNERABILITIES FOUND SO FAR ({len(vulns)}):
 {vuln_list or "  (none yet)"}
 
 {knowledge_context}
+{graph_section}
+{crawl_section}
 Based on everything above:
 1. What do you see that looks promising?
 2. What should I test that I might have missed?

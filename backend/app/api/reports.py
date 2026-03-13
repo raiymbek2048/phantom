@@ -14,6 +14,7 @@ from app.models.scan import Scan
 from app.models.target import Target
 from app.models.user import User
 from app.api.auth import get_current_user
+from app.modules.reporter import VULN_TYPE_CWE, SEVERITY_CVSS
 
 router = APIRouter()
 
@@ -231,6 +232,34 @@ def _severity_order(sev: str) -> int:
     return order.get(sev.upper() if isinstance(sev, str) else sev.value.upper(), 5)
 
 
+PIPELINE_PHASES = [
+    "Recon", "Subdomain Discovery", "Port Scan", "Fingerprint",
+    "Attack Routing", "Endpoint Discovery", "Application Graph",
+    "Stateful Crawling", "Sensitive Files",
+    "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
+    "Payload Generation", "WAF Detection", "Exploit",
+    "Service Attack", "Auth Attack", "Business Logic",
+    "Stress Test", "Vulnerability Confirmation",
+    "Claude Collaboration", "Evidence Collection", "Report Generation",
+]
+
+
+def _lookup_cwe(vuln_type_str: str) -> tuple:
+    """Look up CWE for a vuln type, trying full string first, then first part before underscore."""
+    vt = vuln_type_str.lower()
+    if vt in VULN_TYPE_CWE:
+        return VULN_TYPE_CWE[vt]
+    short = vt.split("_")[0]
+    if short in VULN_TYPE_CWE:
+        return VULN_TYPE_CWE[short]
+    return ("N/A", "N/A")
+
+
+def _lookup_cvss(severity_str: str) -> dict:
+    """Look up CVSS score/vector for a severity level."""
+    return SEVERITY_CVSS.get(severity_str.lower(), SEVERITY_CVSS.get("medium", {"score": 5.3, "vector": "N/A"}))
+
+
 def _render_scan_report_html(scan, target, vulns: list) -> str:
     domain = target.domain if target else "Unknown"
     scan_date = scan.created_at.strftime("%Y-%m-%d %H:%M") if scan else "N/A"
@@ -259,6 +288,21 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
             color = _severity_color(sev)
             severity_badges += f'<span class="badge" style="background:{color}">{sev}: {count}</span> '
 
+    # Pluralize
+    vuln_count_text = f"1 vulnerability" if len(vulns) == 1 else f"{len(vulns)} vulnerabilities"
+
+    # Extract scan_results data safely
+    scan_results = (scan.scan_results if scan and hasattr(scan, 'scan_results') and scan.scan_results else {}) or {}
+    recon_data = scan_results.get("recon") or {}
+    fingerprint_data = scan_results.get("fingerprint") or {}
+    technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
+    subdomains = scan_results.get("subdomains") or []
+    open_ports = scan_results.get("open_ports") or []
+    endpoints_data = scan_results.get("endpoint") or scan_results.get("endpoints") or {}
+    endpoints_count = len(endpoints_data) if isinstance(endpoints_data, list) else endpoints_data.get("count", 0) if isinstance(endpoints_data, dict) else 0
+    phases_completed = scan_results.get("phases_completed") or scan_results.get("completed_phases") or []
+    target_ip = recon_data.get("ip") or recon_data.get("ip_address") or ""
+
     # Calculate risk score
     risk_weights = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 8, "LOW": 2, "INFO": 0}
     risk_score = sum(risk_weights.get(s, 0) * c for s, c in severity_counts.items())
@@ -274,6 +318,9 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
         vtype = v.vuln_type.value if hasattr(v.vuln_type, 'value') else str(v.vuln_type)
         color = _severity_color(sev)
 
+        cvss_info = _lookup_cvss(sev)
+        cwe_info = _lookup_cwe(vtype)
+
         vuln_rows += f"""
         <tr>
             <td><span class="badge" style="background:{color}">{sev}</span></td>
@@ -281,6 +328,7 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
             <td><a href="#vuln-{i}">{v.title or vtype}</a></td>
             <td><code>{v.url or 'N/A'}</code></td>
             <td>{v.method or 'GET'}</td>
+            <td>{cvss_info['score']}</td>
         </tr>"""
 
         # Detail section
@@ -317,6 +365,8 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
                 <tr><td><strong>URL</strong></td><td><code>{v.url or 'N/A'}</code></td></tr>
                 <tr><td><strong>Parameter</strong></td><td><code>{v.parameter or 'N/A'}</code></td></tr>
                 <tr><td><strong>Method</strong></td><td>{v.method or 'GET'}</td></tr>
+                <tr><td><strong>CWE</strong></td><td>{cwe_info[0]} &mdash; {cwe_info[1]}</td></tr>
+                <tr><td><strong>CVSS</strong></td><td>{cvss_info['score']} ({cvss_info['vector']})</td></tr>
                 <tr><td><strong>Confidence</strong></td><td>{v.ai_confidence or 'N/A'}</td></tr>
             </table>
             <h4>Description</h4>
@@ -328,6 +378,33 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
             <h4>Remediation</h4>
             <p>{remediation}</p>
         </div>"""
+
+    # Build methodology phases HTML
+    phases_html = ""
+    for idx, phase in enumerate(PIPELINE_PHASES, 1):
+        phases_html += f'<div class="methodology-item"><span class="phase-num">{idx}</span>{phase}</div>'
+
+    # Build technologies list
+    tech_list = ""
+    if technologies:
+        if isinstance(technologies, list):
+            tech_list = ", ".join(str(t) for t in technologies[:30])
+        elif isinstance(technologies, dict):
+            tech_list = ", ".join(str(k) for k in technologies.keys())
+        else:
+            tech_list = str(technologies)
+
+    # Build subdomains preview
+    subdomains_list = ""
+    if subdomains and isinstance(subdomains, list):
+        subdomains_list = ", ".join(str(s) for s in subdomains[:20])
+        if len(subdomains) > 20:
+            subdomains_list += f" ... (+{len(subdomains) - 20} more)"
+
+    # Build open ports preview
+    ports_list = ""
+    if open_ports and isinstance(open_ports, list):
+        ports_list = ", ".join(str(p) for p in open_ports[:30])
 
     body = f"""
     <div class="header">
@@ -354,10 +431,41 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
                 <div class="summary-label">Risk Score</div>
                 <div class="summary-value" style="color:{risk_color}">{risk_score}/100 ({risk_level})</div>
             </div>
+            <div class="summary-card">
+                <div class="summary-label">Endpoints Tested</div>
+                <div class="summary-value">{endpoints_count or 'N/A'}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Phases Completed</div>
+                <div class="summary-value">{len(phases_completed) if isinstance(phases_completed, list) else phases_completed or 'N/A'} / {len(PIPELINE_PHASES)}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Subdomains Found</div>
+                <div class="summary-value">{len(subdomains) if isinstance(subdomains, list) else 'N/A'}</div>
+            </div>
         </div>
         <div style="margin-top:16px">
-            <strong>Findings:</strong> {len(vulns)} vulnerabilities &mdash; {severity_badges}
+            <strong>Findings:</strong> {vuln_count_text} &mdash; {severity_badges}
         </div>
+    </div>
+
+    <div class="section">
+        <h2>Methodology</h2>
+        <p style="color:var(--muted);margin-bottom:16px">PHANTOM executes a 20-phase automated penetration testing pipeline:</p>
+        <div class="methodology-list">
+            {phases_html}
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Recon / Scope</h2>
+        <table class="detail-table">
+            <tr><td><strong>Domain</strong></td><td>{domain}</td></tr>
+            <tr><td><strong>IP Address</strong></td><td>{target_ip or 'N/A'}</td></tr>
+            <tr><td><strong>Technologies</strong></td><td>{tech_list or 'N/A'}</td></tr>
+            <tr><td><strong>Subdomains</strong></td><td>{subdomains_list or 'None discovered'}</td></tr>
+            <tr><td><strong>Open Ports</strong></td><td>{ports_list or 'N/A'}</td></tr>
+        </table>
     </div>
 
     <div class="section">
@@ -370,6 +478,7 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
                     <th>Title</th>
                     <th>URL</th>
                     <th>Method</th>
+                    <th>CVSS</th>
                 </tr>
             </thead>
             <tbody>{vuln_rows}</tbody>
@@ -558,6 +667,34 @@ def _wrap_html(title: str, body: str) -> str:
             color: var(--muted);
             border-top: 1px solid var(--border);
             margin-top: 40px;
+        }}
+        .methodology-list {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 10px;
+        }}
+        .methodology-item {{
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 0.88rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .phase-num {{
+            background: var(--accent);
+            color: white;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 700;
+            flex-shrink: 0;
         }}
         .disclaimer {{ font-size: 0.8rem; margin-top: 8px; font-style: italic; }}
         @media print {{

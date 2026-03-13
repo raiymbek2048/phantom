@@ -5,8 +5,9 @@ import { useT } from "@/lib/i18n";
 
 const PHASE_KEYS = [
   "recon", "subdomain", "portscan", "fingerprint", "endpoint",
-  "sensitive_files", "vuln_scan", "nuclei", "ai_analysis", "payload_gen",
-  "waf", "exploit", "service_attack", "auth_attack", "stress_test",
+  "app_graph", "stateful_crawl", "sensitive_files", "vuln_scan", "nuclei",
+  "ai_analysis", "payload_gen", "waf", "exploit", "service_attack",
+  "auth_attack", "business_logic", "stress_test", "vuln_confirm",
   "claude_collab", "evidence", "report",
 ];
 

