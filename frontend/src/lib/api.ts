@@ -268,6 +268,7 @@ export async function getTargetReportPdf(targetId: string) {
 export async function validateScanReport(scanId: string, rounds: number = 1, continuous: boolean = false) {
   const { data } = await api.post(`/validate/scan/${scanId}`, null, {
     params: { rounds, continuous },
+    timeout: 300000, // 5 minutes — multi-round LLM validation is slow
   });
   return data;
 }
@@ -275,6 +276,7 @@ export async function validateScanReport(scanId: string, rounds: number = 1, con
 export async function validateTargetReport(targetId: string, rounds: number = 1, continuous: boolean = false) {
   const { data } = await api.post(`/validate/target/${targetId}`, null, {
     params: { rounds, continuous },
+    timeout: 300000,
   });
   return data;
 }

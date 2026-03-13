@@ -131,16 +131,16 @@ class LLMEngine:
         provider = await self._detect_provider()
         return provider is not None
 
-    async def analyze(self, prompt: str, temperature: float = 0.3) -> str:
+    async def analyze(self, prompt: str, temperature: float = 0.3, max_tokens: int = 4096) -> str:
         """Send prompt to Claude API."""
         provider = await self._detect_provider()
 
         if provider == "claude":
-            return await self._call_claude(prompt, temperature)
+            return await self._call_claude(prompt, temperature, max_tokens)
         else:
             raise LLMError("No LLM provider available (set ANTHROPIC_API_KEY)")
 
-    async def _call_claude(self, prompt: str, temperature: float) -> str:
+    async def _call_claude(self, prompt: str, temperature: float, max_tokens: int = 4096) -> str:
         """Call Claude API with auto-retry on 401."""
         try:
             response = await self.client.post(
@@ -148,7 +148,7 @@ class LLMEngine:
                 headers=self._claude_headers(),
                 json={
                     "model": self.claude_model,
-                    "max_tokens": 4096,
+                    "max_tokens": max_tokens,
                     "temperature": temperature,
                     "system": SYSTEM_PROMPT,
                     "messages": [{"role": "user", "content": prompt}],
@@ -164,7 +164,7 @@ class LLMEngine:
                         headers=self._claude_headers(),
                         json={
                             "model": self.claude_model,
-                            "max_tokens": 4096,
+                            "max_tokens": max_tokens,
                             "temperature": temperature,
                             "system": SYSTEM_PROMPT,
                             "messages": [{"role": "user", "content": prompt}],
@@ -186,9 +186,9 @@ class LLMEngine:
         except Exception as e:
             raise LLMError(f"Claude API error: {str(e)}")
 
-    async def analyze_json(self, prompt: str, temperature: float = 0.2) -> dict:
+    async def analyze_json(self, prompt: str, temperature: float = 0.2, max_tokens: int = 4096) -> dict:
         """Send prompt and parse JSON response. Retries once on parse failure."""
-        result = await self.analyze(prompt, temperature)
+        result = await self.analyze(prompt, temperature, max_tokens=max_tokens)
         parsed = self._extract_json(result)
         if parsed is not None:
             return parsed
@@ -197,7 +197,7 @@ class LLMEngine:
             prompt + "\n\nIMPORTANT: Respond with ONLY valid JSON. "
             "No markdown code fences, no explanation text."
         )
-        result = await self.analyze(retry_prompt, temperature=0.1)
+        result = await self.analyze(retry_prompt, temperature=0.1, max_tokens=max_tokens)
         parsed = self._extract_json(result)
         if parsed is not None:
             return parsed
@@ -212,6 +212,7 @@ class LLMEngine:
         except json.JSONDecodeError:
             pass
 
+        # Try code fences
         if "```" in text:
             match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
             if match:
@@ -220,8 +221,22 @@ class LLMEngine:
                 except json.JSONDecodeError:
                     pass
 
+        # Try greedy JSON extraction (outermost braces/brackets)
         for pattern in [r'\{[\s\S]*\}', r'\[[\s\S]*\]']:
             match = re.search(pattern, text)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    continue
+
+        # Try fixing common JSON issues: trailing commas, single quotes
+        cleaned = text
+        # Remove trailing commas before } or ]
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        # Try extraction again on cleaned text
+        for pattern in [r'\{[\s\S]*\}', r'\[[\s\S]*\]']:
+            match = re.search(pattern, cleaned)
             if match:
                 try:
                     return json.loads(match.group(0))

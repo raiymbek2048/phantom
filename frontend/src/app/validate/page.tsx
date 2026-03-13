@@ -159,7 +159,13 @@ export default function ValidatePage() {
       const data = await validateScanReport(selectedScan, rounds, continuous);
       setResult(data);
     } catch (e: any) {
-      setError(e?.response?.data?.detail || "Validation failed. Check if Claude API is available.");
+      if (e?.code === "ECONNABORTED" || e?.message?.includes("timeout")) {
+        setError("Validation timed out. Try with fewer rounds or a single round.");
+      } else if (e?.response?.status === 401) {
+        setError("Authentication failed. Please re-login.");
+      } else {
+        setError(e?.response?.data?.detail || "Validation failed. Server error — check backend logs.");
+      }
     }
     setLoading(false);
   };

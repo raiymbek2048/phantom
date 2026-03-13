@@ -231,7 +231,15 @@ async def validate_scan_report(
             "round_results": [],
         }
 
-    findings_text = _build_findings_text(vulns, target)
+    # Limit findings to top 50 by severity to avoid token overflow
+    MAX_FINDINGS = 50
+    if len(vulns) > MAX_FINDINGS:
+        logger.info(f"Limiting validation to top {MAX_FINDINGS} findings out of {len(vulns)}")
+        vulns_for_review = sorted(vulns, key=lambda v: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(_sev(v), 5))[:MAX_FINDINGS]
+    else:
+        vulns_for_review = vulns
+
+    findings_text = _build_findings_text(vulns_for_review, target)
     auto_score = _calculate_auto_risk_score(vulns)
 
     # Determine how many rounds to run
@@ -282,7 +290,7 @@ Findings:
 Review each finding through the lens of {angle['name']}. Be honest. Return ONLY valid JSON."""
 
             try:
-                review = await llm.analyze_json(prompt, temperature=0.3 + (round_idx * 0.05))
+                review = await llm.analyze_json(prompt, temperature=0.3 + (round_idx * 0.05), max_tokens=8192)
                 review["round_name"] = angle["name"]
                 review["round_number"] = round_idx + 1
                 round_results.append(review)
