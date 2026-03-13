@@ -2185,6 +2185,23 @@ Respond in JSON:
             flows_count = len(results.get("multi_step_flows", []))
             ids_count = sum(len(v) for v in results.get("harvested_ids", {}).values())
 
+            # Propagate auth session from stateful_crawl to context
+            if results.get("session_cookies"):
+                self.context["session_cookies"] = results["session_cookies"]
+                # Build auth_cookie string from session cookies for downstream phases
+                cookie_str = "; ".join(f"{k}={v}" for k, v in results["session_cookies"].items())
+                if cookie_str and not self.context.get("auth_cookie"):
+                    self.context["auth_cookie"] = cookie_str
+                    await self.log(db, "stateful_crawl", f"Auth session propagated: {len(results['session_cookies'])} cookies")
+            if results.get("auth_headers"):
+                self.context["auth_headers"] = results["auth_headers"]
+                # If bearer token found, set as auth_cookie for downstream
+                for hdr_val in results["auth_headers"].values():
+                    if "bearer" in str(hdr_val).lower() and not self.context.get("auth_cookie"):
+                        self.context["auth_cookie"] = f"token={hdr_val.replace('Bearer ', '')}"
+            if results.get("harvested_tokens"):
+                self.context["harvested_tokens"] = results["harvested_tokens"]
+
             # Merge harvested IDs into context for IDOR/auth tests
             existing_ids = self.context.get("harvested_ids", {})
             for key, values in results.get("harvested_ids", {}).items():

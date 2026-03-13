@@ -851,6 +851,11 @@ class StatefulCrawler:
         self.results["harvested_tokens"] = self.harvested_tokens
         self.results["authenticated_endpoints"] = self.authenticated_endpoints
         self.results["multi_step_flows"] = self.multi_step_flows
+        # Propagate auth state for downstream phases
+        if self.session_cookies:
+            self.results["session_cookies"] = dict(self.session_cookies)
+        if self.auth_headers:
+            self.results["auth_headers"] = dict(self.auth_headers)
         self.results["stats"] = {
             "pages_crawled": self.pages_crawled,
             "forms_found": len(self.forms_found),
