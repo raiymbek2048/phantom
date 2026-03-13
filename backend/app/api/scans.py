@@ -422,6 +422,21 @@ async def create_campaign_by_tag(
     }
 
 
+@router.get("/{scan_id}/graph")
+async def get_scan_graph(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get the application graph data from scan results."""
+    result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    scan = result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    graph = (scan.scan_results or {}).get("application_graph", {})
+    return graph
+
+
 @router.get("/{scan_id}")
 async def get_scan(
     scan_id: str,

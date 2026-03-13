@@ -101,11 +101,26 @@ Shows status diff, header diff, body length diff, and content diff.
 {"type": "conclusion", "verdict": "vulnerable/not_vulnerable/needs_more_testing", "findings": [...]}
 ```
 
+ATTACK PATH INTELLIGENCE:
+You have access to an Application Graph with identified attack paths.
+For each HIGH or CRITICAL risk attack path, you SHOULD generate specific test actions.
+Priority order: admin_takeover > payment_manipulation > idor_chain > file_upload_rce > api_key_exposure > privilege_escalation > mass_assignment
+
+When attack paths are provided:
+- Use chain_attack to walk through each path step-by-step
+- Use compare_responses on IDOR paths to prove data differs between users
+- Use extract_info on the first endpoint of each path to understand inputs/tokens needed
+- Tag your actions with the attack path name using the "attack_path" field, e.g.:
+```action
+{"type": "chain_attack", "attack_path": "admin_takeover", "steps": [...]}
+```
+This helps Phantom track which paths have been tested and which still need attention.
+
 STRATEGIC GUIDANCE:
 - Use generate_payload to create WAF-bypass payloads when standard payloads get blocked
 - Use fuzz_parameter to quickly test multiple injection types on a single endpoint
 - Use compare_responses to detect IDOR by comparing authenticated vs unauthenticated requests
-- Use chain_attack to test auth bypass: login → access admin → exfiltrate data
+- Use chain_attack to test auth bypass: login \u2192 access admin \u2192 exfiltrate data
 - Use extract_info to find hidden inputs, CSRF tokens, and JS endpoints before attacking
 - Think in attack chains: find IDOR first, then escalate to data exfiltration
 - If a WAF blocks you, use generate_payload with evasion techniques specific to that WAF
@@ -174,6 +189,9 @@ class ClaudeCollaboration:
         elif atype == "compare_responses":
             entry["url_a"] = action.get("request_a", {}).get("url", "")
             entry["url_b"] = action.get("request_b", {}).get("url", "")
+        # Track attack path association
+        if action.get("attack_path"):
+            entry["attack_path"] = action["attack_path"]
         self._action_history.append(entry)
 
     def _get_history_summary(self) -> str:
@@ -196,7 +214,16 @@ class ClaudeCollaboration:
                 detail += f" steps={h['step_count']}"
             if "payload_count" in h:
                 detail += f" payloads={h['payload_count']}"
+            if "attack_path" in h:
+                detail += f" [path:{h['attack_path']}]"
             lines.append(f"  {i}. [R{h.get('round', '?')}] {atype}{detail}")
+
+        # Summarize attack path coverage
+        tested_paths = set(h["attack_path"] for h in self._action_history if h.get("attack_path"))
+        if tested_paths:
+            lines.append(f"\nAttack paths tested so far: {', '.join(sorted(tested_paths))}")
+            lines.append("Focus on untested paths or dig deeper into partially tested ones.")
+
         lines.append("Avoid repeating these. Try different approaches.\n")
         return "\n".join(lines)
 
@@ -273,8 +300,25 @@ class ClaudeCollaboration:
                 # Check if Claude reached a conclusion
                 conclusions = [a for a in actions if a.get("type") == "conclusion"]
                 if conclusions:
+                    # Collect attack paths tested so far for tagging findings
+                    tested_paths = set(
+                        h["attack_path"] for h in self._action_history if h.get("attack_path")
+                    )
                     for c in conclusions:
                         new_findings = c.get("findings", [])
+                        # Tag each finding with its attack_path if the conclusion has one,
+                        # or if the finding's URL matches a tested attack path
+                        conclusion_path = c.get("attack_path", "")
+                        for finding in new_findings:
+                            if conclusion_path and not finding.get("attack_path"):
+                                finding["attack_path"] = conclusion_path
+                            elif not finding.get("attack_path") and tested_paths:
+                                # Try to associate finding with a tested path
+                                finding_url = (finding.get("url") or "").lower()
+                                for h in self._action_history:
+                                    if h.get("attack_path") and h.get("url", "").lower() in finding_url:
+                                        finding["attack_path"] = h["attack_path"]
+                                        break
                         self.findings.extend(new_findings)
                         for finding in new_findings:
                             await _emit({
@@ -340,6 +384,14 @@ class ClaudeCollaboration:
             if http_client:
                 await http_client.aclose()
 
+        # Build attack path coverage summary
+        tested_paths = {}
+        for h in self._action_history:
+            ap = h.get("attack_path")
+            if ap:
+                tested_paths.setdefault(ap, 0)
+                tested_paths[ap] += 1
+
         return {
             "domain": domain,
             "rounds": self.rounds,
@@ -347,6 +399,7 @@ class ClaudeCollaboration:
             "action_evidence": self._action_evidence,
             "actions_taken": len(self.actions_taken),
             "conversation_length": len(self.conversation),
+            "attack_paths_tested": tested_paths,
         }
 
     async def analyze_finding(self, vuln_data: dict, context: dict) -> dict:
@@ -493,6 +546,56 @@ What should I test to confirm? Give me specific actions."""
                         actions.append(action)
                 except (json.JSONDecodeError, IndexError):
                     pass
+
+        # Infer attack_path from surrounding text when not explicitly set
+        actions = self._tag_actions_with_attack_paths(actions, response)
+
+        return actions
+
+    def _tag_actions_with_attack_paths(self, actions: list[dict], response: str) -> list[dict]:
+        """Tag parsed actions with attack path names based on response context.
+
+        If Claude explicitly set "attack_path" in the action JSON, keep it.
+        Otherwise, try to infer from the surrounding prose in the response.
+        """
+        if not actions:
+            return actions
+
+        # Keywords that map to attack path names
+        _path_keywords = {
+            "admin_takeover": ["admin takeover", "admin access", "admin panel", "admin dashboard", "admin endpoint"],
+            "payment_manipulation": ["payment", "checkout", "price manipulation", "cart", "billing"],
+            "idor_chain": ["idor", "insecure direct object", "sequential id", "user enumeration"],
+            "file_upload_rce": ["file upload", "upload rce", "shell upload", "webshell"],
+            "api_key_exposure": ["api key", "key exposure", "leaked key", "secret key", "api token"],
+            "privilege_escalation": ["privilege escalation", "role escalation", "elevat"],
+            "mass_assignment": ["mass assignment", "parameter pollution", "extra field"],
+            "auth_bypass": ["auth bypass", "authentication bypass", "without auth", "skip auth"],
+        }
+        response_lower = response.lower()
+
+        for action in actions:
+            if action.get("attack_path"):
+                continue  # Already tagged by Claude
+
+            # Check action URLs against known path patterns
+            action_url = ""
+            if action.get("url"):
+                action_url = action["url"].lower()
+            elif action.get("steps"):
+                action_url = " ".join(
+                    (s.get("url", "") if isinstance(s, dict) else str(s))
+                    for s in action["steps"]
+                ).lower()
+
+            # Try to match against known path keywords in the prose or URL
+            for path_name, keywords in _path_keywords.items():
+                for kw in keywords:
+                    if kw in action_url or kw in response_lower:
+                        action["attack_path"] = path_name
+                        break
+                if action.get("attack_path"):
+                    break
 
         return actions
 
@@ -724,10 +827,13 @@ What should I test to confirm? Give me specific actions."""
     async def _exec_chain_attack(self, action: dict, http_client, domain: str) -> dict:
         """Execute a multi-step attack chain, passing cookies between steps."""
         steps = action.get("steps", [])
+        attack_path = action.get("attack_path", "")
         if not steps:
             return {"action": action, "error": "No steps provided"}
         if len(steps) > 10:
             return {"action": action, "error": "Too many steps (max 10)"}
+        if attack_path:
+            logger.info(f"Claude collab: executing chain_attack for attack path '{attack_path}' ({len(steps)} steps)")
 
         step_results = []
         # Cookie jars per step — accumulated cookies from responses
@@ -821,12 +927,16 @@ What should I test to confirm? Give me specific actions."""
                 step_results.append({"step": step_num, "error": str(e)})
 
         self.actions_taken.append(action)
-        return {
+        result = {
             "action": action,
             "chain_results": step_results,
             "steps_executed": len(step_results),
             "steps_succeeded": sum(1 for s in step_results if "status_code" in s),
         }
+        if attack_path:
+            result["attack_path"] = attack_path
+            result["attack_path_context"] = f"Testing as part of {attack_path} attack path"
+        return result
 
     async def _exec_fuzz_parameter(self, action: dict, http_client, domain: str) -> dict:
         """Fuzz a single parameter with multiple payloads."""
@@ -1257,16 +1367,63 @@ What should I test to confirm? Give me specific actions."""
                     ))
                     graph_parts.append(f"  - {name}: {len(eps)} endpoints, methods: {', '.join(methods)}")
 
-            # Attack paths — all paths with risk and steps
+            # Attack paths — all paths with risk and steps, sorted by priority
             attack_paths = application_graph.get("attack_paths", [])
             if attack_paths:
-                graph_parts.append("Attack Paths:")
-                for ap in attack_paths[:10]:
-                    risk = ap.get("risk", ap.get("risk_level", "?"))
-                    desc = ap.get("description", ap.get("name", "?"))
+                # Priority ordering for attack path types
+                _path_priority = {
+                    "admin_takeover": 0, "payment_manipulation": 1, "idor_chain": 2,
+                    "file_upload_rce": 3, "api_key_exposure": 4, "privilege_escalation": 5,
+                    "mass_assignment": 6,
+                }
+                _risk_priority = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+                def _ap_sort_key(ap):
+                    name = (ap.get("name") or ap.get("description") or "").lower().replace(" ", "_")
+                    risk = (ap.get("risk") or ap.get("risk_level") or "medium").lower()
+                    type_score = min((_path_priority.get(t, 99) for t in _path_priority if t in name), default=99)
+                    return (_risk_priority.get(risk, 99), type_score)
+
+                sorted_paths = sorted(attack_paths, key=_ap_sort_key)
+
+                graph_parts.append("\n## Priority Attack Paths (TEST THESE)")
+                for idx, ap in enumerate(sorted_paths[:10], 1):
+                    risk = (ap.get("risk") or ap.get("risk_level") or "?").upper()
+                    desc = ap.get("description") or ap.get("name") or "?"
+                    path_name = ap.get("name") or ap.get("id") or desc
                     steps = ap.get("steps", [])
-                    steps_str = " → ".join(str(s) if isinstance(s, str) else s.get("action", str(s)) for s in steps[:6])
-                    graph_parts.append(f"  - [{risk}] {desc}: {steps_str}")
+                    # Build step chain with URLs
+                    step_parts = []
+                    for s in steps[:8]:
+                        if isinstance(s, str):
+                            step_parts.append(s)
+                        elif isinstance(s, dict):
+                            url = s.get("url") or s.get("endpoint") or s.get("action") or str(s)
+                            method = s.get("method", "")
+                            step_parts.append(f"{method} {url}".strip() if method else url)
+                    steps_str = " → ".join(step_parts)
+                    graph_parts.append(f"  {idx}. [{risk}] {desc}: {steps_str}")
+                    # Add test suggestion based on path type
+                    name_lower = (path_name).lower().replace(" ", "_")
+                    if "admin" in name_lower or "takeover" in name_lower:
+                        graph_parts.append(f"     → Test: register user, login, try accessing admin endpoints")
+                    elif "idor" in name_lower:
+                        graph_parts.append(f"     → Test: access sequential IDs (1, 2, 3...), check if data differs")
+                    elif "payment" in name_lower or "checkout" in name_lower:
+                        graph_parts.append(f"     → Test: modify price parameter, add negative quantities, replay requests")
+                    elif "upload" in name_lower or "rce" in name_lower:
+                        graph_parts.append(f"     → Test: upload .php/.jsp shell, bypass extension filter, check execution")
+                    elif "api_key" in name_lower or "exposure" in name_lower:
+                        graph_parts.append(f"     → Test: access key endpoints without auth, check for leaked secrets")
+                    elif "privilege" in name_lower or "escalat" in name_lower:
+                        graph_parts.append(f"     → Test: change role parameter, access higher-privilege endpoints")
+                    elif "mass_assign" in name_lower:
+                        graph_parts.append(f"     → Test: add role/admin/is_staff fields to registration/update requests")
+                    elif "auth" in name_lower or "bypass" in name_lower:
+                        graph_parts.append(f"     → Test: access protected endpoints without token, with expired token")
+                    else:
+                        graph_parts.append(f"     → Test: use chain_attack to walk through steps, verify each transition")
+                    graph_parts.append(f"     (tag actions with attack_path: \"{path_name}\")")
 
             # Auth flows
             auth_flows = application_graph.get("auth_flows", [])
@@ -1359,7 +1516,11 @@ Use them strategically. Let's find everything. Give me actions to execute."""
         for i, r in enumerate(results, 1):
             action = r.get("action", {})
             atype = action.get("type", "?")
-            parts.append(f"--- Action {i}: {atype} ---")
+            attack_path = action.get("attack_path", "")
+            path_label = f" [attack_path: {attack_path}]" if attack_path else ""
+            parts.append(f"--- Action {i}: {atype}{path_label} ---")
+            if attack_path:
+                parts.append(f"(Testing as part of {attack_path} attack path)")
 
             if "error" in r:
                 parts.append(f"ERROR: {r['error']}")

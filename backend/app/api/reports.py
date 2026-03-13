@@ -2,7 +2,7 @@ from datetime import datetime
 
 import markdown
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -182,6 +182,167 @@ async def get_target_report_pdf(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _build_json_report(scan, target, vulns: list) -> dict:
+    """Build structured JSON report for Tumar One bug bounty platform."""
+    domain = target.domain if target else "unknown"
+
+    # Scan metadata
+    scan_duration = None
+    if scan and scan.started_at and scan.completed_at:
+        delta = scan.completed_at - scan.started_at
+        scan_duration = int(delta.total_seconds() / 60)
+
+    scan_results = (scan.scan_results if scan and hasattr(scan, 'scan_results') and scan.scan_results else {}) or {}
+    recon_data = scan_results.get("recon") or {}
+    fingerprint_data = scan_results.get("fingerprint") or {}
+    technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
+    if isinstance(technologies, dict):
+        technologies = list(technologies.keys())
+    phases_completed = scan_results.get("phases_completed") or scan_results.get("completed_phases") or []
+    target_ip = recon_data.get("ip") or recon_data.get("ip_address") or None
+
+    # Severity / type counts
+    severity_counts = {}
+    type_counts = {}
+    for v in vulns:
+        sev = v.severity.value if hasattr(v.severity, 'value') else str(v.severity)
+        severity_counts[sev.lower()] = severity_counts.get(sev.lower(), 0) + 1
+        vtype = v.vuln_type.value if hasattr(v.vuln_type, 'value') else str(v.vuln_type)
+        type_counts[vtype] = type_counts.get(vtype, 0) + 1
+
+    # Risk score
+    risk_weights = {"critical": 40, "high": 25, "medium": 8, "low": 2, "info": 0}
+    risk_score = sum(risk_weights.get(s, 0) * c for s, c in severity_counts.items())
+    risk_score = min(risk_score, 100)
+
+    # Build vulnerability list
+    vuln_list = []
+    for v in vulns:
+        sev = v.severity.value if hasattr(v.severity, 'value') else str(v.severity)
+        vtype = v.vuln_type.value if hasattr(v.vuln_type, 'value') else str(v.vuln_type)
+        cvss_info = _lookup_cvss(sev)
+        cwe_id, cwe_name = _lookup_cwe(vtype)
+
+        confirmed = False
+        if v.title and "[CONFIRMED]" in v.title:
+            confirmed = True
+
+        poc = {
+            "payload": v.payload_used or None,
+            "request": v.request_data if isinstance(v.request_data, dict) else None,
+            "response": v.response_data if isinstance(v.response_data, dict) else None,
+        }
+
+        vuln_list.append({
+            "id": str(v.id),
+            "title": v.title or vtype,
+            "type": vtype,
+            "severity": sev.lower(),
+            "cvss": {"score": cvss_info["score"], "vector": cvss_info["vector"]},
+            "cwe": {"id": cwe_id, "name": cwe_name},
+            "url": v.url or None,
+            "parameter": v.parameter or None,
+            "method": v.method or "GET",
+            "description": v.description or None,
+            "impact": v.impact if hasattr(v, 'impact') and v.impact else None,
+            "remediation": v.remediation or None,
+            "proof_of_concept": poc,
+            "confidence": v.ai_confidence,
+            "confirmed": confirmed,
+            "found_at": v.created_at.isoformat() if v.created_at else None,
+        })
+
+    return {
+        "report_format": "phantom_v1",
+        "generated_at": datetime.utcnow().isoformat(),
+        "target": {
+            "domain": domain,
+            "ip": target_ip,
+            "technologies": technologies if isinstance(technologies, list) else [],
+        },
+        "scan": {
+            "id": str(scan.id) if scan else None,
+            "type": scan.scan_type if scan and hasattr(scan, 'scan_type') else "full",
+            "started_at": scan.started_at.isoformat() if scan and scan.started_at else None,
+            "completed_at": scan.completed_at.isoformat() if scan and scan.completed_at else None,
+            "duration_minutes": scan_duration,
+            "phases_completed": len(phases_completed) if isinstance(phases_completed, list) else phases_completed,
+            "risk_score": risk_score,
+        },
+        "summary": {
+            "total_vulns": len(vulns),
+            "by_severity": severity_counts,
+            "by_type": type_counts,
+        },
+        "vulnerabilities": vuln_list,
+    }
+
+
+@router.get("/scan/{scan_id}/json")
+async def get_scan_report_json(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Export scan report as structured JSON for Tumar One bug bounty platform."""
+    scan_result = await db.execute(select(Scan).where(Scan.id == scan_id))
+    scan = scan_result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    target_result = await db.execute(select(Target).where(Target.id == scan.target_id))
+    target = target_result.scalar_one_or_none()
+
+    vulns_result = await db.execute(
+        select(Vulnerability)
+        .where(Vulnerability.scan_id == scan_id)
+        .order_by(Vulnerability.severity)
+    )
+    vulns = vulns_result.scalars().all()
+
+    report_data = _build_json_report(scan, target, vulns)
+    domain = target.domain if target else "unknown"
+    filename = f"phantom-report-{domain}-{scan_id[:8]}.json"
+
+    return JSONResponse(
+        content=report_data,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/target/{target_id}/json")
+async def get_target_report_json(
+    target_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Export target report as structured JSON for Tumar One bug bounty platform."""
+    target_result = await db.execute(select(Target).where(Target.id == target_id))
+    target = target_result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    vulns_result = await db.execute(
+        select(Vulnerability)
+        .where(Vulnerability.target_id == target_id)
+        .order_by(Vulnerability.severity)
+    )
+    vulns = vulns_result.scalars().all()
+
+    scans_result = await db.execute(
+        select(Scan).where(Scan.target_id == target_id).order_by(Scan.created_at.desc())
+    )
+    latest_scan = scans_result.scalars().first()
+
+    report_data = _build_json_report(latest_scan, target, vulns)
+    filename = f"phantom-report-{target.domain}.json"
+
+    return JSONResponse(
+        content=report_data,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

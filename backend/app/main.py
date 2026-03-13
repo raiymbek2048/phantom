@@ -31,6 +31,10 @@ async def _ensure_pg_enums(conn):
     # Add new columns to existing tables
     new_columns = [
         ("targets", "tags", "JSONB"),
+        ("schedules", "cron_expression", "VARCHAR(100)"),
+        ("schedules", "user_id", "VARCHAR REFERENCES users(id)"),
+        ("schedules", "enabled", "BOOLEAN DEFAULT TRUE"),
+        ("schedules", "updated_at", "TIMESTAMP"),
     ]
     for table, column, col_type in new_columns:
         try:

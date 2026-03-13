@@ -136,7 +136,7 @@ def run_scan_task(self, scan_id: str):
 
 @celery_app.task(name="phantom.check_schedules")
 def check_schedules_task():
-    """Check for due scheduled scans and launch them."""
+    """Check for due scheduled scans and launch them (supports cron expressions)."""
     import asyncio
 
     async def _check():
@@ -144,35 +144,60 @@ def check_schedules_task():
         reset_engine()
 
         from datetime import datetime, timedelta
-        from sqlalchemy import select
+        from sqlalchemy import select, or_
         from app.models.database import async_session
         from app.models.schedule import Schedule
         from app.models.scan import Scan, ScanStatus
 
+        try:
+            from croniter import croniter
+        except ImportError:
+            croniter = None
+
         async with async_session() as db:
             now = datetime.utcnow()
-            result = await db.execute(
-                select(Schedule).where(
-                    Schedule.is_active == True,
-                    Schedule.next_run_at <= now,
+
+            try:
+                result = await db.execute(
+                    select(Schedule).where(
+                        or_(Schedule.enabled == True, Schedule.is_active == True),
+                        Schedule.next_run_at <= now,
+                    )
                 )
-            )
-            schedules = result.scalars().all()
+                schedules = result.scalars().all()
+            except Exception as e:
+                # Table might not exist yet (pre-migration)
+                logger.debug(f"Schedule table query failed: {e}")
+                schedules = []
 
             for sched in schedules:
                 scan = Scan(
                     target_id=sched.target_id,
+                    user_id=getattr(sched, "user_id", None) or getattr(sched, "created_by", None),
                     scan_type=sched.scan_type,
                     status=ScanStatus.QUEUED,
+                    config={"scheduled": True, "schedule_id": sched.id},
                 )
                 db.add(scan)
                 await db.flush()
 
                 sched.last_run_at = now
-                sched.next_run_at = now + timedelta(seconds=sched.interval_seconds)
-                await db.commit()
 
+                # Compute next_run_at using croniter if cron_expression is set
+                cron_expr = getattr(sched, "cron_expression", None)
+                if cron_expr and croniter and croniter.is_valid(cron_expr):
+                    cron = croniter(cron_expr, now)
+                    sched.next_run_at = cron.get_next(datetime)
+                else:
+                    # Fallback to interval_seconds
+                    sched.next_run_at = now + timedelta(seconds=sched.interval_seconds)
+
+                await db.commit()
                 run_scan_task.delay(scan.id)
+                logger.info(
+                    f"Scheduled scan launched: scan={scan.id}, "
+                    f"schedule={sched.id}, next_run={sched.next_run_at}"
+                )
 
         # --- Detect and restart stuck scans (>2h without progress, max 3 retries) ---
         MAX_AUTO_RESTARTS = 3

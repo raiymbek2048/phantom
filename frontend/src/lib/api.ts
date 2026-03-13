@@ -99,6 +99,11 @@ export async function getScanLogs(id: string) {
   return data;
 }
 
+export async function getScanGraph(scanId: string) {
+  const { data } = await api.get(`/scans/${scanId}/graph`);
+  return data;
+}
+
 export async function compareScans(scanIdA: string, scanIdB: string) {
   const { data } = await api.get(`/scans/compare/${scanIdA}/${scanIdB}`);
   return data;

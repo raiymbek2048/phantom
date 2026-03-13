@@ -227,6 +227,12 @@ function ScanDetail() {
               >
                 <ShieldCheck className="w-4 h-4" /> Validate
               </button>
+              <Link
+                href={`/graph/${scan.id}`}
+                className="bg-green-600/20 text-green-400 hover:bg-green-600/30 px-4 py-2 rounded-lg text-sm flex items-center gap-2 transition"
+              >
+                <Network className="w-4 h-4" /> App Graph
+              </Link>
             </>
           )}
           {isActive && (
