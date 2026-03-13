@@ -106,6 +106,7 @@ from app.modules.vuln_confirmer import VulnConfirmer
 from app.modules.application_graph import ApplicationGraphBuilder
 from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
+from app.modules.auto_register import AutoRegister
 
 # Phase definitions with progress percentages
 PHASES = [
@@ -116,8 +117,9 @@ PHASES = [
     ("attack_routing", "Adaptive Attack Routing", 23),
     ("endpoint", "Endpoint Discovery", 28),
     ("app_graph", "Application Graph", 32),
-    ("stateful_crawl", "Stateful Crawling", 36),
-    ("sensitive_files", "Sensitive File Discovery", 40),
+    ("stateful_crawl", "Stateful Crawling", 34),
+    ("auto_register", "Auto Account Registration", 38),
+    ("sensitive_files", "Sensitive File Discovery", 42),
     ("vuln_scan", "Vulnerability Scanning", 46),
     ("nuclei", "Nuclei Deep Scan", 52),
     ("ai_analysis", "AI Analysis & Strategy", 56),
@@ -152,6 +154,7 @@ class ScanPipeline:
         "scan_id", "ports", "payloads", "evidence", "scope", "is_internal",
         "reachable", "rate_limit", "scan_type", "stealth", "bounty_mode",
         "custom_headers", "bounty_rules", "proxy_url", "cross_scan_intel",
+        "auto_register_result", "js_api_endpoints",
     ]
 
     def _make_json_serializable(self, obj):
@@ -693,7 +696,7 @@ class ScanPipeline:
         {
             "name": "Deep IDOR & Access Control",
             "context_flags": {"round_focus": "idor", "try_idor_patterns": True, "test_auth_bypass": True},
-            "phases": ["endpoint", "vuln_scan", "exploit", "vuln_confirm", "auth_attack", "ai_analysis"],
+            "phases": ["endpoint", "auto_register", "vuln_scan", "exploit", "vuln_confirm", "auth_attack", "ai_analysis"],
         },
         {
             "name": "Injection & RCE Hunting",
@@ -708,7 +711,7 @@ class ScanPipeline:
         {
             "name": "Business Logic & API Abuse",
             "context_flags": {"round_focus": "business_logic", "test_race_conditions": True, "test_mass_assignment": True},
-            "phases": ["endpoint", "app_graph", "stateful_crawl", "vuln_scan", "exploit", "business_logic", "vuln_confirm", "ai_analysis"],
+            "phases": ["endpoint", "app_graph", "stateful_crawl", "auto_register", "vuln_scan", "exploit", "business_logic", "vuln_confirm", "ai_analysis"],
         },
         {
             "name": "Auth & JWT Deep Dive",
@@ -1031,8 +1034,9 @@ Respond in JSON:
             ("attack_routing", 23, self._phase_attack_routing),
             ("endpoint", 28, self._phase_endpoint),
             ("app_graph", 32, self._phase_app_graph),
-            ("stateful_crawl", 36, self._phase_stateful_crawl),
-            ("sensitive_files", 40, self._phase_sensitive_files),
+            ("stateful_crawl", 34, self._phase_stateful_crawl),
+            ("auto_register", 38, self._phase_auto_register),
+            ("sensitive_files", 42, self._phase_sensitive_files),
             ("vuln_scan", 46, self._phase_vuln_scan),
             ("nuclei", 52, self._phase_nuclei),
             ("ai_analysis", 56, self._phase_ai_analysis),
@@ -1053,7 +1057,7 @@ Respond in JSON:
             # Skip heavy phases for quick scan
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
                     "evidence", "service_attack", "auth_attack", "stress_test",
-                    "stateful_crawl", "business_logic"}
+                    "stateful_crawl", "business_logic", "auto_register"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
             # Recalculate progress evenly
             for i, (n, _, f) in enumerate(phases):
@@ -2230,6 +2234,74 @@ Respond in JSON:
                 f"{ids_count} harvested IDs")
         except Exception as e:
             await self.log(db, "stateful_crawl", f"Stateful crawl error (non-fatal): {e}", "error")
+
+    async def _phase_auto_register(self, db: AsyncSession):
+        """Auto-register a test account, obtain auth tokens for authenticated testing."""
+        try:
+            registrar = AutoRegister(self.context)
+            result = await registrar.run()
+            self.context["auto_register_result"] = result
+
+            if result.get("authenticated"):
+                # Propagate auth token to context for all downstream phases
+                auth_header = result.get("auth_header")
+                if auth_header and not self.context.get("auth_cookie"):
+                    token = auth_header.replace("Bearer ", "")
+                    self.context["auth_cookie"] = f"token={token}"
+                    await self.log(db, "auto_register",
+                        f"Authenticated as {result.get('test_email')} (role: {result.get('user_role', 'unknown')})")
+
+                # Store user_id for IDOR testing
+                if result.get("user_id"):
+                    existing_ids = self.context.get("harvested_ids", {})
+                    user_ids = existing_ids.get("user_id", [])
+                    if result["user_id"] not in user_ids:
+                        user_ids.append(result["user_id"])
+                    existing_ids["user_id"] = user_ids
+                    self.context["harvested_ids"] = existing_ids
+
+                # Store JS-extracted endpoints for IDOR/exploit phases
+                js_eps = self.context.get("js_api_endpoints", [])
+                for ep in (self.context.get("endpoints") or []):
+                    url = ep.get("url", "") if isinstance(ep, dict) else str(ep)
+                    if url and url not in js_eps:
+                        js_eps.append(url)
+                self.context["js_api_endpoints"] = js_eps
+
+            # Save findings from auto_register (e.g., no email verification, user enumeration)
+            findings = result.get("findings", [])
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                saved = 0
+                for f in findings:
+                    vtype = VULN_TYPE_ALIASES.get(f.get("vuln_type", ""), VulnType.MISCONFIGURATION)
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=str(f.get("title", "Auth issue"))[:500],
+                        vuln_type=vtype,
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=str(f.get("url", ""))[:2000],
+                        method=f.get("method"),
+                        description=str(f.get("description", "")),
+                        impact=str(f.get("impact", "")),
+                        remediation=str(f.get("remediation", "")),
+                        ai_confidence=f.get("ai_confidence", 0.8),
+                    )
+                    r = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if r:
+                        saved += 1
+                await self.log(db, "auto_register",
+                    f"Auto-register: {saved} auth findings saved", "warning")
+
+            status = "authenticated" if result.get("authenticated") else (
+                "registered" if result.get("registered") else "no registration endpoint found")
+            await self.log(db, "auto_register", f"Auto-register status: {status}")
+        except Exception as e:
+            await self.log(db, "auto_register", f"Auto-register error (non-fatal): {e}", "error")
 
     async def _phase_business_logic(self, db: AsyncSession):
         """Test for business logic vulnerabilities."""

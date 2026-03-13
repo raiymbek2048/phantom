@@ -156,6 +156,7 @@ class BusinessLogicTester:
             ("File Upload", self._test_file_upload),
             ("Email Verification Bypass", self._test_email_verification_bypass),
             ("Search/Filter Injection", self._test_search_injection),
+            ("Stored XSS in Profiles/Orders", self._test_stored_xss),
         ]
 
         for name, method in test_methods:
@@ -1620,4 +1621,127 @@ class BusinessLogicTester:
                             break
                     except Exception:
                         continue
+        return findings
+
+    # ─── 11. Stored XSS in Profiles / Orders ─────────────────────────
+
+    PROFILE_PATHS = [
+        "/api/v1/users/me", "/api/v1/profile", "/api/v1/account",
+        "/api/users/me", "/api/profile", "/api/account",
+        "/api/v1/user/profile", "/api/v1/me",
+    ]
+    ORDER_PATHS = [
+        "/api/v1/orders", "/api/v1/order", "/api/orders",
+        "/api/v1/tasks", "/api/v1/posts", "/api/v1/comments",
+        "/api/v1/messages", "/api/v1/tickets",
+    ]
+    XSS_PAYLOADS = [
+        '<script>alert(1)</script>',
+        '<img src=x onerror=alert(document.cookie)>',
+        '"><svg/onload=alert(1)>',
+        "'-alert(1)-'",
+        '<details open ontoggle=alert(1)>',
+    ]
+    # Fields commonly vulnerable to stored XSS
+    PROFILE_FIELDS = ["fullName", "full_name", "name", "displayName", "display_name",
+                      "bio", "about", "description", "website", "company", "location",
+                      "firstName", "first_name", "lastName", "last_name", "nickname"]
+    ORDER_FIELDS = ["description", "title", "name", "comment", "note", "notes",
+                    "message", "text", "body", "content", "details", "subject"]
+
+    async def _test_stored_xss(self) -> list[dict]:
+        """Test for stored XSS by injecting payloads into profile and order fields."""
+        if not self.auth_cookie and "Authorization" not in self.headers:
+            logger.info("Stored XSS: skipped (no auth token)")
+            return []
+
+        findings = []
+        async with make_client(extra_headers=self.headers) as client:
+            # Test profile endpoints
+            for path in self.PROFILE_PATHS:
+                url = self._resolve_url(path)
+                findings.extend(await self._test_stored_xss_endpoint(
+                    client, url, self.PROFILE_FIELDS, "profile", "PUT"))
+                # Also try PATCH
+                findings.extend(await self._test_stored_xss_endpoint(
+                    client, url, self.PROFILE_FIELDS, "profile", "PATCH"))
+
+            # Test order/content creation endpoints
+            for path in self.ORDER_PATHS:
+                url = self._resolve_url(path)
+                findings.extend(await self._test_stored_xss_endpoint(
+                    client, url, self.ORDER_FIELDS, "order/content", "POST"))
+
+            # Also test endpoints from context that look like user-editable resources
+            for ep in self.endpoints:
+                ep_norm = self._normalize_endpoint(ep)
+                ep_url = ep_norm["url"].lower()
+                if any(kw in ep_url for kw in ("profile", "user", "account", "order",
+                                                 "post", "comment", "message", "ticket")):
+                    if ep_norm["method"] in ("PUT", "PATCH", "POST"):
+                        full_url = self._resolve_url(ep_norm["url"])
+                        fields = self.PROFILE_FIELDS if "user" in ep_url or "profile" in ep_url else self.ORDER_FIELDS
+                        findings.extend(await self._test_stored_xss_endpoint(
+                            client, full_url, fields, "dynamic", ep_norm["method"]))
+
+        return findings
+
+    async def _test_stored_xss_endpoint(self, client: httpx.AsyncClient,
+                                         url: str, fields: list[str],
+                                         context_type: str, method: str) -> list[dict]:
+        """Test a single endpoint for stored XSS across multiple fields."""
+        findings = []
+
+        for payload in self.XSS_PAYLOADS[:3]:  # Test top 3 payloads
+            for field in fields[:8]:  # Top 8 fields
+                try:
+                    body = {field: payload}
+                    async with self.semaphore:
+                        if method == "PUT":
+                            resp = await client.put(url, json=body)
+                        elif method == "PATCH":
+                            resp = await client.patch(url, json=body)
+                        else:
+                            resp = await client.post(url, json=body)
+
+                    if resp.status_code in (200, 201):
+                        resp_text = resp.text
+                        # Check if XSS payload is reflected back unescaped
+                        if payload in resp_text:
+                            findings.append(self._make_finding(
+                                title=f"Stored XSS in {context_type} field '{field}'",
+                                severity="high",
+                                url=url,
+                                method=method,
+                                parameter=field,
+                                description=(
+                                    f"XSS payload stored and reflected unescaped in {context_type} "
+                                    f"field '{field}'. The server accepted and returned the payload "
+                                    f"without sanitization or encoding."
+                                ),
+                                impact=(
+                                    "Attacker can inject JavaScript that executes in other users' "
+                                    "browsers, stealing session tokens, credentials, or performing "
+                                    "actions on behalf of victims."
+                                ),
+                                remediation=(
+                                    "Sanitize all user input on the server side. Use output encoding "
+                                    "(HTML entity encoding) when rendering user-supplied content. "
+                                    "Implement Content-Security-Policy headers."
+                                ),
+                                payload_used=f'{field}={payload}',
+                                confidence=0.95,
+                                request_data={"field": field, "payload": payload, "method": method},
+                                response_data={"status": resp.status_code,
+                                               "reflected": True,
+                                               "snippet": resp_text[:500]},
+                            ))
+                            # One finding per field is enough
+                            break
+                    elif resp.status_code == 404:
+                        # Endpoint doesn't exist, skip all fields
+                        return findings
+
+                except Exception:
+                    continue
         return findings
