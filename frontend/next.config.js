@@ -1,8 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
-  // API requests go through nginx directly (location /api/ in nginx.conf)
-  // No rewrites needed — they caused socket hang up on long LLM requests
+  async rewrites() {
+    return [
+      {
+        source: "/api/:path*",
+        destination: `${process.env.BACKEND_URL || "http://backend:8000"}/api/:path*`,
+      },
+    ];
+  },
 };
 
 module.exports = nextConfig;
