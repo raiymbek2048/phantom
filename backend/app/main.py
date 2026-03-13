@@ -35,6 +35,7 @@ async def _ensure_pg_enums(conn):
         ("schedules", "user_id", "VARCHAR REFERENCES users(id)"),
         ("schedules", "enabled", "BOOLEAN DEFAULT TRUE"),
         ("schedules", "updated_at", "TIMESTAMP"),
+        ("scans", "data", "JSONB"),
     ]
     for table, column, col_type in new_columns:
         try:

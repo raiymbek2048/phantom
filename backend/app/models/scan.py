@@ -43,6 +43,7 @@ class Scan(Base):
 
     # Config
     config: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # scan settings
+    data: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # scan results data (graph, tech, recon)
     priority: Mapped[int] = mapped_column(Integer, default=5)  # 1=highest, 10=lowest
 
     # Results summary

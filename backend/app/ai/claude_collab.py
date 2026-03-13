@@ -1354,6 +1354,8 @@ What should I test to confirm? Give me specific actions."""
             graph_parts = []
             # Entities summary — top entities with endpoint counts and methods
             entities = application_graph.get("entities", [])
+            if not isinstance(entities, list):
+                entities = list(entities.values()) if isinstance(entities, dict) else []
             if entities:
                 graph_parts.append("Entities:")
                 for ent in entities[:15]:
@@ -1369,6 +1371,8 @@ What should I test to confirm? Give me specific actions."""
 
             # Attack paths — all paths with risk and steps, sorted by priority
             attack_paths = application_graph.get("attack_paths", [])
+            if not isinstance(attack_paths, list):
+                attack_paths = list(attack_paths.values()) if isinstance(attack_paths, dict) else []
             if attack_paths:
                 # Priority ordering for attack path types
                 _path_priority = {
@@ -1445,6 +1449,8 @@ What should I test to confirm? Give me specific actions."""
 
             # Forms found
             forms = stateful_crawl.get("forms", [])
+            if not isinstance(forms, list):
+                forms = list(forms.values()) if isinstance(forms, dict) else []
             if forms:
                 crawl_parts.append("Forms Found:")
                 for f in forms[:15]:

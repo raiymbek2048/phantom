@@ -91,7 +91,14 @@ class AccessControlProver:
         self.base_url = context.get("base_url", "").rstrip("/")
         self.auth_cookie = context.get("auth_cookie", "")
         self.auth_header = context.get("auth_header", "")
-        self.harvested_ids = context.get("harvested_ids", [])
+        raw_ids = context.get("harvested_ids", [])
+        # harvested_ids can be dict[str, list] from stateful_crawler — flatten to list
+        if isinstance(raw_ids, dict):
+            self.harvested_ids = [v for vals in raw_ids.values() for v in (vals if isinstance(vals, (list, set)) else [vals])]
+        elif isinstance(raw_ids, list):
+            self.harvested_ids = raw_ids
+        else:
+            self.harvested_ids = []
         self.rate_limit = context.get("rate_limit") or 5
         self.context = context
         self.findings: list[dict] = []
