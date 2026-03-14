@@ -179,6 +179,7 @@ class AttackPlanner:
             )
 
             consecutive_empty = 0
+            consecutive_no_response = 0
 
             while self.rounds < self.max_rounds:
                 self.rounds += 1
@@ -192,13 +193,16 @@ class AttackPlanner:
 
                 response = await self._ask_claude()
                 if not response:
-                    if self.rounds < self.max_rounds:
-                        self.conversation.append({
-                            "role": "user",
-                            "content": "No response received. Please provide actions or use the done tool."
-                        })
-                        continue
-                    break
+                    consecutive_no_response += 1
+                    if consecutive_no_response >= 3:
+                        logger.warning("Attack Planner: 3 consecutive API failures, aborting")
+                        break
+                    self.conversation.append({
+                        "role": "user",
+                        "content": "No response received. Please provide actions or use the done tool."
+                    })
+                    continue
+                consecutive_no_response = 0
 
                 actions = self._parse_actions(response)
 
@@ -351,6 +355,9 @@ class AttackPlanner:
             if paths:
                 attack_paths_str = "\n\n## ATTACK PATHS IDENTIFIED BY APP GRAPH"
                 for i, path in enumerate(paths[:10], 1):
+                    if isinstance(path, str):
+                        attack_paths_str += f"\n  {i}. {path}"
+                        continue
                     risk = path.get("risk", path.get("risk_level", "medium"))
                     desc = path.get("description", path.get("name", "?"))
                     steps = path.get("steps", [])

@@ -1365,7 +1365,7 @@ What should I test to confirm? Give me specific actions."""
                     name = ent.get("name", ent.get("id", "?"))
                     eps = ent.get("endpoints", [])
                     methods = sorted(set(
-                        m for ep in eps for m in (
+                        m for ep in eps if isinstance(ep, dict) for m in (
                             [ep.get("method", "GET")] if isinstance(ep.get("method"), str)
                             else ep.get("methods", ["GET"])
                         )
@@ -1386,6 +1386,8 @@ What should I test to confirm? Give me specific actions."""
                 _risk_priority = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
                 def _ap_sort_key(ap):
+                    if isinstance(ap, str):
+                        return (99, 99)
                     name = (ap.get("name") or ap.get("description") or "").lower().replace(" ", "_")
                     risk = (ap.get("risk") or ap.get("risk_level") or "medium").lower()
                     type_score = min((_path_priority.get(t, 99) for t in _path_priority if t in name), default=99)
@@ -1395,6 +1397,9 @@ What should I test to confirm? Give me specific actions."""
 
                 graph_parts.append("\n## Priority Attack Paths (TEST THESE)")
                 for idx, ap in enumerate(sorted_paths[:10], 1):
+                    if isinstance(ap, str):
+                        graph_parts.append(f"  {idx}. {ap}")
+                        continue
                     risk = (ap.get("risk") or ap.get("risk_level") or "?").upper()
                     desc = ap.get("description") or ap.get("name") or "?"
                     path_name = ap.get("name") or ap.get("id") or desc
@@ -1437,6 +1442,9 @@ What should I test to confirm? Give me specific actions."""
             if auth_flows:
                 graph_parts.append("Auth Flows:")
                 for af in auth_flows[:5]:
+                    if isinstance(af, str):
+                        graph_parts.append(f"  - {af}")
+                        continue
                     flow_type = af.get("type", af.get("name", "?"))
                     login_url = af.get("login_url", af.get("url", "?"))
                     token_type = af.get("token_type", af.get("mechanism", "?"))
