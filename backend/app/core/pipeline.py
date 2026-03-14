@@ -625,12 +625,23 @@ class ScanPipeline:
                         "application_graph": self.context.get("application_graph", {}),
                         "technologies": self.context.get("technologies", []),
                         "recon_data": self.context.get("recon_data", {}),
+                        "fingerprint_data": self.context.get("fingerprint_data", {}),
                         "open_ports": self.context.get("open_ports", []),
+                        "subdomains": self.context.get("subdomains", []),
+                        "endpoints": [
+                            {"url": ep.get("url") if isinstance(ep, dict) else ep}
+                            for ep in (self.context.get("endpoints") or [])[:200]
+                        ],
                         "waf_info": self.context.get("waf_info", {}),
                         "stateful_crawl": {
                             k: v for k, v in (self.context.get("stateful_crawl") or {}).items()
                             if k in ("forms", "multi_step_flows", "authenticated_endpoints")
                         },
+                        "auto_register_result": {
+                            k: v for k, v in (self.context.get("auto_register_result") or {}).items()
+                            if k in ("registered", "authenticated", "test_email",
+                                     "register_endpoint", "login_endpoint", "user_role")
+                        } if self.context.get("auto_register_result") else {},
                         "phases_completed": [p[0] for p in phases],
                     }
                     from sqlalchemy.orm.attributes import flag_modified as _fm2

@@ -38,18 +38,37 @@ class StressTestModule:
         if not base_url:
             return []
 
-        # 1. Rate limiting test on discovered endpoints
+        # 1. Rate limiting test — focus on auth endpoints, skip static assets
         from app.utils.spa_detector import is_static_asset
 
         endpoints = context.get("endpoints", [])
-        test_urls = [base_url]
-        for ep in endpoints[:5]:
-            ep_url = ep.get("url") if isinstance(ep, dict) else ep
-            if ep_url and not is_static_asset(ep_url):
-                test_urls.append(ep_url)
+        auth_keywords = ("login", "signin", "auth", "token", "register",
+                         "signup", "password", "reset", "otp")
 
-        for url in test_urls[:5]:
-            result = await self._test_rate_limiting(url)
+        # Prioritize auth endpoints for rate limit testing
+        auth_urls = []
+        other_urls = []
+        for ep in endpoints:
+            ep_url = ep.get("url") if isinstance(ep, dict) else ep
+            if not ep_url or is_static_asset(ep_url):
+                continue
+            ep_lower = ep_url.lower()
+            if any(kw in ep_lower for kw in auth_keywords):
+                auth_urls.append(ep_url)
+            elif len(other_urls) < 3:
+                other_urls.append(ep_url)
+
+        # Test auth endpoints with POST (correct method for login/register)
+        for url in auth_urls[:3]:
+            result = await self._test_rate_limiting(
+                url, method="POST",
+                post_body={"email": "test@test.com", "password": "wrong"})
+            if result:
+                findings.append(result)
+
+        # Test base_url and a few other endpoints with GET
+        for url in [base_url] + other_urls[:2]:
+            result = await self._test_rate_limiting(url, method="GET")
             if result:
                 findings.append(result)
 
@@ -73,16 +92,32 @@ class StressTestModule:
         logger.info(f"Stress test: {len(findings)} resilience issues found")
         return findings
 
-    async def _test_rate_limiting(self, url: str) -> dict | None:
-        """Send rapid requests to test rate limiting."""
-        # Skip health/status endpoints — they are expected to accept unlimited requests
+    async def _test_rate_limiting(self, url: str, method: str = "GET",
+                                   post_body: dict | None = None) -> dict | None:
+        """Send rapid requests to test rate limiting.
+
+        Only reports a finding if the server returns 200/201 on all requests
+        (i.e. actually processes them). 403/401/429 responses mean protection
+        is already in place — NOT a vulnerability.
+        """
         from urllib.parse import urlparse
         path = urlparse(url).path.lower()
-        health_patterns = ("/health", "/healthz", "/status", "/ping", "/ready", "/alive")
-        if any(path.endswith(p) or path == p for p in health_patterns):
+
+        # Skip endpoints where rate limiting is irrelevant
+        skip_patterns = ("/health", "/healthz", "/status", "/ping", "/ready",
+                         "/alive", "/favicon", "/robots.txt", "/sitemap")
+        if any(path.endswith(p) or path == p for p in skip_patterns):
             return None
 
-        num_requests = 50
+        # Skip static assets
+        static_exts = ('.js', '.css', '.map', '.png', '.jpg', '.jpeg', '.gif',
+                       '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.webp')
+        if any(path.endswith(ext) for ext in static_exts):
+            return None
+        if '/assets/' in path or '/static/' in path or '/dist/' in path:
+            return None
+
+        num_requests = 20
         results = []
 
         async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
@@ -90,48 +125,68 @@ class StressTestModule:
 
             async def send_one(i):
                 try:
-                    resp = await client.get(url, headers={"X-Test": f"stress-{i}"})
+                    headers = {"X-Test": f"stress-{i}",
+                               "Content-Type": "application/json"}
+                    if method == "POST" and post_body:
+                        resp = await client.post(url, json=post_body, headers=headers)
+                    else:
+                        resp = await client.get(url, headers=headers)
                     return resp.status_code
                 except Exception:
                     return 0
 
-            # Send all requests concurrently
             tasks = [send_one(i) for i in range(num_requests)]
             results = await asyncio.gather(*tasks)
 
             elapsed = time.time() - start
 
-        success = sum(1 for r in results if r == 200)
+        # Count response categories
+        success = sum(1 for r in results if r in (200, 201))
         rate_limited = sum(1 for r in results if r == 429)
+        blocked = sum(1 for r in results if r in (403, 401))
         errors = sum(1 for r in results if r >= 500)
 
+        # If server blocks requests (403/401), that IS protection — not a vulnerability
+        if blocked > 0:
+            return None
+
+        # Only report if ALL requests were processed successfully (no blocking at all)
         if success == num_requests and rate_limited == 0:
             rps = num_requests / elapsed if elapsed > 0 else 0
+            # Determine severity based on endpoint type
+            is_auth = any(kw in path for kw in ("/login", "/signin", "/auth",
+                                                  "/token", "/register", "/signup",
+                                                  "/password", "/reset", "/otp"))
+            severity = "medium" if is_auth else "low"
             return {
-                "title": f"No rate limiting detected: {url}",
+                "title": f"No rate limiting on {'auth' if is_auth else ''} endpoint: {path}",
                 "url": url,
-                "severity": "info",
+                "severity": severity,
                 "vuln_type": "misconfiguration",
-                "payload": f"Sent {num_requests} concurrent GET requests in {elapsed:.1f}s",
-                "method": "GET",
-                "impact": f"Endpoint accepted all {num_requests} requests ({rps:.0f} req/s) "
-                         f"without rate limiting. Vulnerable to brute force and resource exhaustion.",
+                "payload": f"Sent {num_requests} concurrent {method} requests in {elapsed:.1f}s",
+                "method": method,
+                "impact": f"Endpoint processed all {num_requests} requests ({rps:.0f} req/s) "
+                         f"with HTTP 200. No rate limiting, blocking, or throttling detected."
+                         f"{' Brute-force attacks on credentials are possible.' if is_auth else ''}",
                 "remediation": "Implement rate limiting (e.g., nginx limit_req, "
-                              "application-level throttling). Recommended: 10-30 req/s per IP.",
+                              "application-level throttling). "
+                              f"{'For auth endpoints: max 5 attempts per 15 minutes per IP.' if is_auth else 'Recommended: 10-30 req/s per IP.'}",
+                "ai_confidence": 0.9 if is_auth else 0.7,
             }
 
-        if errors > num_requests * 0.3:
+        if errors > num_requests * 0.5:
             return {
-                "title": f"Server errors under moderate load: {url}",
+                "title": f"Server errors under moderate load: {path}",
                 "url": url,
                 "severity": "low",
                 "vuln_type": "misconfiguration",
                 "payload": f"{errors}/{num_requests} requests returned 5xx errors",
-                "method": "GET",
+                "method": method,
                 "impact": f"Server returned {errors} errors out of {num_requests} concurrent requests. "
                          f"The server may have stability issues under load.",
                 "remediation": "Improve server capacity, add connection pooling, "
                               "and implement graceful degradation.",
+                "ai_confidence": 0.5,
             }
 
         return None

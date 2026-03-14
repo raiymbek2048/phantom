@@ -197,13 +197,18 @@ def _build_json_report(scan, target, vulns: list) -> dict:
         scan_duration = int(delta.total_seconds() / 60)
 
     scan_results = (scan.data if scan and hasattr(scan, 'data') and scan.data else {}) or {}
-    recon_data = scan_results.get("recon") or {}
-    fingerprint_data = scan_results.get("fingerprint") or {}
+    recon_data = scan_results.get("recon_data") or scan_results.get("recon") or {}
+    fingerprint_data = scan_results.get("fingerprint_data") or scan_results.get("fingerprint") or {}
     technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
     if isinstance(technologies, dict):
         technologies = list(technologies.keys())
     phases_completed = scan_results.get("phases_completed") or scan_results.get("completed_phases") or []
     target_ip = recon_data.get("ip") or recon_data.get("ip_address") or None
+    if not target_ip:
+        for rec in recon_data.get("dns_records", []):
+            if rec.get("type") == "A":
+                target_ip = rec.get("value")
+                break
 
     # Severity / type counts
     severity_counts = {}
@@ -396,7 +401,7 @@ def _severity_order(sev: str) -> int:
 PIPELINE_PHASES = [
     "Recon", "Subdomain Discovery", "Port Scan", "Fingerprint",
     "Attack Routing", "Endpoint Discovery", "Application Graph",
-    "Stateful Crawling", "Sensitive Files",
+    "Stateful Crawling", "Auto Account Registration", "Sensitive Files",
     "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
     "Payload Generation", "WAF Detection", "Exploit",
     "Service Attack", "Auth Attack", "Business Logic",
@@ -454,15 +459,22 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
 
     # Extract scan_results data safely
     scan_results = (scan.data if scan and hasattr(scan, 'data') and scan.data else {}) or {}
-    recon_data = scan_results.get("recon") or {}
-    fingerprint_data = scan_results.get("fingerprint") or {}
+    recon_data = scan_results.get("recon_data") or scan_results.get("recon") or {}
+    fingerprint_data = scan_results.get("fingerprint") or scan_results.get("fingerprint_data") or {}
     technologies = scan_results.get("technologies") or fingerprint_data.get("technologies") or []
     subdomains = scan_results.get("subdomains") or []
     open_ports = scan_results.get("open_ports") or []
-    endpoints_data = scan_results.get("endpoint") or scan_results.get("endpoints") or {}
+    endpoints_data = scan_results.get("endpoints") or scan_results.get("endpoint") or {}
     endpoints_count = len(endpoints_data) if isinstance(endpoints_data, list) else endpoints_data.get("count", 0) if isinstance(endpoints_data, dict) else 0
     phases_completed = scan_results.get("phases_completed") or scan_results.get("completed_phases") or []
+
+    # Extract IP from DNS A records in recon_data
     target_ip = recon_data.get("ip") or recon_data.get("ip_address") or ""
+    if not target_ip:
+        for rec in recon_data.get("dns_records", []):
+            if rec.get("type") == "A":
+                target_ip = rec.get("value", "")
+                break
 
     # Calculate risk score
     risk_weights = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 8, "LOW": 2, "INFO": 0}
@@ -612,7 +624,7 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
 
     <div class="section">
         <h2>Methodology</h2>
-        <p style="color:var(--muted);margin-bottom:16px">PHANTOM executes a 20-phase automated penetration testing pipeline:</p>
+        <p style="color:var(--muted);margin-bottom:16px">PHANTOM executes a {len(PIPELINE_PHASES)}-phase automated penetration testing pipeline:</p>
         <div class="methodology-list">
             {phases_html}
         </div>
