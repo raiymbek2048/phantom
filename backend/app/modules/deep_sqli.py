@@ -376,7 +376,12 @@ class DeepSQLi:
         return False
 
     async def _check_time_blind(self, client, url, param, method, extra_fields, db_type) -> bool:
-        """Test time-based blind SQLi by measuring response delay."""
+        """Test time-based blind SQLi by measuring response delay.
+
+        Uses adaptive baseline calibration: measures 3 normal requests to compute
+        average + stddev, then uses threshold = max(baseline_avg * 3, TIME_THRESHOLD).
+        This avoids false positives on slow servers and false negatives on fast ones.
+        """
         if self._budget_exhausted():
             return False
 
@@ -385,13 +390,23 @@ class DeepSQLi:
         if db_type not in TIME_PAYLOADS:
             payloads = TIME_PAYLOADS["mysql"] + TIME_PAYLOADS["postgresql"]
 
-        # First measure baseline response time
-        baseline_start = time.monotonic()
-        baseline_resp = await self._send_safe(client, url, param, "1", method, extra_fields)
-        baseline_time = time.monotonic() - baseline_start
+        # Adaptive baseline: measure 3 normal requests for calibration
+        baseline_times = []
+        for _ in range(3):
+            if self._budget_exhausted():
+                break
+            b_start = time.monotonic()
+            b_resp = await self._send_safe(client, url, param, "1", method, extra_fields)
+            b_elapsed = time.monotonic() - b_start
+            if b_resp is not None:
+                baseline_times.append(b_elapsed)
 
-        if baseline_resp is None:
+        if not baseline_times:
             return False
+
+        baseline_avg = sum(baseline_times) / len(baseline_times)
+        # Adaptive threshold: at least TIME_THRESHOLD, or 3x the average baseline
+        adaptive_threshold = max(TIME_THRESHOLD, baseline_avg * 3)
 
         for payload_tmpl in payloads[:3]:  # Limit attempts
             if self._budget_exhausted():
@@ -401,8 +416,12 @@ class DeepSQLi:
             resp = await self._send_safe(client, url, param, payload, method, extra_fields)
             elapsed = time.monotonic() - start
 
-            if resp is not None and (elapsed - baseline_time) >= TIME_THRESHOLD:
-                logger.info(f"DeepSQLi: Time-based blind confirmed (elapsed={elapsed:.1f}s, baseline={baseline_time:.1f}s)")
+            if resp is not None and (elapsed - baseline_avg) >= adaptive_threshold:
+                logger.info(
+                    f"DeepSQLi: Time-based blind confirmed "
+                    f"(elapsed={elapsed:.1f}s, baseline_avg={baseline_avg:.2f}s, "
+                    f"threshold={adaptive_threshold:.2f}s)"
+                )
                 return True
 
         return False

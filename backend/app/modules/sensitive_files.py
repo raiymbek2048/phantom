@@ -167,6 +167,15 @@ class SensitiveFilesModule:
             if result:
                 findings.append(result)
 
+        # If .git/HEAD was found accessible, run deep git dump for secrets
+        git_exposed = any(
+            f.get("url", "").endswith(".git/HEAD") and f.get("severity") in ("critical", "high")
+            for f in findings
+        )
+        if git_exposed:
+            git_findings = await self._dump_git_objects(base_url)
+            findings.extend(git_findings)
+
         logger.info(f"Sensitive files: found {len(findings)} exposed files/endpoints")
         return findings
 
@@ -302,3 +311,125 @@ class SensitiveFilesModule:
                 secrets.append({"type": secret_type, "pattern": pattern})
 
         return secrets
+
+    async def _dump_git_objects(self, base_url: str) -> list[dict]:
+        """When .git is exposed, enumerate git objects to find secrets in commit history.
+
+        Fetches: .git/HEAD, .git/config, .git/logs/HEAD (commit log),
+        .git/refs/heads/*, .git/COMMIT_EDITMSG, .git/description,
+        and parses commit hashes to read loose objects.
+        """
+        findings = []
+        git_base = urljoin(base_url + "/", ".git/")
+        all_secrets = []
+        commit_messages = []
+
+        # Key git files that often contain sensitive data
+        git_paths = [
+            "config",           # May contain remote URLs with credentials
+            "logs/HEAD",        # Full commit log with author emails
+            "COMMIT_EDITMSG",   # Last commit message
+            "description",      # Repo description
+            "refs/heads/main",
+            "refs/heads/master",
+            "refs/heads/develop",
+            "refs/stash",       # Stashed changes (often contain secrets)
+            "info/refs",
+            "packed-refs",
+        ]
+
+        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=False) as client:
+            for gpath in git_paths:
+                try:
+                    async with self.rate_limit:
+                        resp = await client.get(f"{git_base}{gpath}")
+                        if resp.status_code != 200 or len(resp.text.strip()) < 3:
+                            continue
+
+                        body = resp.text
+
+                        # Check config for credentials in remote URLs
+                        if gpath == "config":
+                            url_matches = re.findall(
+                                r'url\s*=\s*(https?://[^\s]+:[^\s@]+@[^\s]+)', body
+                            )
+                            for cred_url in url_matches:
+                                all_secrets.append({
+                                    "type": "Git remote with credentials",
+                                    "source": f".git/{gpath}",
+                                    "value": cred_url[:80],
+                                })
+
+                        # Check logs for author emails
+                        if gpath == "logs/HEAD":
+                            emails = set(re.findall(r'<([^>]+@[^>]+)>', body))
+                            if emails:
+                                all_secrets.append({
+                                    "type": "Developer emails from git log",
+                                    "source": f".git/{gpath}",
+                                    "value": ", ".join(list(emails)[:10]),
+                                })
+                            # Extract commit hashes from log
+                            hashes = re.findall(r'\b([0-9a-f]{40})\b', body)
+                            commit_messages.extend(hashes[:20])
+
+                        # Scan all content for secrets
+                        secrets = self._extract_secrets(body)
+                        for s in secrets:
+                            s["source"] = f".git/{gpath}"
+                            all_secrets.append(s)
+
+                except Exception:
+                    continue
+
+            # Try to read a few commit objects (loose objects)
+            seen_hashes = set()
+            for commit_hash in commit_messages[:10]:
+                if commit_hash in seen_hashes:
+                    continue
+                seen_hashes.add(commit_hash)
+
+                # Git loose object path: .git/objects/ab/cdef...
+                obj_path = f"objects/{commit_hash[:2]}/{commit_hash[2:]}"
+                try:
+                    async with self.rate_limit:
+                        resp = await client.get(f"{git_base}{obj_path}")
+                        if resp.status_code == 200:
+                            # Loose objects are zlib-compressed, but some misconfigured
+                            # servers serve them as-is
+                            try:
+                                import zlib
+                                decompressed = zlib.decompress(resp.content).decode("utf-8", errors="replace")
+                                secrets = self._extract_secrets(decompressed)
+                                for s in secrets:
+                                    s["source"] = f".git/{obj_path}"
+                                    all_secrets.append(s)
+                            except Exception:
+                                # Try raw content
+                                secrets = self._extract_secrets(resp.text)
+                                for s in secrets:
+                                    s["source"] = f".git/{obj_path}"
+                                    all_secrets.append(s)
+                except Exception:
+                    continue
+
+        if all_secrets:
+            secret_types = list(set(s.get("type", "unknown") for s in all_secrets))
+            findings.append({
+                "title": f"Git repository exposed with {len(all_secrets)} secret(s) in history",
+                "url": git_base,
+                "severity": "critical",
+                "vuln_type": "info_disclosure",
+                "payload": f"curl {git_base}logs/HEAD",
+                "impact": f"Full git repository is accessible. Found {len(all_secrets)} secrets: "
+                         f"{', '.join(secret_types[:5])}. "
+                         "Attacker can reconstruct source code and extract credentials from commit history.",
+                "remediation": "Block access to .git directory via web server config. "
+                             "Rotate ALL exposed credentials immediately. "
+                             "Add 'deny from all' for .git in nginx/apache config.",
+                "method": "GET",
+                "secrets_found": len(all_secrets),
+                "secret_details": all_secrets[:20],
+            })
+
+        return findings

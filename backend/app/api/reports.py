@@ -406,7 +406,7 @@ PIPELINE_PHASES = [
     "Payload Generation", "WAF Detection", "Exploit",
     "Service Attack", "Auth Attack", "Business Logic",
     "Stress Test", "Vulnerability Confirmation",
-    "Claude Collaboration", "Evidence Collection", "Report Generation",
+    "Claude Collaboration", "AI Attack Planner", "Evidence Collection", "Report Generation",
 ]
 
 

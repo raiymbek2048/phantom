@@ -107,6 +107,7 @@ from app.modules.application_graph import ApplicationGraphBuilder
 from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
 from app.modules.auto_register import AutoRegister
+from app.core.attack_planner import AttackPlanner
 
 # Phase definitions with progress percentages
 PHASES = [
@@ -131,7 +132,8 @@ PHASES = [
     ("business_logic", "Business Logic Testing", 81),
     ("stress_test", "Resilience Testing", 84),
     ("vuln_confirm", "Vulnerability Confirmation", 88),
-    ("claude_collab", "Claude Deep Analysis", 93),
+    ("claude_collab", "Claude Deep Analysis", 90),
+    ("attack_planner", "AI Attack Planner", 94),
     ("evidence", "Evidence Collection", 97),
     ("report", "Report Generation", 100),
 ]
@@ -747,7 +749,7 @@ class ScanPipeline:
         {
             "name": "AI Creative Attack",
             "context_flags": {"round_focus": "creative", "ai_creative_mode": True},
-            "phases": ["ai_analysis", "payload_gen", "exploit", "vuln_confirm", "claude_collab"],
+            "phases": ["ai_analysis", "payload_gen", "exploit", "vuln_confirm", "claude_collab", "attack_planner"],
         },
     ]
 
@@ -780,6 +782,7 @@ class ScanPipeline:
             "business_logic": self._phase_business_logic,
             "stress_test": self._phase_stress_test,
             "claude_collab": self._phase_claude_collab,
+            "attack_planner": self._phase_attack_planner,
             "vuln_confirm": self._phase_vuln_confirm,
         }
 
@@ -1059,7 +1062,8 @@ Respond in JSON:
             ("business_logic", 81, self._phase_business_logic),
             ("stress_test", 84, self._phase_stress_test),
             ("vuln_confirm", 88, self._phase_vuln_confirm),
-            ("claude_collab", 93, self._phase_claude_collab),
+            ("claude_collab", 90, self._phase_claude_collab),
+            ("attack_planner", 94, self._phase_attack_planner),
             ("evidence", 97, self._phase_evidence),
             ("report", 100, self._phase_report),
         ]
@@ -2606,6 +2610,129 @@ Respond in JSON:
                     "title": title,
                     "url": url,
                 })
+
+    async def _phase_attack_planner(self, db: AsyncSession):
+        """AI Attack Planner: Claude-as-Brain reasoning loop for chained attacks."""
+        from app.ai.get_claude_key import get_claude_api_key
+        if not get_claude_api_key():
+            await self.log(db, "attack_planner", "Skipped: no Anthropic API key configured")
+            return
+
+        planner = AttackPlanner()
+        await self.log(db, "attack_planner",
+            f"Starting AI Attack Planner on {self.context['domain']}...")
+
+        # Load ALL vulns from DB for full context
+        try:
+            vuln_rows = (await db.execute(
+                select(Vulnerability).where(Vulnerability.scan_id == self.scan_id)
+            )).scalars().all()
+            if vuln_rows:
+                self.context["vulnerabilities"] = [
+                    {
+                        "vuln_type": v.vuln_type.value if v.vuln_type else "",
+                        "severity": v.severity.value if v.severity else "",
+                        "url": v.url or "",
+                        "title": v.title or "",
+                        "parameter": v.parameter or "",
+                        "payload_used": v.payload_used or "",
+                        "description": (v.description or "")[:200],
+                    }
+                    for v in vuln_rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to load vulns for Attack Planner: {e}")
+
+        # Inject RAG context if not already present
+        if not self.context.get("_rag_context"):
+            try:
+                from app.core.knowledge import KnowledgeBase
+                kb = KnowledgeBase()
+                techs = list((self.context.get("technologies") or {}).get("summary", {}).keys())
+                rag_parts = []
+                for vt_value in set(v.get("vuln_type", "") for v in self.context.get("vulnerabilities", []))[:3]:
+                    if vt_value:
+                        payloads = await kb.get_effective_payloads(db, vt_value)
+                        if payloads:
+                            rag_parts.append(f"Effective {vt_value} payloads: " + ", ".join(p["payload"][:60] for p in payloads[:3]))
+                if rag_parts:
+                    self.context["_rag_context"] = "\nKB INTELLIGENCE:\n" + "\n".join(rag_parts) + "\n"
+            except Exception:
+                pass
+
+        # WebSocket callback
+        async def on_planner_event(event: dict):
+            await self._publish({"type": "attack_planner_event", **event})
+
+        result = await planner.run(self.context, on_event=on_planner_event)
+
+        rounds = result.get("rounds", 0)
+        findings = result.get("findings", [])
+        actions = result.get("actions_executed", 0)
+
+        if result.get("error"):
+            await self.log(db, "attack_planner",
+                f"Attack Planner error: {result['error']} ({rounds} rounds)", "warning")
+
+        await self.log(db, "attack_planner",
+            f"Attack Planner: {rounds} rounds, {actions} actions, {len(findings)} findings",
+            "success" if findings else "info")
+
+        # Save findings as Vulnerability records
+        if findings:
+            scan_result = await db.execute(
+                select(Scan).where(Scan.id == self.context["scan_id"])
+            )
+            scan = scan_result.scalar_one_or_none()
+
+            _SEVERITY_MAP = {v.value: v for v in Severity}
+
+            for f in findings:
+                raw_type = str(f.get("vuln_type", "")).lower().strip().replace(" ", "_").replace("-", "_")
+                vuln_type = VULN_TYPE_ALIASES.get(raw_type, VulnType.INFO_DISCLOSURE)
+
+                raw_sev = str(f.get("severity", "medium")).lower().strip()
+                severity = _SEVERITY_MAP.get(raw_sev, Severity.MEDIUM)
+
+                title = f.get("title", f"Attack Planner: {vuln_type.value}")
+                description = f.get("description", "")
+                chain_info = f.get("chain", "")
+                if chain_info:
+                    description = f"{description}\n\nAttack Chain: {chain_info}"
+
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=f"[AI Planner] {title}"[:500],
+                    vuln_type=vuln_type,
+                    severity=severity,
+                    url=(f.get("url") or self.context.get("base_url", ""))[:2000],
+                    parameter=f.get("parameter"),
+                    description=description,
+                    impact=f.get("impact"),
+                    remediation=f.get("remediation"),
+                    payload_used=f.get("payload"),
+                    ai_confidence=0.8,
+                    ai_analysis=json.dumps(f, default=str),
+                )
+
+                saved = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict={
+                    "vuln_type": vuln_type.value,
+                    "severity": severity.value,
+                    "url": vuln.url,
+                    "title": title,
+                    "source": "attack_planner",
+                })
+
+                if saved:
+                    await self._publish({
+                        "type": "new_vuln",
+                        "source": "attack_planner",
+                        "vuln_id": saved.id,
+                        "vuln_type": vuln_type.value,
+                        "severity": severity.value,
+                        "title": title,
+                    })
 
     async def _phase_vuln_confirm(self, db: AsyncSession):
         """Confirm all detected vulnerabilities by attempting actual exploitation.

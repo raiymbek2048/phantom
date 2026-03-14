@@ -275,7 +275,10 @@ Example: ["payload1", "payload2"]"""
         return self._fallback_payloads(vuln_type)
 
     def _fallback_payloads(self, vuln_type: str) -> list[str]:
-        """Hardcoded fallback payloads."""
+        """Hardcoded fallback payloads with randomized markers for SSTI."""
+        import random
+        # Generate unique random marker for SSTI (avoids false positives from natural page content)
+        _ssti_marker = random.randint(10000, 99999)
         payloads = {
             "xss": [
                 '<script>alert(1)</script>',
@@ -330,6 +333,13 @@ Example: ["payload1", "payload2"]"""
                 "http://192.168.1.1",
             ],
             "ssti": [
+                # Randomized markers — unique per scan, virtually zero false positives
+                f"{{{{{_ssti_marker}*2}}}}",
+                f"${{{_ssti_marker}*2}}",
+                f"#{{{_ssti_marker}*2}}",
+                f"<%= {_ssti_marker}*2 %>",
+                # Classic markers as fallback
+                "{{7*'7'}}",
                 "{{7*7}}",
                 "${7*7}",
                 "#{7*7}",
