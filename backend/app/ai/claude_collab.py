@@ -1359,6 +1359,9 @@ What should I test to confirm? Give me specific actions."""
             if entities:
                 graph_parts.append("Entities:")
                 for ent in entities[:15]:
+                    if isinstance(ent, str):
+                        graph_parts.append(f"  - {ent}")
+                        continue
                     name = ent.get("name", ent.get("id", "?"))
                     eps = ent.get("endpoints", [])
                     methods = sorted(set(

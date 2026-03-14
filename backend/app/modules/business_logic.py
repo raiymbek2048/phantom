@@ -243,6 +243,8 @@ class BusinessLogicTester:
         # --- Enrich from application graph entities ---
         app_graph = self.context.get("application_graph", {})
         for entity in app_graph.get("entities", []):
+            if isinstance(entity, str):
+                continue
             entity_type = (entity.get("type") or entity.get("name", "")).lower()
             if any(kw in entity_type for kw in ("payment", "order", "cart",
                                                   "invoice", "checkout", "billing")):
@@ -820,6 +822,8 @@ class BusinessLogicTester:
         # --- Enrich payloads from application graph entities ---
         app_graph = self.context.get("application_graph", {})
         for entity in app_graph.get("entities", []):
+            if isinstance(entity, str):
+                continue
             entity_type = (entity.get("type") or entity.get("name", "")).lower()
             if any(kw in entity_type for kw in ("user", "account", "profile",
                                                   "member", "role")):
