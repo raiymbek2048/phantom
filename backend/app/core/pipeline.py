@@ -2669,13 +2669,19 @@ Respond in JSON:
         rounds = result.get("rounds", 0)
         findings = result.get("findings", [])
         actions = result.get("actions_executed", 0)
+        reflector_uses = result.get("reflector_uses", 0)
+        monitor_triggers = result.get("monitor_triggers", 0)
 
         if result.get("error"):
             await self.log(db, "attack_planner",
                 f"Attack Planner error: {result['error']} ({rounds} rounds)", "warning")
 
-        await self.log(db, "attack_planner",
-            f"Attack Planner: {rounds} rounds, {actions} actions, {len(findings)} findings",
+        stats = f"Attack Planner: {rounds} rounds, {actions} actions, {len(findings)} findings"
+        if reflector_uses:
+            stats += f", {reflector_uses} reflections"
+        if monitor_triggers:
+            stats += f", {monitor_triggers} pivots"
+        await self.log(db, "attack_planner", stats,
             "success" if findings else "info")
 
         # Save findings as Vulnerability records

@@ -1,21 +1,20 @@
 """
-AI Attack Planner — Claude-as-Brain reasoning loop.
+AI Attack Planner v2 — Multi-agent reasoning loop with smart context management.
 
-Unlike the fixed 24-phase pipeline where each module runs independently,
-the Attack Planner gives Claude full control to:
-1. See ALL findings from the pipeline
-2. Build attack trees (chained multi-step attacks)
-3. Execute arbitrary HTTP requests to prove exploitation
-4. Reason about what to try next based on results
-5. Chain vulnerabilities together (e.g., SSRF → credential leak → admin access)
-
-This is the "senior hacker brain" that thinks strategically about the target.
+Upgrades over v1:
+- Reflector: forces Claude back into tool-call format when it outputs plain text
+- Execution Monitor: detects loops (repeated URLs/tools) and pivots strategy
+- Context compression: summarizes large responses, compresses old conversation
+- Sploitus integration: searches real CVE exploits for discovered tech stack
+- Sensitive data anonymization for KB storage
+- Better briefing with exploit intelligence
 """
 import asyncio
 import json
 import logging
 import re
 import secrets
+from collections import Counter
 from datetime import datetime
 from urllib.parse import urlparse, urljoin, urlencode
 
@@ -46,88 +45,99 @@ Find vulnerabilities that automated scanners MISS. Think creatively. Chain findi
 
 Execute these by writing ```action blocks:
 
-### HTTP Requests
 ```action
-{"tool": "http", "method": "GET", "url": "https://...", "headers": {}, "body": null}
-```
-```action
-{"tool": "http", "method": "POST", "url": "https://...", "headers": {"Content-Type": "application/json"}, "body": {"key": "value"}}
-```
-```action
-{"tool": "http", "method": "PUT", "url": "https://...", "headers": {}, "body": {"role": "admin"}}
-```
-```action
-{"tool": "http", "method": "DELETE", "url": "https://..."}
+{"tool": "http", "method": "GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD", "url": "https://...", "headers": {}, "body": {}}
 ```
 
-### JWT Operations
 ```action
 {"tool": "jwt_decode", "token": "eyJ..."}
 ```
+
 ```action
-{"tool": "jwt_forge", "payload": {"sub": "admin", "role": "admin"}, "algorithm": "none"}
-```
-```action
-{"tool": "jwt_forge", "payload": {"sub": "1", "role": "admin"}, "algorithm": "HS256", "secret": "secret"}
+{"tool": "jwt_forge", "algorithm": "none|HS256", "payload": {"sub": "admin"}, "secret": ""}
 ```
 
-### Diff Two Responses (detect IDOR, auth bypass)
 ```action
-{"tool": "diff", "request_a": {"method": "GET", "url": "https://.../api/user/1"}, "request_b": {"method": "GET", "url": "https://.../api/user/2"}}
+{"tool": "diff", "request_a": {"url": "...", "method": "GET"}, "request_b": {"url": "...", "method": "GET"}}
 ```
 
-### Auth-as-user (login and save session)
 ```action
-{"tool": "login", "url": "https://.../api/login", "body": {"email": "test@test.com", "password": "password123"}, "extract_token": true}
+{"tool": "login", "url": "https://...", "body": {"username": "admin", "password": "admin"}, "extract_token": true}
 ```
 
-### Fuzz a parameter with multiple values
 ```action
-{"tool": "fuzz", "url": "https://.../search", "param": "q", "method": "GET", "values": ["'", "\"", "<script>", "{{7*7}}", "${7*7}", "../etc/passwd", "1 OR 1=1--"]}
+{"tool": "fuzz", "url": "https://...", "param": "id", "values": ["1", "2", "0", "-1", "admin", "{{7*7}}", "<script>"], "method": "GET"}
 ```
 
-### Extract page structure (forms, hidden inputs, scripts, links)
 ```action
-{"tool": "extract", "url": "https://.../login"}
+{"tool": "extract", "url": "https://..."}
 ```
 
-### Report a confirmed vulnerability
 ```action
-{"tool": "report_vuln", "title": "JWT Algorithm None Bypass", "vuln_type": "jwt", "severity": "critical", "url": "https://.../api/profile", "description": "Server accepts JWT with algorithm=none, allowing authentication bypass", "payload": "eyJ0eXAiOiJKV1QiLCJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.", "evidence": "Response returned admin user data with forged token", "chain": "JWT None → Admin Access → Full User Data Leak"}
+{"tool": "search_exploits", "query": "Apache 2.4.49 RCE"}
 ```
 
-### Mark task complete
 ```action
-{"tool": "done", "summary": "Tested X attack paths, found Y confirmed vulnerabilities"}
+{"tool": "report_vuln", "title": "...", "vuln_type": "sqli|xss|ssrf|idor|auth_bypass|rce|ssti|lfi|cors|info_disclosure|business_logic|misconfiguration", "severity": "critical|high|medium|low", "url": "https://...", "parameter": "...", "description": "...", "impact": "...", "payload": "...", "proof": "Explain what response proves exploitation"}
 ```
 
-## THINKING FRAMEWORK
+```action
+{"tool": "done", "summary": "What was found and tested"}
+```
 
-For each target, follow this mental model:
-
-1. **Understand the app**: What does it do? What's the tech stack? What auth mechanism?
-2. **Map the attack surface**: What endpoints exist? What parameters accept input? What's behind auth?
-3. **Identify high-value targets**: Admin panels, payment flows, file uploads, API keys
-4. **Build attack hypotheses**: "If JWT uses HS256, I should try known weak secrets"
-5. **Execute and verify**: Send the actual requests, verify the response shows real data
-6. **Chain findings**: "I found IDOR on /api/users/ID → now let me get admin's ID → access admin data"
-
-## CRITICAL RULES
-
-1. **VERIFY EVERYTHING**: Don't report a vuln unless you see REAL evidence in the response (actual data, not HTML shells)
-2. **SPA AWARENESS**: React/Vue/Angular apps serve the same HTML for ALL routes. /admin returning 200 with `<div id="root">` is NOT a vuln — test the API layer
-3. **NO DUPLICATES**: Don't report vulns that the scanner already found (listed below)
-4. **STAY IN SCOPE**: Only test the target domain and its subdomains
-5. **BE CREATIVE**: The whole point is to find what scanners miss. Think laterally.
-6. **CHAIN ATTACKS**: A single IDOR is medium. IDOR → admin data → account takeover is critical.
-7. **USE CONTEXT**: If you see "Django" in headers, try Django-specific exploits. If you see "Express", try prototype pollution.
+## RULES
+1. ALWAYS use ```action blocks — never just describe what you'd do
+2. You can include MULTIPLE action blocks in ONE response
+3. After seeing results, analyze them and decide next steps
+4. Report ONLY vulnerabilities you PROVED with actual HTTP responses
+5. Don't re-report vulnerabilities already found by the scanner
+6. Stay in scope (target domain and subdomains only)
+7. When stuck, try a completely different attack vector instead of repeating
+8. Use search_exploits to find real CVE exploits when you identify specific tech versions
 
 You can include multiple ```action blocks in a single response. I'll execute them all and show you results.
 Keep going until you've exhausted all promising attack paths, then use the "done" tool."""
 
+# Reflector prompt — forces Claude back into tool-call format
+REFLECTOR_PROMPT = """Your response did not contain any ```action blocks. You MUST use structured tool calls.
+
+REMINDER: Always respond with ```action blocks. Do NOT just describe what you would do — actually DO it.
+
+If you're done testing, use:
+```action
+{"tool": "done", "summary": "..."}
+```
+
+If you want to test something, use:
+```action
+{"tool": "http", "method": "GET", "url": "..."}
+```
+
+Rewrite your response with proper ```action blocks now."""
+
+# Execution monitor prompt — injected when loop is detected
+MONITOR_PROMPT = """⚠️ EXECUTION MONITOR: I've detected you may be stuck in a loop.
+
+Actions so far: {action_count}
+Most repeated: {repeated}
+Unique URLs tested: {unique_urls}
+
+RECOMMENDATIONS:
+1. STOP testing the same endpoints with similar payloads
+2. Try a COMPLETELY DIFFERENT attack vector:
+   - If you were testing XSS, try IDOR or auth bypass instead
+   - If you were testing APIs, try file/path traversal
+   - If you were testing injection, try business logic flaws
+   - Try HTTP verb tampering (PUT/DELETE on GET endpoints)
+   - Try parameter pollution (?param=a&param=b)
+   - Try race conditions (simultaneous requests)
+3. If you've exhausted all vectors, use the done tool
+
+What NEW attack vector will you try?"""
+
 
 class AttackPlanner:
-    """Claude-driven attack planning and execution engine."""
+    """Claude-driven attack planning and execution engine with smart loop detection."""
 
     def __init__(self):
         self.client = None
@@ -138,24 +148,25 @@ class AttackPlanner:
         self.findings: list[dict] = []
         self.rounds = 0
         self.max_rounds = 20
-        self._session_cookies: dict = {}  # Cookies from login actions
-        self._session_token: str | None = None  # JWT/Bearer token from login
+        self._session_cookies: dict = {}
+        self._session_token: str | None = None
         self._action_log: list[dict] = []
+        # Loop detection
+        self._url_counter: Counter = Counter()
+        self._tool_counter: Counter = Counter()
+        self._reflector_uses = 0
+        self._monitor_triggers = 0
+        # Context management
+        self._llm = None
 
     async def run(self, context: dict, on_event=None) -> dict:
-        """
-        Run the AI Attack Planner loop.
-
-        Args:
-            context: Full scan context with all findings, endpoints, technologies
-            on_event: Optional async callback for WebSocket events
-        """
+        """Run the AI Attack Planner loop with all smart features."""
         if not self.client:
             logger.warning("Attack Planner: no Claude API key")
             return {"findings": [], "rounds": 0, "error": "no_api_key"}
 
         domain = context.get("domain", "unknown")
-        logger.info(f"Attack Planner: starting on {domain}")
+        logger.info(f"Attack Planner v2: starting on {domain}")
 
         async def _emit(event: dict):
             if on_event:
@@ -164,8 +175,9 @@ class AttackPlanner:
                 except Exception:
                     pass
 
-        initial_message = self._build_briefing(context)
-        self.conversation = [{"role": "user", "content": initial_message}]
+        # Enrich briefing with exploit intelligence
+        briefing = await self._build_enriched_briefing(context)
+        self.conversation = [{"role": "user", "content": briefing}]
 
         http_client = None
         try:
@@ -189,6 +201,9 @@ class AttackPlanner:
                     "message": f"Attack Planner thinking (round {self.rounds})...",
                 })
 
+                # Context compression before sending to Claude
+                self._maybe_compress_context()
+
                 response = await self._ask_claude()
                 if not response:
                     consecutive_no_response += 1
@@ -197,12 +212,22 @@ class AttackPlanner:
                         break
                     self.conversation.append({
                         "role": "user",
-                        "content": "No response received. Please provide actions or use the done tool."
+                        "content": "No response received. Please provide ```action blocks or use the done tool."
                     })
                     continue
                 consecutive_no_response = 0
 
                 actions = self._parse_actions(response)
+
+                # === REFLECTOR: force tool-call format ===
+                if not actions and self._reflector_uses < 3:
+                    self._reflector_uses += 1
+                    logger.info(f"Reflector triggered ({self._reflector_uses}/3)")
+                    self.conversation.append({"role": "user", "content": REFLECTOR_PROMPT})
+                    # Re-ask Claude
+                    response2 = await self._ask_claude()
+                    if response2:
+                        actions = self._parse_actions(response2)
 
                 # Check for done
                 done_actions = [a for a in actions if a.get("tool") == "done"]
@@ -234,12 +259,26 @@ class AttackPlanner:
                 else:
                     consecutive_empty = 0
 
+                # === EXECUTION MONITOR: detect loops ===
+                if executable:
+                    self._track_actions(executable)
+                    monitor_msg = self._check_for_loops()
+                    if monitor_msg:
+                        self._monitor_triggers += 1
+                        logger.info(f"Execution Monitor triggered ({self._monitor_triggers})")
+                        if self._monitor_triggers >= 3:
+                            logger.warning("Attack Planner: too many loop detections, stopping")
+                            break
+
                 if executable:
                     results = await self._execute_actions(executable, http_client, domain)
+                    results_text = await self._format_results_smart(results)
 
-                    results_text = self._format_results(results)
-                    # Add action log summary
-                    if len(self._action_log) > 5:
+                    # Add monitor warning if needed
+                    monitor_msg = self._check_for_loops()
+                    if monitor_msg:
+                        results_text += f"\n\n{monitor_msg}"
+                    elif len(self._action_log) > 5:
                         results_text += f"\n\n[{len(self._action_log)} actions executed so far. Avoid repeating tested URLs/payloads.]"
 
                     self.conversation.append({"role": "user", "content": results_text})
@@ -266,7 +305,89 @@ class AttackPlanner:
             "rounds": self.rounds,
             "findings": self.findings,
             "actions_executed": len(self._action_log),
+            "reflector_uses": self._reflector_uses,
+            "monitor_triggers": self._monitor_triggers,
         }
+
+    # ──────────────────────────────────────────
+    # Briefing with exploit intelligence
+    # ──────────────────────────────────────────
+
+    async def _build_enriched_briefing(self, context: dict) -> str:
+        """Build briefing enriched with Sploitus exploit data."""
+        base_briefing = self._build_briefing(context)
+
+        # Search for exploits based on detected technologies
+        exploit_section = await self._gather_exploit_intelligence(context)
+        if exploit_section:
+            base_briefing += f"\n\n{exploit_section}"
+
+        return base_briefing
+
+    async def _gather_exploit_intelligence(self, context: dict) -> str:
+        """Query Sploitus for real exploits matching the tech stack."""
+        try:
+            from app.core.sploitus import get_exploits_for_tech
+        except ImportError:
+            return ""
+
+        technologies = context.get("technologies", {})
+        if not technologies:
+            return ""
+
+        all_exploits = []
+        # Extract tech+version pairs
+        queries = []
+        if isinstance(technologies, dict):
+            for category, items in technologies.items():
+                if isinstance(items, list):
+                    for item in items[:3]:
+                        if isinstance(item, str):
+                            queries.append(item)
+                        elif isinstance(item, dict):
+                            name = item.get("name", item.get("product", ""))
+                            version = item.get("version", "")
+                            if name:
+                                queries.append(f"{name} {version}".strip())
+                elif isinstance(items, str):
+                    queries.append(items)
+
+        # Deduplicate and limit
+        seen = set()
+        unique_queries = []
+        for q in queries:
+            q_lower = q.lower().strip()
+            if q_lower and q_lower not in seen and len(q_lower) > 2:
+                seen.add(q_lower)
+                unique_queries.append(q)
+
+        # Query Sploitus (max 5 tech queries to avoid rate limits)
+        for query in unique_queries[:5]:
+            try:
+                results = await get_exploits_for_tech(query)
+                for r in results[:3]:
+                    all_exploits.append(r)
+            except Exception as e:
+                logger.debug(f"Sploitus query failed for '{query}': {e}")
+
+        if not all_exploits:
+            return ""
+
+        lines = ["## KNOWN EXPLOITS (from Sploitus)"]
+        for ex in all_exploits[:15]:
+            cve = ex.get("cve", "")
+            title = ex.get("title", "")[:100]
+            url = ex.get("source_url", "")
+            ex_type = ex.get("type", "exploit")
+            line = f"  - [{ex_type}] {title}"
+            if cve:
+                line += f" ({cve})"
+            if url:
+                line += f" → {url}"
+            lines.append(line)
+        lines.append("")
+        lines.append("Use these as inspiration for your attack vectors. Try to exploit known CVEs!")
+        return "\n".join(lines)
 
     def _build_briefing(self, context: dict) -> str:
         """Build comprehensive briefing for Claude from all scan data."""
@@ -410,9 +531,69 @@ class AttackPlanner:
 3. Execute tests to prove or disprove each hypothesis
 4. Chain findings into high-impact attack paths
 5. Report confirmed vulnerabilities using report_vuln tool
+6. Use search_exploits to find real CVE exploits for identified technologies
 
 Think step by step. Start with the most promising attack vector.
 What do you want to test first?"""
+
+    # ──────────────────────────────────────────
+    # Loop detection and execution monitor
+    # ──────────────────────────────────────────
+
+    def _track_actions(self, actions: list[dict]):
+        """Track action URLs and tools for loop detection."""
+        for action in actions:
+            tool = action.get("tool", "?")
+            self._tool_counter[tool] += 1
+            url = action.get("url", "")
+            if url:
+                # Normalize URL (strip params for comparison)
+                parsed = urlparse(url)
+                base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                self._url_counter[base] += 1
+
+    def _check_for_loops(self) -> str | None:
+        """Check if the planner is stuck in a loop."""
+        total_actions = sum(self._tool_counter.values())
+        if total_actions < 8:
+            return None
+
+        # Check for repeated URLs (same URL hit 4+ times)
+        most_common_url = self._url_counter.most_common(1)
+        if most_common_url and most_common_url[0][1] >= 4:
+            repeated_url = most_common_url[0][0]
+            unique_urls = len(self._url_counter)
+            return MONITOR_PROMPT.format(
+                action_count=total_actions,
+                repeated=f"{repeated_url} ({most_common_url[0][1]}x)",
+                unique_urls=unique_urls,
+            )
+
+        # Check for repeated tool pattern (same tool 6+ times in a row)
+        recent_tools = [a.get("tool", "?") for a in self._action_log[-6:]]
+        if len(recent_tools) >= 6 and len(set(recent_tools)) == 1:
+            return MONITOR_PROMPT.format(
+                action_count=total_actions,
+                repeated=f"tool '{recent_tools[0]}' used {len(recent_tools)}x in a row",
+                unique_urls=len(self._url_counter),
+            )
+
+        return None
+
+    # ──────────────────────────────────────────
+    # Context compression
+    # ──────────────────────────────────────────
+
+    def _maybe_compress_context(self):
+        """Compress conversation if it's getting too large."""
+        from app.core.context_manager import compress_conversation
+        total = sum(len(m.get("content", "")) for m in self.conversation)
+        if total > 60000:
+            self.conversation = compress_conversation(self.conversation, max_total_chars=50000)
+
+    # ──────────────────────────────────────────
+    # UA rotation
+    # ──────────────────────────────────────────
 
     def _get_rotating_ua(self) -> dict:
         """Return headers with a random realistic User-Agent."""
@@ -428,6 +609,10 @@ What do you want to test first?"""
         ]
         import random
         return {"User-Agent": random.choice(uas)}
+
+    # ──────────────────────────────────────────
+    # Claude communication
+    # ──────────────────────────────────────────
 
     async def _ask_claude(self) -> str | None:
         """Send conversation to Claude."""
@@ -462,6 +647,10 @@ What do you want to test first?"""
                 logger.error(f"Attack Planner API error: {e}")
                 return None
 
+    # ──────────────────────────────────────────
+    # Action parsing
+    # ──────────────────────────────────────────
+
     def _parse_actions(self, response: str) -> list[dict]:
         """Extract ```action blocks from Claude's response."""
         actions = []
@@ -492,6 +681,10 @@ What do you want to test first?"""
 
         return actions
 
+    # ──────────────────────────────────────────
+    # Action execution
+    # ──────────────────────────────────────────
+
     async def _execute_actions(self, actions: list[dict], http_client: httpx.AsyncClient, domain: str) -> list[dict]:
         """Execute all actions and return results."""
         results = []
@@ -519,6 +712,8 @@ What do you want to test first?"""
                     coro = self._exec_fuzz(action, http_client, domain)
                 elif tool == "extract":
                     coro = self._exec_extract(action, http_client, domain)
+                elif tool == "search_exploits":
+                    coro = self._exec_search_exploits(action)
                 else:
                     results.append({"tool": tool, "error": f"Unknown tool: {tool}"})
                     continue
@@ -559,6 +754,10 @@ What do you want to test first?"""
                 headers["Cookie"] = cookie_str
         return headers
 
+    # ──────────────────────────────────────────
+    # Tool implementations
+    # ──────────────────────────────────────────
+
     async def _exec_http(self, action: dict, client: httpx.AsyncClient, domain: str) -> dict:
         """Execute arbitrary HTTP request."""
         method = action.get("method", "GET").upper()
@@ -568,7 +767,6 @@ What do you want to test first?"""
 
         headers = dict(action.get("headers", {}))
         headers = self._add_auth_headers(headers)
-        # Rotate UA per request
         headers.update(self._get_rotating_ua())
 
         body = action.get("body")
@@ -627,11 +825,8 @@ What do you want to test first?"""
             return {"tool": "jwt_decode", "error": "Invalid JWT format"}
 
         try:
-            # Decode header
             header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
             header = json.loads(base64.urlsafe_b64decode(header_b64))
-
-            # Decode payload
             payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
             payload = json.loads(base64.urlsafe_b64decode(payload_b64))
 
@@ -654,7 +849,6 @@ What do you want to test first?"""
         secret = action.get("secret", "")
 
         try:
-            # Build header
             header = {"typ": "JWT", "alg": algorithm}
             header_b64 = base64.urlsafe_b64encode(
                 json.dumps(header, separators=(',', ':')).encode()
@@ -751,11 +945,9 @@ What do you want to test first?"""
         try:
             resp = await client.post(url, json=body, headers=headers)
 
-            # Extract cookies
             for cookie_name, cookie_value in resp.cookies.items():
                 self._session_cookies[cookie_name] = cookie_value
 
-            # Extract token from response body
             token = None
             if action.get("extract_token"):
                 try:
@@ -764,7 +956,6 @@ What do you want to test first?"""
                         if key in data:
                             token = data[key]
                             break
-                        # Check nested
                         if isinstance(data.get("data"), dict) and key in data["data"]:
                             token = data["data"][key]
                             break
@@ -774,7 +965,6 @@ What do you want to test first?"""
             if token:
                 self._session_token = token
 
-            # Extract from Set-Cookie header
             set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, 'get_list') else []
             if not set_cookies:
                 sc = resp.headers.get("set-cookie", "")
@@ -804,7 +994,7 @@ What do you want to test first?"""
         method = action.get("method", "GET").upper()
 
         results = []
-        for val in values[:30]:  # Limit to 30 values
+        for val in values[:30]:
             try:
                 headers = self._add_auth_headers({})
                 headers.update(self._get_rotating_ua())
@@ -824,11 +1014,10 @@ What do you want to test first?"""
                     "reflected": reflected,
                     "snippet": resp.text[:500] if reflected else "",
                 })
-                await asyncio.sleep(0.1)  # Rate limiting
+                await asyncio.sleep(0.1)
             except Exception as e:
                 results.append({"value": str(val)[:100], "error": str(e)})
 
-        # Summary
         statuses = {}
         for r in results:
             s = r.get("status", "error")
@@ -858,7 +1047,6 @@ What do you want to test first?"""
             resp = await client.get(url, headers=headers)
             text = resp.text
 
-            # Extract forms
             forms = []
             form_pattern = re.compile(r'<form[^>]*>(.*?)</form>', re.DOTALL | re.IGNORECASE)
             for match in form_pattern.finditer(text):
@@ -875,28 +1063,17 @@ What do you want to test first?"""
                     "fields": inputs + textareas + selects,
                 })
 
-            # Hidden inputs
             hidden = re.findall(
                 r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']*)["\'][^>]*value=["\']([^"\']*)["\']',
                 text, re.IGNORECASE
             )
 
-            # Script sources
             scripts = re.findall(r'<script[^>]*src=["\']([^"\']*)["\']', text, re.IGNORECASE)
-
-            # Links
             links = re.findall(r'<a[^>]*href=["\']([^"\']*)["\']', text, re.IGNORECASE)
-            # Filter to same domain
             in_scope_links = [l for l in links if domain in l or l.startswith("/")]
-
-            # HTML comments
             comments = re.findall(r'<!--(.*?)-->', text, re.DOTALL)
             comments = [c.strip()[:200] for c in comments if c.strip() and len(c.strip()) > 5]
-
-            # Meta tags
             metas = re.findall(r'<meta[^>]*>', text, re.IGNORECASE)
-
-            # API endpoints in JS
             api_endpoints = re.findall(r'["\'](/api/[^"\']+)["\']', text)
 
             return {
@@ -923,8 +1100,32 @@ What do you want to test first?"""
         except Exception as e:
             return {"tool": "extract", "error": str(e)}
 
-    def _format_results(self, results: list[dict]) -> str:
-        """Format execution results for Claude."""
+    async def _exec_search_exploits(self, action: dict) -> dict:
+        """Search Sploitus for real CVE exploits."""
+        query = action.get("query", "")
+        if not query:
+            return {"tool": "search_exploits", "error": "No query provided"}
+
+        try:
+            from app.core.sploitus import search_exploits
+            results = await search_exploits(query, max_results=10)
+            return {
+                "tool": "search_exploits",
+                "query": query,
+                "count": len(results),
+                "exploits": results,
+            }
+        except Exception as e:
+            return {"tool": "search_exploits", "error": str(e)}
+
+    # ──────────────────────────────────────────
+    # Smart result formatting with auto-summarization
+    # ──────────────────────────────────────────
+
+    async def _format_results_smart(self, results: list[dict]) -> str:
+        """Format results with auto-summarization for large responses."""
+        from app.core.context_manager import summarize_large_response
+
         parts = [f"## Execution Results ({len(results)} actions)\n"]
 
         for i, result in enumerate(results, 1):
@@ -940,7 +1141,6 @@ What do you want to test first?"""
                 parts.append(f"Status: {result.get('status', '?')}")
                 parts.append(f"Body length: {result.get('body_length', '?')}")
 
-                # Show security-relevant headers
                 headers = result.get("headers", {})
                 sec_headers = {k: v for k, v in headers.items() if k.lower() in (
                     "server", "x-powered-by", "content-type", "set-cookie",
@@ -951,7 +1151,11 @@ What do you want to test first?"""
                     parts.append(f"Security headers: {json.dumps(sec_headers, default=str)}")
 
                 body = result.get("body", "")
-                if len(body) > 3000:
+                # Auto-summarize large bodies
+                if len(body) > 6000:
+                    body = await summarize_large_response(body, max_chars=3000, llm=self._llm)
+                    parts.append(f"Body (summarized):\n```\n{body}\n```")
+                elif len(body) > 3000:
                     parts.append(f"Body (first 3000 chars):\n```\n{body[:3000]}\n```")
                 else:
                     parts.append(f"Body:\n```\n{body}\n```")
@@ -999,6 +1203,20 @@ What do you want to test first?"""
                 parts.append(f"Comments: {json.dumps(result.get('comments', []))[:500]}")
                 parts.append(f"Security headers: {json.dumps(result.get('response_headers', {}))}")
 
-            parts.append("")  # blank line
+            elif tool == "search_exploits":
+                parts.append(f"Query: {result.get('query')}")
+                parts.append(f"Found: {result.get('count', 0)} exploits")
+                for ex in result.get("exploits", [])[:10]:
+                    cve = ex.get("cve", "")
+                    title = ex.get("title", "")[:100]
+                    url = ex.get("source_url", "")
+                    line = f"  - {title}"
+                    if cve:
+                        line += f" ({cve})"
+                    if url:
+                        line += f" → {url}"
+                    parts.append(line)
+
+            parts.append("")
 
         return "\n".join(parts)
