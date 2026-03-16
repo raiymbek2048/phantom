@@ -484,7 +484,10 @@ class ScanPipeline:
             return "rate_limiting_is_good"
 
         # Staging/test environments are not vulns
-        if "staging" in title or "test environment" in title or "test subdomain" in title:
+        staging_keywords = ("staging", "test environment", "test subdomain",
+                           "publicly accessible staging", "publicly accessible test",
+                           "pre-release environment")
+        if any(kw in title for kw in staging_keywords):
             return "staging_not_vuln"
 
         # Info-only findings with no real impact
