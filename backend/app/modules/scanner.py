@@ -1,16 +1,21 @@
 """
 Vulnerability Scanner Module
 
-Uses nuclei templates + custom checks to find vulnerabilities.
+Uses nuclei templates + custom checks + lightweight payload probing to find vulnerabilities.
 Tools: nuclei, nikto, custom HTTP checks
 """
 import asyncio
 import json
+import logging
+import secrets
 import tempfile
 import os
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from app.utils.tool_runner import run_command
 from app.utils.http_client import make_client
+
+logger = logging.getLogger(__name__)
 
 
 class VulnerabilityScanner:
@@ -30,6 +35,7 @@ class VulnerabilityScanner:
             self._check_security_headers(base_url),
             self._check_cors(base_url, endpoints),
             self._check_sensitive_files(base_url, endpoints),
+            self._quick_param_probe(endpoints),
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -188,4 +194,114 @@ class VulnerabilityScanner:
                 except Exception:
                     continue
 
+        return findings
+
+    async def _quick_param_probe(self, endpoints: list[dict]) -> list[dict]:
+        """Lightweight probe of parameterized URLs for reflection (XSS) and SQL errors.
+
+        Not a full exploit — just signals to flag endpoints for deeper testing.
+        Tests at most 30 endpoints with 1 payload each.
+        """
+        findings = []
+
+        # Collect endpoints that have query parameters
+        param_endpoints = []
+        for ep in endpoints:
+            url = ep.get("url", "") if isinstance(ep, dict) else str(ep)
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            if params and parsed.scheme in ("http", "https"):
+                param_endpoints.append((url, parsed, params))
+
+        if not param_endpoints:
+            return findings
+
+        marker = f"ph4nt0m{secrets.token_hex(4)}"
+
+        sql_errors = [
+            "you have an error in your sql syntax",
+            "unclosed quotation mark",
+            "quoted string not properly terminated",
+            "pg_query", "pg_exec",
+            "mysql_fetch", "mysql_num_rows",
+            "sqlite3.operationalerror",
+            "microsoft ole db provider",
+            "ora-01756", "ora-00933",
+            "sqlstate[",
+            "syntax error at or near",
+            "warning: mysql",
+            "valid mysql result",
+        ]
+
+        async with make_client(extra_headers=dict(self._custom_headers)) as client:
+            sem = asyncio.Semaphore(5)
+
+            async def _probe_one(url: str, parsed, params: dict):
+                async with sem:
+                    results = []
+                    param_name = next(iter(params))
+                    original_val = params[param_name][0] if params[param_name] else ""
+
+                    # XSS reflection probe
+                    try:
+                        xss_payload = f'{marker}<"\'>'
+                        new_params = dict(params)
+                        new_params[param_name] = [xss_payload]
+                        probe_url = urlunparse(parsed._replace(
+                            query=urlencode(new_params, doseq=True)
+                        ))
+                        resp = await client.get(probe_url, timeout=8)
+                        body = resp.text
+                        if marker in body:
+                            reflects_html = f'{marker}<' in body or f"{marker}\"" in body
+                            if reflects_html:
+                                results.append({
+                                    "source": "param_probe",
+                                    "name": f"Reflected XSS candidate: {param_name} on {parsed.path}",
+                                    "severity": "medium",
+                                    "url": url,
+                                    "type": "xss",
+                                    "parameter": param_name,
+                                    "details": "Unencoded reflection of HTML special characters",
+                                })
+                    except Exception:
+                        pass
+
+                    # SQL error probe
+                    try:
+                        sqli_payload = f"{original_val}'\""
+                        new_params = dict(params)
+                        new_params[param_name] = [sqli_payload]
+                        probe_url = urlunparse(parsed._replace(
+                            query=urlencode(new_params, doseq=True)
+                        ))
+                        resp = await client.get(probe_url, timeout=8)
+                        body_lower = resp.text.lower()
+                        for err in sql_errors:
+                            if err in body_lower:
+                                results.append({
+                                    "source": "param_probe",
+                                    "name": f"SQL error triggered: {param_name} on {parsed.path}",
+                                    "severity": "high",
+                                    "url": url,
+                                    "type": "sqli",
+                                    "parameter": param_name,
+                                    "details": f"SQL error pattern: {err}",
+                                })
+                                break
+                    except Exception:
+                        pass
+
+                    return results
+
+            tasks = [
+                _probe_one(url, parsed, params)
+                for url, parsed, params in param_endpoints[:30]
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, list):
+                    findings.extend(r)
+
+        logger.info(f"Quick param probe: {len(param_endpoints[:30])} endpoints tested, {len(findings)} signals found")
         return findings
