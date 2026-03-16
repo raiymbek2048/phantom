@@ -48,6 +48,29 @@ SEVERITY_CVSS = {
     "info": {"score": 0.0, "vector": "CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N"},
 }
 
+# Type-specific CVSS — overrides generic severity-based CVSS for accuracy
+VULN_TYPE_CVSS = {
+    "xss":              {"score": 6.1, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"},
+    "sqli":             {"score": 9.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    "ssrf":             {"score": 7.5, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+    "idor":             {"score": 6.5, "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"},
+    "auth_bypass":      {"score": 9.1, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"},
+    "info_disclosure":  {"score": 5.3, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"},
+    "misconfiguration": {"score": 4.3, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N"},
+    "cmd_injection":    {"score": 9.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    "path_traversal":   {"score": 7.5, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+    "file_upload":      {"score": 8.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"},
+    "open_redirect":    {"score": 4.7, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:N/I:L/A:N"},
+    "csrf":             {"score": 4.3, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N"},
+    "xxe":              {"score": 7.5, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+    "deserialization":  {"score": 9.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    "rce":              {"score": 9.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    "ssti":             {"score": 8.6, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"},
+    "lfi":              {"score": 7.5, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+    "cors":             {"score": 5.3, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"},
+    "header_injection": {"score": 4.3, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N"},
+}
+
 # Bugcrowd severity mapping
 BUGCROWD_SEVERITY = {
     "critical": "P1",
@@ -69,7 +92,7 @@ class ReportGenerator:
         severity_str = vuln.severity.value if hasattr(vuln.severity, "value") else str(vuln.severity)
 
         cwe = VULN_TYPE_CWE.get(vuln_type_str, ("CWE-Unknown", "Unknown"))
-        cvss = SEVERITY_CVSS.get(severity_str, SEVERITY_CVSS["medium"])
+        cvss = VULN_TYPE_CVSS.get(vuln_type_str, SEVERITY_CVSS.get(severity_str, SEVERITY_CVSS["medium"]))
 
         prompt = f"""Generate a professional bug bounty vulnerability report.
 
@@ -295,7 +318,7 @@ The assessment identified **{len(vulns)} vulnerabilities** across {len(type_coun
         vuln_type_str = vuln.vuln_type.value if hasattr(vuln.vuln_type, "value") else str(vuln.vuln_type)
         severity_str = vuln.severity.value if hasattr(vuln.severity, "value") else str(vuln.severity)
         cwe = VULN_TYPE_CWE.get(vuln_type_str, ("CWE-Unknown", "Unknown Weakness"))
-        cvss = SEVERITY_CVSS.get(severity_str, SEVERITY_CVSS["medium"])
+        cvss = VULN_TYPE_CVSS.get(vuln_type_str, SEVERITY_CVSS.get(severity_str, SEVERITY_CVSS["medium"]))
 
         payload_section = ""
         if vuln.payload_used:

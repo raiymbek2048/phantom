@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import markdown
@@ -14,7 +15,7 @@ from app.models.scan import Scan
 from app.models.target import Target
 from app.models.user import User
 from app.api.auth import get_current_user
-from app.modules.reporter import VULN_TYPE_CWE, SEVERITY_CVSS
+from app.modules.reporter import VULN_TYPE_CWE, SEVERITY_CVSS, VULN_TYPE_CVSS
 
 router = APIRouter()
 
@@ -229,18 +230,24 @@ def _build_json_report(scan, target, vulns: list) -> dict:
     for v in vulns:
         sev = v.severity.value if hasattr(v.severity, 'value') else str(v.severity)
         vtype = v.vuln_type.value if hasattr(v.vuln_type, 'value') else str(v.vuln_type)
-        cvss_info = _lookup_cvss(sev)
+        cvss_info = _lookup_cvss(sev, vtype)
         cwe_id, cwe_name = _lookup_cwe(vtype)
 
         confirmed = False
         if v.title and "[CONFIRMED]" in v.title:
             confirmed = True
 
+        resp_data = v.response_data if isinstance(v.response_data, dict) else {}
+        confirmation = resp_data.get("confirmation", {}) if resp_data else {}
+
         poc = {
             "payload": v.payload_used or None,
             "request": v.request_data if isinstance(v.request_data, dict) else None,
-            "response": v.response_data if isinstance(v.response_data, dict) else None,
+            "response": resp_data or None,
+            "confirmation": confirmation if confirmation else None,
         }
+
+        repro_steps = _generate_repro_steps(v, vtype, v.payload_used or "")
 
         vuln_list.append({
             "id": str(v.id),
@@ -254,7 +261,8 @@ def _build_json_report(scan, target, vulns: list) -> dict:
             "method": v.method or "GET",
             "description": v.description or None,
             "impact": v.impact if hasattr(v, 'impact') and v.impact else None,
-            "remediation": v.remediation or None,
+            "remediation": v.remediation or _get_default_remediation(vtype),
+            "steps_to_reproduce": repro_steps,
             "proof_of_concept": poc,
             "confidence": v.ai_confidence,
             "confirmed": confirmed,
@@ -275,7 +283,8 @@ def _build_json_report(scan, target, vulns: list) -> dict:
             "started_at": scan.started_at.isoformat() if scan and scan.started_at else None,
             "completed_at": scan.completed_at.isoformat() if scan and scan.completed_at else None,
             "duration_minutes": scan_duration,
-            "phases_completed": len(phases_completed) if isinstance(phases_completed, list) else phases_completed,
+            "phases_completed": min(len(phases_completed), len(PIPELINE_PHASES)) if isinstance(phases_completed, list) else phases_completed,
+            "total_phases": len(PIPELINE_PHASES),
             "risk_score": risk_score,
         },
         "summary": {
@@ -400,7 +409,7 @@ def _severity_order(sev: str) -> int:
 
 PIPELINE_PHASES = [
     "Recon", "Subdomain Discovery", "Port Scan", "Fingerprint",
-    "Attack Routing", "Endpoint Discovery", "Application Graph",
+    "Attack Routing", "Endpoint Discovery", "GraphQL Attacks", "Application Graph",
     "Stateful Crawling", "Auto Account Registration", "Sensitive Files",
     "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
     "Payload Generation", "WAF Detection", "Exploit",
@@ -422,9 +431,78 @@ def _lookup_cwe(vuln_type_str: str) -> tuple:
     return ("N/A", "N/A")
 
 
-def _lookup_cvss(severity_str: str) -> dict:
-    """Look up CVSS score/vector for a severity level."""
+def _lookup_cvss(severity_str: str, vuln_type_str: str = "") -> dict:
+    """Look up CVSS score/vector — type-specific first, then severity fallback."""
+    vt = vuln_type_str.lower()
+    if vt in VULN_TYPE_CVSS:
+        return VULN_TYPE_CVSS[vt]
     return SEVERITY_CVSS.get(severity_str.lower(), SEVERITY_CVSS.get("medium", {"score": 5.3, "vector": "N/A"}))
+
+
+def _generate_repro_steps(vuln, vuln_type: str, payload: str) -> list[str]:
+    """Generate step-by-step reproduction instructions."""
+    url = vuln.url or "TARGET_URL"
+    method = vuln.method or "GET"
+    param = vuln.parameter or ""
+    steps = []
+
+    if vuln_type == "xss":
+        steps.append(f"Open {url} in a browser or send a {method} request")
+        if param:
+            steps.append(f"Set the parameter '{param}' to the XSS payload: {payload}" if payload else f"Inject a script payload into the '{param}' parameter")
+        steps.append("Observe that the payload is reflected in the response without encoding")
+        steps.append("Verify script execution in the browser DOM/console")
+    elif vuln_type == "sqli":
+        steps.append(f"Send a {method} request to {url}")
+        if param:
+            steps.append(f"Inject SQL payload into '{param}': {payload}" if payload else f"Inject a single quote (') into '{param}'")
+        steps.append("Observe SQL error message or modified response behavior")
+        steps.append("Compare response with a normal request to confirm injection")
+    elif vuln_type == "idor":
+        steps.append(f"Authenticate as User A and access {url}")
+        steps.append("Note the object ID in the request")
+        steps.append("Change the ID to another user's resource ID")
+        steps.append("Observe that User B's data is returned without authorization check")
+    elif vuln_type == "ssrf":
+        steps.append(f"Send a {method} request to {url}")
+        steps.append(f"Supply an internal URL as the payload: {payload}" if payload else "Supply an internal/cloud metadata URL as the parameter value")
+        steps.append("Observe that the server fetches the internal resource and returns its contents")
+    elif vuln_type == "auth_bypass":
+        steps.append(f"Send a {method} request to {url} without authentication credentials")
+        if payload:
+            steps.append(f"Apply the bypass technique: {payload}")
+        steps.append("Observe that the protected resource is accessible without valid authentication")
+    elif vuln_type in ("misconfiguration", "info_disclosure"):
+        steps.append(f"Send a {method} request to {url}")
+        steps.append("Examine the response headers and body")
+        steps.append("Note the misconfigured/exposed information in the response")
+    else:
+        steps.append(f"Send a {method} request to {url}")
+        if payload:
+            steps.append(f"Use the following payload: {payload}")
+        if param:
+            steps.append(f"Target parameter: {param}")
+        steps.append("Observe the vulnerability in the server response")
+
+    steps.append("Use the cURL command below to reproduce programmatically")
+    return steps
+
+
+def _get_default_remediation(vuln_type: str) -> str:
+    """Get default remediation advice."""
+    remediations = {
+        "xss": "Implement output encoding (HTML entity, JS, URL encoding as appropriate). Deploy Content Security Policy (CSP) headers. Use framework auto-escaping. Validate and sanitize all user input server-side.",
+        "sqli": "Use parameterized queries (prepared statements) for all database operations. Never concatenate user input into SQL. Apply least privilege to database accounts. Use an ORM with parameterized queries.",
+        "ssrf": "Implement URL allowlists for outbound requests. Validate and sanitize all URL inputs. Block requests to internal IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x). Disable unnecessary URL schemes.",
+        "idor": "Implement authorization checks on every object access. Verify the authenticated user has permission to access the requested resource. Use indirect references (UUIDs) instead of sequential IDs.",
+        "auth_bypass": "Implement proper authentication verification on every protected endpoint. Use established authentication frameworks. Enforce MFA. Validate tokens server-side on every request.",
+        "info_disclosure": "Remove sensitive data from responses. Use DTOs to control output fields. Disable debug mode and verbose errors in production. Remove server version headers.",
+        "misconfiguration": "Review and harden server configuration per CIS benchmarks. Implement security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options). Remove default credentials and unnecessary features.",
+        "cmd_injection": "Never pass user input to system commands. Use language-native APIs instead of shell commands. If unavoidable, use strict allowlist validation and parameterized command execution.",
+        "path_traversal": "Validate file paths against an allowlist. Use chroot or sandboxed file access. Resolve canonical paths and verify they stay within the intended directory.",
+        "cors": "Configure Access-Control-Allow-Origin to specific trusted domains only. Never reflect arbitrary origins. Do not combine wildcard origins with credentials.",
+    }
+    return remediations.get(vuln_type, "Review and fix the identified vulnerability following OWASP guidelines for this vulnerability type. Implement input validation, output encoding, and proper access controls.")
 
 
 def _render_scan_report_html(scan, target, vulns: list) -> str:
@@ -492,8 +570,11 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
         vtype = v.vuln_type.value if hasattr(v.vuln_type, 'value') else str(v.vuln_type)
         color = _severity_color(sev)
 
-        cvss_info = _lookup_cvss(sev)
+        cvss_info = _lookup_cvss(sev, vtype)
         cwe_info = _lookup_cwe(vtype)
+
+        confirmed = "[CONFIRMED]" in (v.title or "")
+        confirmed_badge = ' <span class="badge" style="background:#16a34a">CONFIRMED</span>' if confirmed else ""
 
         vuln_rows += f"""
         <tr>
@@ -507,50 +588,137 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
 
         # Detail section
         description = v.description or "Vulnerability confirmed by automated testing."
-        remediation = v.remediation or "Review and fix the identified vulnerability."
-        payload = v.payload_used or "N/A"
+        remediation = v.remediation or _get_default_remediation(vtype)
+        payload = v.payload_used or ""
+        impact = v.impact if hasattr(v, 'impact') and v.impact else ""
 
+        # --- Build full HTTP Request section ---
         request_info = ""
         if v.request_data:
             req = v.request_data if isinstance(v.request_data, dict) else {}
-            request_info = f"""
-            <div class="code-block">
-                <strong>Request:</strong><br>
-                {req.get('method', 'GET')} {req.get('url', v.url)}<br>
-                {f"Parameter: {req.get('param', '')}" if req.get('param') else ""}
-                {f"<br>Body: {req.get('body', '')}" if req.get('body') else ""}
-            </div>"""
+            req_method = req.get('method', v.method or 'GET')
+            req_url = req.get('url', v.url or '')
+            req_headers = req.get('headers', {})
+            req_body = req.get('body', '')
+            req_param = req.get('param', v.parameter or '')
 
+            # Format as raw HTTP request
+            raw_request_lines = [f"{req_method} {_escape_html(req_url)} HTTP/1.1"]
+            if isinstance(req_headers, dict):
+                for hk, hv in list(req_headers.items())[:15]:
+                    raw_request_lines.append(f"{_escape_html(str(hk))}: {_escape_html(str(hv))}")
+            if req_body:
+                raw_request_lines.append("")
+                raw_request_lines.append(_escape_html(str(req_body)[:1000]))
+            raw_request = "\n".join(raw_request_lines)
+
+            request_info = f"""
+            <h4>HTTP Request</h4>
+            <div class="code-block"><pre>{raw_request}</pre></div>"""
+
+        # --- Build full HTTP Response section ---
         response_info = ""
-        if v.response_data:
-            resp = v.response_data if isinstance(v.response_data, dict) else {}
-            body_preview = str(resp.get("body", ""))[:500]
-            response_info = f"""
-            <div class="code-block">
-                <strong>Response:</strong> HTTP {resp.get('status_code', '?')}<br>
-                <pre>{_escape_html(body_preview)}</pre>
-            </div>"""
+        resp_data = v.response_data if isinstance(v.response_data, dict) else {}
+        if resp_data:
+            status_code = resp_data.get("status_code", "")
+            resp_headers = resp_data.get("headers", {})
+            body_preview = str(resp_data.get("body_preview") or resp_data.get("body", ""))[:1500]
+            body_length = resp_data.get("body_length", "")
+
+            raw_response_lines = []
+            if status_code:
+                raw_response_lines.append(f"HTTP/1.1 {status_code}")
+            if isinstance(resp_headers, dict):
+                for hk, hv in list(resp_headers.items())[:15]:
+                    raw_response_lines.append(f"{_escape_html(str(hk))}: {_escape_html(str(hv))}")
+            if body_preview:
+                raw_response_lines.append("")
+                raw_response_lines.append(_escape_html(body_preview))
+            raw_response = "\n".join(raw_response_lines)
+
+            if raw_response.strip():
+                response_info = f"""
+            <h4>HTTP Response{f' ({body_length} bytes)' if body_length else ''}</h4>
+            <div class="code-block"><pre>{raw_response}</pre></div>"""
+
+        # --- Confirmation proof ---
+        confirmation_info = ""
+        confirmation = resp_data.get("confirmation", {}) if resp_data else {}
+        if confirmation and isinstance(confirmation, dict) and confirmation.get("confirmed"):
+            proof = confirmation.get("proof", "")
+            method_used = confirmation.get("method", "")
+            depth = confirmation.get("exploitation_depth", "")
+            extracted = confirmation.get("extracted_data", {})
+
+            conf_lines = [f"<strong>Status:</strong> Confirmed via {_escape_html(method_used)}"]
+            if depth:
+                conf_lines.append(f"<strong>Exploitation Depth:</strong> {_escape_html(depth)}")
+            if proof:
+                conf_lines.append(f"<strong>Proof:</strong> {_escape_html(str(proof)[:500])}")
+            if extracted and isinstance(extracted, dict):
+                for ek, ev in list(extracted.items())[:10]:
+                    ev_str = str(ev)[:300] if not isinstance(ev, (list, dict)) else json.dumps(ev, default=str)[:300]
+                    conf_lines.append(f"<strong>{_escape_html(str(ek))}:</strong> <code>{_escape_html(ev_str)}</code>")
+
+            confirmation_info = f"""
+            <h4>Exploitation Proof</h4>
+            <div class="code-block">{'<br>'.join(conf_lines)}</div>"""
+
+        # --- cURL reproduction command ---
+        curl_cmd = ""
+        if v.url:
+            curl_parts = [f"curl -k -v -X {v.method or 'GET'}"]
+            if v.request_data and isinstance(v.request_data, dict):
+                for hk, hv in list(v.request_data.get("headers", {}).items())[:10]:
+                    if hk.lower() not in ("host", "user-agent", "accept-encoding", "connection"):
+                        curl_parts.append(f"  -H '{_escape_html(str(hk))}: {_escape_html(str(hv))}'")
+            if payload and (v.method or "GET") in ("POST", "PUT", "PATCH"):
+                escaped_payload = _escape_html(payload.replace("'", "'\\''"))
+                curl_parts.append(f"  -d '{escaped_payload}'")
+            curl_parts.append(f"  '{_escape_html(v.url)}'")
+            curl_cmd = " \\\n".join(curl_parts)
+
+        poc_section = ""
+        if payload or curl_cmd:
+            poc_parts = []
+            if payload:
+                poc_parts.append(f'<div class="code-block"><strong>Payload:</strong> <code>{_escape_html(payload)}</code></div>')
+            if curl_cmd:
+                poc_parts.append(f'<div class="code-block"><strong>cURL Command:</strong><pre>{curl_cmd}</pre></div>')
+            poc_section = "\n".join(poc_parts)
+
+        # --- Reproduction steps ---
+        repro_steps = _generate_repro_steps(v, vtype, payload)
+
+        # --- Impact analysis ---
+        impact_section = ""
+        if impact:
+            impact_section = f"<h4>Impact Analysis</h4><p>{_escape_html(str(impact))}</p>"
 
         vuln_details += f"""
         <div class="vuln-detail" id="vuln-{i}">
-            <h3><span class="badge" style="background:{color}">{sev}</span> {v.title or vtype}</h3>
+            <h3><span class="badge" style="background:{color}">{sev}</span>{confirmed_badge} {_escape_html(v.title or vtype)}</h3>
             <table class="detail-table">
                 <tr><td><strong>Type</strong></td><td>{vtype}</td></tr>
-                <tr><td><strong>URL</strong></td><td><code>{v.url or 'N/A'}</code></td></tr>
-                <tr><td><strong>Parameter</strong></td><td><code>{v.parameter or 'N/A'}</code></td></tr>
+                <tr><td><strong>URL</strong></td><td><code>{_escape_html(v.url or 'N/A')}</code></td></tr>
+                <tr><td><strong>Parameter</strong></td><td><code>{_escape_html(v.parameter or 'N/A')}</code></td></tr>
                 <tr><td><strong>Method</strong></td><td>{v.method or 'GET'}</td></tr>
                 <tr><td><strong>CWE</strong></td><td>{cwe_info[0]} &mdash; {cwe_info[1]}</td></tr>
                 <tr><td><strong>CVSS</strong></td><td>{cvss_info['score']} ({cvss_info['vector']})</td></tr>
                 <tr><td><strong>Confidence</strong></td><td>{v.ai_confidence or 'N/A'}</td></tr>
             </table>
             <h4>Description</h4>
-            <p>{description}</p>
+            <p>{_escape_html(description)}</p>
+            {impact_section}
+            <h4>Steps to Reproduce</h4>
+            <ol>{''.join(f'<li>{_escape_html(s)}</li>' for s in repro_steps)}</ol>
             <h4>Proof of Concept</h4>
-            <div class="code-block"><strong>Payload:</strong> <code>{_escape_html(payload)}</code></div>
+            {poc_section if poc_section else '<p>No payload data available.</p>'}
             {request_info}
             {response_info}
+            {confirmation_info}
             <h4>Remediation</h4>
-            <p>{remediation}</p>
+            <p>{_escape_html(remediation)}</p>
         </div>"""
 
     # Build methodology phases HTML
@@ -611,7 +779,7 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
             </div>
             <div class="summary-card">
                 <div class="summary-label">Phases Completed</div>
-                <div class="summary-value">{len(phases_completed) if isinstance(phases_completed, list) else phases_completed or 'N/A'} / {len(PIPELINE_PHASES)}</div>
+                <div class="summary-value">{min(len(phases_completed), len(PIPELINE_PHASES)) if isinstance(phases_completed, list) else phases_completed or 'N/A'} / {len(PIPELINE_PHASES)}</div>
             </div>
             <div class="summary-card">
                 <div class="summary-label">Subdomains Found</div>
