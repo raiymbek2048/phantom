@@ -404,7 +404,7 @@ PIPELINE_PHASES = [
     "Stateful Crawling", "Auto Account Registration", "Sensitive Files",
     "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
     "Payload Generation", "WAF Detection", "Exploit",
-    "Service Attack", "Auth Attack", "Business Logic",
+    "Service Attack", "Auth Attack", "Account Enumeration", "MFA Bypass", "Business Logic",
     "Request Smuggling", "Mass Assignment", "Cache Poisoning",
     "Stress Test", "Vulnerability Confirmation",
     "Claude Collaboration", "AI Attack Planner", "Evidence Collection", "Report Generation",

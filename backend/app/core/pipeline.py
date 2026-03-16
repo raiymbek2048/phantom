@@ -87,6 +87,21 @@ VULN_TYPE_ALIASES: dict[str, VulnType] = {
     "cache_deception": VulnType.INFO_DISCLOSURE,
     "web_cache_poisoning": VulnType.MISCONFIGURATION,
     "web_cache_deception": VulnType.INFO_DISCLOSURE,
+    "graphql": VulnType.MISCONFIGURATION,
+    "graphql_introspection": VulnType.MISCONFIGURATION,
+    "graphql_injection": VulnType.SQLI,
+    "graphql_sqli": VulnType.SQLI,
+    "graphql_nosql": VulnType.SQLI,
+    "graphql_dos": VulnType.MISCONFIGURATION,
+    "graphql_batching": VulnType.MISCONFIGURATION,
+    "graphql_authz_bypass": VulnType.AUTH_BYPASS,
+    "graphql_info_disclosure": VulnType.INFO_DISCLOSURE,
+    "mfa_bypass": VulnType.AUTH_BYPASS,
+    "2fa_bypass": VulnType.AUTH_BYPASS,
+    "otp_bypass": VulnType.AUTH_BYPASS,
+    "two_factor_bypass": VulnType.AUTH_BYPASS,
+    "account_enumeration": VulnType.INFO_DISCLOSURE,
+    "user_enumeration": VulnType.INFO_DISCLOSURE,
 }
 from app.modules.recon import ReconModule
 from app.modules.subdomain import SubdomainModule
@@ -105,6 +120,8 @@ from app.modules.nuclei import NucleiModule
 from app.modules.service_attack import ServiceAttackModule
 from app.modules.sensitive_files import SensitiveFilesModule
 from app.modules.auth_attack import AuthAttackModule
+from app.modules.mfa_bypass import MFABypassModule
+from app.modules.account_enumeration import AccountEnumerationModule
 from app.modules.stress_test import StressTestModule
 from app.core.attack_router import AttackRouter
 from app.core.realtime_learner import RealtimeLearner
@@ -119,6 +136,7 @@ from app.modules.auto_register import AutoRegister
 from app.modules.request_smuggling import RequestSmugglingModule
 from app.modules.mass_assignment import MassAssignmentModule
 from app.modules.cache_poisoning import CachePoisoningModule
+from app.modules.graphql_attacks import GraphQLAttackModule
 from app.core.attack_planner import AttackPlanner
 from app.core.phase_optimizer import PhaseOptimizer
 
@@ -747,7 +765,7 @@ class ScanPipeline:
         {
             "name": "Business Logic & API Abuse",
             "context_flags": {"round_focus": "business_logic", "test_race_conditions": True, "test_mass_assignment": True},
-            "phases": ["endpoint", "app_graph", "stateful_crawl", "auto_register", "vuln_scan", "exploit", "business_logic", "mass_assignment", "vuln_confirm", "ai_analysis"],
+            "phases": ["endpoint", "graphql_attacks", "app_graph", "stateful_crawl", "auto_register", "vuln_scan", "exploit", "business_logic", "mass_assignment", "vuln_confirm", "ai_analysis"],
         },
         {
             "name": "Auth & JWT Deep Dive",
@@ -802,7 +820,10 @@ class ScanPipeline:
             "exploit": self._phase_exploit,
             "service_attack": self._phase_service_attack,
             "auth_attack": self._phase_auth_attack,
+            "mfa_bypass": self._phase_mfa_bypass,
+            "account_enumeration": self._phase_account_enumeration,
             "business_logic": self._phase_business_logic,
+            "graphql_attacks": self._phase_graphql_attacks,
             "request_smuggling": self._phase_request_smuggling,
             "mass_assignment": self._phase_mass_assignment,
             "cache_poisoning": self._phase_cache_poisoning,
@@ -1037,7 +1058,8 @@ Respond in JSON:
             # Validate phases
             valid_phases = set(["endpoint", "sensitive_files", "vuln_scan", "nuclei",
                                "ai_analysis", "payload_gen", "waf", "exploit", "vuln_confirm",
-                               "service_attack", "auth_attack", "stress_test", "claude_collab"])
+                               "service_attack", "auth_attack", "stress_test", "claude_collab",
+                               "graphql_attacks"])
             result["phases"] = [p for p in result.get("phases", []) if p in valid_phases]
             if not result["phases"]:
                 result["phases"] = ["vuln_scan", "exploit", "ai_analysis"]
@@ -1073,6 +1095,7 @@ Respond in JSON:
             ("fingerprint", 20, self._phase_fingerprint),
             ("attack_routing", 23, self._phase_attack_routing),
             ("endpoint", 28, self._phase_endpoint),
+            ("graphql_attacks", 30, self._phase_graphql_attacks),
             ("app_graph", 32, self._phase_app_graph),
             ("stateful_crawl", 34, self._phase_stateful_crawl),
             ("auto_register", 38, self._phase_auto_register),
@@ -1084,7 +1107,9 @@ Respond in JSON:
             ("waf", 63, self._phase_waf),
             ("exploit", 68, self._phase_exploit),
             ("service_attack", 73, self._phase_service_attack),
-            ("auth_attack", 77, self._phase_auth_attack),
+            ("auth_attack", 75, self._phase_auth_attack),
+            ("account_enumeration", 76, self._phase_account_enumeration),
+            ("mfa_bypass", 77, self._phase_mfa_bypass),
             ("business_logic", 78, self._phase_business_logic),
             ("request_smuggling", 80, self._phase_request_smuggling),
             ("mass_assignment", 82, self._phase_mass_assignment),
@@ -1102,7 +1127,8 @@ Respond in JSON:
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
                     "evidence", "service_attack", "auth_attack", "stress_test",
                     "stateful_crawl", "business_logic", "auto_register",
-                    "request_smuggling", "mass_assignment", "cache_poisoning"}
+                    "request_smuggling", "mass_assignment", "cache_poisoning",
+                    "mfa_bypass", "account_enumeration"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
             # Recalculate progress evenly
             for i, (n, _, f) in enumerate(phases):
@@ -2315,6 +2341,84 @@ Respond in JSON:
         else:
             await self.log(db, "auth_attack", "No auth vulnerabilities found")
 
+    async def _phase_account_enumeration(self, db: AsyncSession):
+        """Detect user existence via side channels in auth flows."""
+        sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+        mod = AccountEnumerationModule(rate_limit=sem)
+        findings = await mod.run(self.context)
+        if findings:
+            findings = await self._filter_false_positives(findings, db, "account_enumeration")
+        if findings:
+            scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+            scan = scan_result.scalar_one_or_none()
+            sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                       "medium": Severity.MEDIUM, "low": Severity.LOW}
+
+            saved = 0
+            for f in findings:
+                raw_type = f.get("vuln_type", "info_disclosure")
+                vuln_type = VULN_TYPE_ALIASES.get(raw_type, VulnType.INFO_DISCLOSURE)
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=f.get("title", "Account enumeration")[:500],
+                    vuln_type=vuln_type,
+                    severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                    url=f.get("url", "")[:2000],
+                    method=f.get("method"),
+                    description=f.get("impact", ""),
+                    payload_used=f.get("payload"),
+                    remediation=f.get("remediation"),
+                    ai_confidence=0.85,
+                )
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
+
+            await self.log(db, "account_enumeration",
+                f"Account enumeration found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+        else:
+            await self.log(db, "account_enumeration", "No account enumeration issues found")
+
+    async def _phase_mfa_bypass(self, db: AsyncSession):
+        """Test for weak or bypassable multi-factor authentication."""
+        sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+        mod = MFABypassModule(rate_limit=sem)
+        findings = await mod.run(self.context)
+        if findings:
+            findings = await self._filter_false_positives(findings, db, "mfa_bypass")
+        if findings:
+            scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+            scan = scan_result.scalar_one_or_none()
+            sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                       "medium": Severity.MEDIUM, "low": Severity.LOW}
+
+            saved = 0
+            for f in findings:
+                raw_type = f.get("vuln_type", "auth_bypass")
+                vuln_type = VULN_TYPE_ALIASES.get(raw_type, VulnType.AUTH_BYPASS)
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=f.get("title", "MFA bypass vulnerability")[:500],
+                    vuln_type=vuln_type,
+                    severity=sev_map.get(f.get("severity", "high"), Severity.HIGH),
+                    url=f.get("url", "")[:2000],
+                    method=f.get("method"),
+                    description=f.get("impact", ""),
+                    payload_used=f.get("payload"),
+                    remediation=f.get("remediation"),
+                    ai_confidence=0.9,
+                )
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    saved += 1
+
+            await self.log(db, "mfa_bypass",
+                f"MFA bypass found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+        else:
+            await self.log(db, "mfa_bypass", "No MFA bypass vulnerabilities found")
+
     async def _phase_app_graph(self, db: AsyncSession):
         """Build application model / attack graph from discovered endpoints."""
         try:
@@ -2464,6 +2568,64 @@ Respond in JSON:
             await self.log(db, "auto_register", f"Auto-register status: {status}")
         except Exception as e:
             await self.log(db, "auto_register", f"Auto-register error (non-fatal): {e}", "error")
+
+    async def _phase_graphql_attacks(self, db: AsyncSession):
+        """Deep GraphQL security testing — introspection, injection, DoS, authz bypass."""
+        if self.context.get("stealth"):
+            await self.log(db, "graphql_attacks", "Skipped in stealth mode")
+            return
+
+        try:
+            mod = GraphQLAttackModule(self.context)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "graphql_attacks")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                saved = 0
+                for f in findings:
+                    # Map vuln_type based on finding title
+                    title_lower = f.get("title", "").lower()
+                    if "injection" in title_lower or "sqli" in title_lower or "nosql" in title_lower:
+                        vtype = VulnType.SQLI
+                    elif "authorization" in title_lower or "bypass" in title_lower:
+                        vtype = VulnType.AUTH_BYPASS
+                    elif "information" in title_lower or "disclosure" in title_lower or "suggestion" in title_lower:
+                        vtype = VulnType.INFO_DISCLOSURE
+                    else:
+                        vtype = VulnType.MISCONFIGURATION
+
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "GraphQL issue")[:500],
+                        vuln_type=vtype,
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=f.get("url", "")[:2000],
+                        parameter=f.get("parameter"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload_used"),
+                        response_data=f.get("response_data"),
+                        ai_confidence=f.get("ai_confidence", 0.7),
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "graphql_attacks",
+                    f"GraphQL attack testing: {saved} new issues ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "graphql_attacks", "No GraphQL vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "graphql_attacks", f"GraphQL attack testing error (non-fatal): {e}", "error")
 
     async def _phase_business_logic(self, db: AsyncSession):
         """Test for business logic vulnerabilities."""
