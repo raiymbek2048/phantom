@@ -18,9 +18,17 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 1440
 
-    # AI - Claude
+    # AI - Claude (primary)
     anthropic_api_key: str = ""
     claude_model: str = "claude-opus-4-6"
+
+    # AI - Fallback LLMs (used when Claude unavailable)
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-chat"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+    openai_base_url: str = "https://api.openai.com/v1"
 
     # HackerOne
     hackerone_username: str = ""
