@@ -17,6 +17,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from app.utils.url_utils import is_static_url
+
 logger = logging.getLogger(__name__)
 
 # Endpoints to test (relative paths)
@@ -110,11 +112,7 @@ class StressTestModule:
             return None
 
         # Skip static assets
-        static_exts = ('.js', '.css', '.map', '.png', '.jpg', '.jpeg', '.gif',
-                       '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.webp')
-        if any(path.endswith(ext) for ext in static_exts):
-            return None
-        if '/assets/' in path or '/static/' in path or '/dist/' in path:
+        if is_static_url(url):
             return None
 
         num_requests = 20

@@ -7,6 +7,7 @@ Includes WAF bypass mutations and encoding tricks.
 import json
 import logging
 import random
+import re
 from urllib.parse import quote, quote_plus
 
 from app.ai.llm_engine import LLMEngine
@@ -491,6 +492,41 @@ class PayloadGenerator:
             scored_gets = sorted(get_eps, key=self._endpoint_score, reverse=True)
             selected = scored_forms[:10] + scored_gets[:25]
 
+            # Discovery probes: when few endpoints matched, spray basic probes
+            # across unmatched page/crawled endpoints to find hidden injection points
+            if len(selected) < 5 and vuln_type in ("xss", "sqli"):
+                selected_urls = {e.get("url") for e in selected}
+                probe_candidates = [
+                    e for e in endpoints
+                    if e.get("type") in ("page", "crawled")
+                    and e.get("url") not in selected_urls
+                ]
+                # Score and pick the most interesting ones
+                probe_candidates.sort(key=self._endpoint_score, reverse=True)
+                _DISCOVERY_PROBES = {
+                    "xss": [
+                        "<script>alert(1)</script>",
+                        '"onmouseover="alert(1)',
+                        "{{7*7}}",
+                    ],
+                    "sqli": [
+                        "'",
+                        "' OR '1'='1",
+                        "1 AND 1=1",
+                    ],
+                }
+                probes = _DISCOVERY_PROBES.get(vuln_type, [])
+                for ep in probe_candidates[:10]:
+                    for probe in probes:
+                        payloads.append({
+                            "vuln_type": vuln_type,
+                            "payload": probe,
+                            "target_url": ep.get("url"),
+                            "params": ep.get("params", []),
+                            "method": "GET",
+                            "discovery_probe": True,
+                        })
+
             for endpoint in selected:
                 for payload in raw_payloads[:20]:
                     if endpoint.get("type") == "form":
@@ -779,16 +815,70 @@ class PayloadGenerator:
 
         return payloads
 
+    # URL path segments that indicate injectable pages (login, search, etc.)
+    _INJECTABLE_PATH_KEYWORDS = (
+        "/search", "/login", "/signin", "/signup", "/register",
+        "/feedback", "/comment", "/contact", "/transfer", "/account",
+        "/profile", "/edit", "/update", "/query", "/lookup", "/find",
+        "/filter", "/sort", "/bank", "/dologin", "/process",
+    )
+    # Server-side extensions likely to have DB interaction (SQLi)
+    _SQLI_EXTENSIONS = (".jsp", ".asp", ".aspx", ".php")
+    # Server-side extensions likely to render user input (XSS)
+    _XSS_EXTENSIONS = (".jsp", ".asp", ".aspx", ".php", ".html")
+    # Regex: URL path ending with numeric segment like /products/123
+    _NUMERIC_SEGMENT_RE = re.compile(r"/\d+(?:[/?#]|$)")
+
+    def _is_injectable_page(self, endpoint: dict, vuln_type: str) -> bool:
+        """Check if a page/crawled endpoint looks injectable based on URL patterns."""
+        url = endpoint.get("url", "").lower()
+
+        # Has query parameters → likely injectable
+        if "?" in url:
+            return True
+
+        # URL path contains known injectable keywords
+        if any(kw in url for kw in self._INJECTABLE_PATH_KEYWORDS):
+            return True
+
+        # URL has numeric path segments (e.g. /products/123)
+        if self._NUMERIC_SEGMENT_RE.search(url):
+            return True
+
+        # Server-side extension checks per vuln type
+        if vuln_type == "sqli" and any(url.split("?")[0].endswith(ext) for ext in self._SQLI_EXTENSIONS):
+            return True
+        if vuln_type == "xss" and any(url.split("?")[0].endswith(ext) for ext in self._XSS_EXTENSIONS):
+            return True
+
+        return False
+
     def _get_endpoints_for_vuln(self, vuln_type: str, endpoints: list[dict]) -> list[dict]:
         """Select the best endpoints to test for a specific vulnerability type.
 
         Forms are prioritized since they're more likely to have real injection points.
+        For XSS/SQLi, also includes page/crawled endpoints with injectable URL patterns.
         """
         if vuln_type in ("xss", "sqli", "ssti", "cmd_injection"):
-            matched = [
-                e for e in endpoints
-                if e.get("params") or e.get("type") in ("parameterized", "api", "injectable", "form")
-            ]
+            matched_urls = set()
+            matched = []
+
+            # Primary: endpoints with params or tagged as injectable types
+            for e in endpoints:
+                if e.get("params") or e.get("type") in ("parameterized", "api", "injectable", "form"):
+                    url = e.get("url", "")
+                    if url not in matched_urls:
+                        matched_urls.add(url)
+                        matched.append(e)
+
+            # Secondary (XSS/SQLi only): page/crawled endpoints with injectable URL patterns
+            if vuln_type in ("xss", "sqli"):
+                for e in endpoints:
+                    if e.get("type") in ("page", "crawled") and e.get("url", "") not in matched_urls:
+                        if self._is_injectable_page(e, vuln_type):
+                            matched_urls.add(e.get("url", ""))
+                            matched.append(e)
+
             # Prioritize: forms first, then parameterized, then others
             matched.sort(key=lambda e: (0 if e.get("type") == "form" else 1))
             return matched

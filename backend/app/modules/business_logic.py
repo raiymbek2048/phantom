@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from app.utils.http_client import make_client
+from app.utils.url_utils import is_static_url, is_transactional_url
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,15 @@ PRIVILEGE_PARAMS = ("role", "is_admin", "admin", "type", "status", "plan",
 DESTRUCTIVE_KEYWORDS = ("delete", "destroy", "remove", "purge", "wipe",
                         "terminate", "erase", "drop")
 
+# NOTE: Static extension and non-transactional path filtering now uses
+# app.utils.url_utils (is_static_url, is_transactional_url)
+
+# Response body keywords that indicate a transactional context
+TRANSACTIONAL_INDICATORS = (
+    "price", "total", "cart", "order", "amount", "subtotal", "checkout",
+    "payment", "invoice", "billing", "charge", "fee", "cost", "$", "€",
+    "£", "¥", "discount", "quantity",
+)
 
 UPLOAD_KEYWORDS = ("upload", "file", "attach", "import", "image", "avatar",
                    "photo", "document", "media", "cv", "resume")
@@ -107,6 +117,10 @@ class BusinessLogicTester:
     def _is_destructive(self, url: str) -> bool:
         url_lower = url.lower()
         return any(kw in url_lower for kw in DESTRUCTIVE_KEYWORDS)
+
+    def _is_static_or_informational(self, url: str) -> bool:
+        """Return True if URL points to a static asset or non-transactional page."""
+        return not is_transactional_url(url)
 
     def _make_finding(
         self,
@@ -184,14 +198,17 @@ class BusinessLogicTester:
             logger.info("BusinessLogicTester: No price/cart endpoints found")
             return findings
 
+        max_price_findings = 2
         async with make_client(extra_headers=self.headers, timeout=15.0) as client:
             for target in targets[:10]:
+                if len(findings) >= max_price_findings:
+                    break
                 try:
                     results = await self._test_price_endpoint(client, target)
                     findings.extend(results)
                 except Exception as e:
                     logger.warning(f"Price test failed for {target['url']}: {e}")
-        return findings
+        return findings[:max_price_findings]
 
     def _find_price_endpoints(self) -> list[dict]:
         targets = []
@@ -200,6 +217,11 @@ class BusinessLogicTester:
         for ep in self.endpoints:
             norm = self._normalize_endpoint(ep)
             url_lower = norm["url"].lower()
+
+            # Skip static assets and informational pages
+            if self._is_static_or_informational(norm["url"]):
+                continue
+
             is_cart = any(kw in url_lower for kw in CART_KEYWORDS)
             has_price_params = any(
                 kw in (f.lower() if isinstance(f, str) else f.get("name", "").lower())
@@ -207,8 +229,10 @@ class BusinessLogicTester:
                 for kw in PRICE_KEYWORDS
             ) if norm["form_fields"] else False
 
-            # Also check URL params
-            if not has_price_params:
+            # URL keyword matching ONLY for POST/PUT/PATCH endpoints or those
+            # with form fields — plain GET pages with "price" in URL are not
+            # transactional endpoints
+            if not has_price_params and norm["method"] in ("POST", "PUT", "PATCH"):
                 has_price_params = any(
                     kw in url_lower for kw in PRICE_KEYWORDS
                 )
@@ -222,6 +246,8 @@ class BusinessLogicTester:
         for form in crawl_data.get("forms", []):
             form_url = form.get("action") or form.get("url", "")
             if form_url in seen_urls:
+                continue
+            if self._is_static_or_informational(form_url):
                 continue
             fields = form.get("fields", [])
             field_names = [
@@ -250,6 +276,8 @@ class BusinessLogicTester:
                                                   "invoice", "checkout", "billing")):
                 for ep_url in entity.get("endpoints", []):
                     if isinstance(ep_url, str) and ep_url not in seen_urls:
+                        if self._is_static_or_informational(ep_url):
+                            continue
                         targets.append({
                             "url": ep_url,
                             "method": "POST",
@@ -290,6 +318,36 @@ class BusinessLogicTester:
         ]
 
         for field in numeric_fields[:3]:
+            # --- BASELINE REQUEST: send normal value first ---
+            baseline_body = {field: "1"}
+            for f in target["form_fields"]:
+                fname = f if isinstance(f, str) else f.get("name", "")
+                if fname != field:
+                    baseline_body.setdefault(fname, "1")
+
+            try:
+                async with self.semaphore:
+                    baseline_resp = await client.post(url, json=baseline_body)
+                baseline_status = baseline_resp.status_code
+                baseline_text = baseline_resp.text[:2000]
+                baseline_ct = (baseline_resp.headers.get("content-type") or "").lower()
+            except Exception:
+                continue
+
+            # If baseline returns HTML with no transactional evidence, skip
+            # this endpoint entirely — it's not a real commerce endpoint
+            if "text/html" in baseline_ct:
+                baseline_lower = baseline_text.lower()
+                has_transactional = any(
+                    ind in baseline_lower for ind in TRANSACTIONAL_INDICATORS
+                )
+                if not has_transactional:
+                    logger.debug(
+                        f"Price test: skipping {url} — HTML response with no "
+                        f"transactional indicators"
+                    )
+                    continue
+
             for test_val, desc, severity in test_values:
                 async with self.semaphore:
                     try:
@@ -304,6 +362,18 @@ class BusinessLogicTester:
 
                         if resp.status_code in (200, 201, 202):
                             resp_text = resp.text[:2000]
+                            resp_ct = (resp.headers.get("content-type") or "").lower()
+
+                            # Skip if response is HTML with no transactional content
+                            if "text/html" in resp_ct:
+                                resp_lower = resp_text.lower()
+                                has_transactional = any(
+                                    ind in resp_lower
+                                    for ind in TRANSACTIONAL_INDICATORS
+                                )
+                                if not has_transactional:
+                                    continue
+
                             # Check for signs the server accepted the value
                             accepted = (
                                 resp.status_code in (200, 201) and
@@ -311,52 +381,75 @@ class BusinessLogicTester:
                                 "invalid" not in resp_text.lower()[:500] and
                                 "must be" not in resp_text.lower()[:500]
                             )
-                            if accepted:
-                                # Check if the manipulated value appears in response
-                                value_reflected = test_val in resp_text
-                                # Negative or zero in financial context = likely vuln
-                                is_financial = any(
-                                    kw in field.lower()
-                                    for kw in ("price", "amount", "total", "cost",
-                                               "charge", "fee")
-                                )
-                                if value_reflected or is_financial:
-                                    confidence = 0.85 if value_reflected else 0.6
-                                    findings.append(self._make_finding(
-                                        title=f"Price Manipulation: {desc} accepted "
-                                              f"for '{field}'",
-                                        severity=severity,
-                                        url=url,
-                                        method="POST",
-                                        parameter=field,
-                                        description=(
-                                            f"The endpoint accepted {desc} ({test_val}) "
-                                            f"for the '{field}' parameter without "
-                                            f"proper server-side validation. "
-                                            f"Response status: {resp.status_code}."
-                                        ),
-                                        impact=(
-                                            "Attackers could manipulate prices, "
-                                            "quantities, or totals to purchase items "
-                                            "for free, get negative charges (refunds), "
-                                            "or cause integer overflow issues."
-                                        ),
-                                        remediation=(
-                                            "Implement strict server-side validation "
-                                            "for all numeric parameters. Enforce "
-                                            "minimum/maximum bounds. Never trust "
-                                            "client-supplied prices — recalculate "
-                                            "totals server-side."
-                                        ),
-                                        payload_used=json.dumps(body),
-                                        confidence=confidence,
-                                        request_data={"body": body, "method": "POST"},
-                                        response_data={
-                                            "status": resp.status_code,
-                                            "snippet": resp_text[:500],
-                                        },
-                                    ))
-                                    break  # One finding per field is enough
+                            if not accepted:
+                                continue
+
+                            # --- BASELINE COMPARISON ---
+                            # Responses must differ meaningfully: different
+                            # status code OR body differs by >10%
+                            status_differs = resp.status_code != baseline_status
+                            body_diff_ratio = (
+                                abs(len(resp_text) - len(baseline_text))
+                                / max(len(baseline_text), 1)
+                            )
+                            responses_differ = status_differs or body_diff_ratio > 0.10
+
+                            if not responses_differ:
+                                # Server returned the same response for normal
+                                # and manipulated values — likely ignoring the
+                                # parameter entirely, not a real vuln
+                                continue
+
+                            # Check if the manipulated value appears in response
+                            value_reflected = test_val in resp_text
+                            # Negative or zero in financial context = likely vuln
+                            is_financial = any(
+                                kw in field.lower()
+                                for kw in ("price", "amount", "total", "cost",
+                                           "charge", "fee")
+                            )
+                            if value_reflected or is_financial:
+                                confidence = 0.85 if value_reflected else 0.6
+                                findings.append(self._make_finding(
+                                    title=f"Price Manipulation: {desc} accepted "
+                                          f"for '{field}'",
+                                    severity=severity,
+                                    url=url,
+                                    method="POST",
+                                    parameter=field,
+                                    description=(
+                                        f"The endpoint accepted {desc} ({test_val}) "
+                                        f"for the '{field}' parameter without "
+                                        f"proper server-side validation. "
+                                        f"Response status: {resp.status_code}. "
+                                        f"Baseline comparison: status "
+                                        f"{baseline_status}, body size diff "
+                                        f"{body_diff_ratio:.0%}."
+                                    ),
+                                    impact=(
+                                        "Attackers could manipulate prices, "
+                                        "quantities, or totals to purchase items "
+                                        "for free, get negative charges (refunds), "
+                                        "or cause integer overflow issues."
+                                    ),
+                                    remediation=(
+                                        "Implement strict server-side validation "
+                                        "for all numeric parameters. Enforce "
+                                        "minimum/maximum bounds. Never trust "
+                                        "client-supplied prices — recalculate "
+                                        "totals server-side."
+                                    ),
+                                    payload_used=json.dumps(body),
+                                    confidence=confidence,
+                                    request_data={"body": body, "method": "POST"},
+                                    response_data={
+                                        "status": resp.status_code,
+                                        "snippet": resp_text[:500],
+                                        "baseline_status": baseline_status,
+                                        "body_diff_ratio": round(body_diff_ratio, 3),
+                                    },
+                                ))
+                                break  # One finding per field is enough
                     except httpx.TimeoutException:
                         pass
                     except Exception as e:
@@ -389,6 +482,8 @@ class BusinessLogicTester:
         for ep in self.endpoints:
             norm = self._normalize_endpoint(ep)
             if self._is_destructive(norm["url"]):
+                continue
+            if self._is_static_or_informational(norm["url"]):
                 continue
             url_lower = norm["url"].lower()
             method = norm["method"]

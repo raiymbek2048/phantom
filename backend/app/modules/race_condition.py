@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import httpx
 from app.utils.http_client import make_client
+from app.utils.url_utils import is_static_url, is_transactional_url
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ COMMON_RACE_PATHS = [
     "/api/cart/checkout", "/api/order/create", "/api/points/redeem",
     "/api/wallet/withdraw", "/api/credits/use",
 ]
+# NOTE: Static extension, path segment, and informational keyword filtering
+# now uses app.utils.url_utils (is_static_url, is_transactional_url)
 
 
 class RaceConditionModule:
@@ -111,6 +114,11 @@ class RaceConditionModule:
 
     # ─── Target Identification ───────────────────────────────────────────
 
+    @staticmethod
+    def _is_static_or_informational(url: str) -> bool:
+        """Return True if URL points to a static asset or informational page."""
+        return not is_transactional_url(url)
+
     def _identify_race_targets(self, endpoints: list, base_url: str) -> list[dict]:
         targets, seen_urls = [], set()
         for ep in endpoints:
@@ -120,6 +128,8 @@ class RaceConditionModule:
                 continue
             seen_urls.add(url)
             if method not in ("POST", "PUT", "PATCH", "DELETE"):
+                continue
+            if self._is_static_or_informational(url):
                 continue
             url_lower = url.lower()
             for severity, keywords in RACE_KEYWORDS.items():
@@ -275,31 +285,31 @@ class RaceConditionModule:
         error_count = sum(1 for r in valid if r["status"] >= 400)
         indicators: list[str] = []
 
-        # 1. Mixed success/failure — strongest signal
-        if len(statuses) > 1 and success_count >= 2 and error_count >= 1:
+        total = len(valid)
+        success_ratio = success_count / total if total else 0
+        error_ratio = error_count / total if total else 0
+        has_timing_variance = False
+
+        # 1. Mixed success/failure — require at least 30% success AND 30% failure
+        if (len(statuses) > 1 and success_ratio >= 0.3 and error_ratio >= 0.3):
             indicators.append(f"Mixed statuses: {dict(statuses)} — "
                               f"{success_count} succeeded, {error_count} failed")
 
-        # 2. All succeed on critical endpoint (should be idempotent)
-        if success_count == len(valid) and target.get("severity") == "critical" and len(valid) >= 5:
-            indicators.append(f"All {len(valid)} concurrent requests returned success "
-                              f"— possible double-spend on critical endpoint")
-
-        # 3. Response length variance (different code paths)
+        # 2. Response length variance (different code paths) — require stddev > 25% of mean
         if len(lengths) >= 3:
             avg_len = sum(lengths) / len(lengths)
             if avg_len > 0:
                 std_dev = (sum((l - avg_len) ** 2 for l in lengths) / len(lengths)) ** 0.5
-                if std_dev > avg_len * 0.1 and std_dev > 50:
+                if std_dev > avg_len * 0.25 and std_dev > 50:
                     indicators.append(f"Response length variance: stddev={std_dev:.0f} (avg {avg_len:.0f})")
 
-        # 4. Timing variance — lock contention / different paths
+        # 3. Timing variance — only used as supporting evidence, not standalone
         if len(times) >= 3 and min(times) > 0:
             ratio = max(times) / min(times)
             if ratio > 4:
-                indicators.append(f"Timing variance: {min(times):.3f}s to {max(times):.3f}s ({ratio:.1f}x)")
+                has_timing_variance = True
 
-        # 5. Different bodies among successful responses
+        # 4. Different bodies among successful responses
         bodies = [r.get("body_preview", "") for r in valid]
         success_bodies = [b for r, b in zip(valid, bodies) if 200 <= r["status"] < 300]
         if len(success_bodies) >= 2:
@@ -308,7 +318,13 @@ class RaceConditionModule:
                 indicators.append(f"Different response bodies among {len(success_bodies)} "
                                   f"successful requests ({len(unique)} variants)")
 
-        if not indicators:
+        # Timing variance only counts if there is at least one other indicator
+        if has_timing_variance and indicators:
+            indicators.append(f"Timing variance: {min(times):.3f}s to {max(times):.3f}s "
+                              f"({max(times) / min(times):.1f}x)")
+
+        # Require at least 2 strong indicators to report
+        if len(indicators) < 2:
             return None
 
         severity = target.get("severity", "medium")
@@ -343,6 +359,8 @@ class RaceConditionModule:
         for ep in endpoints:
             url = ep.get("url", "") if isinstance(ep, dict) else str(ep)
             method = (ep.get("method", "GET") if isinstance(ep, dict) else "GET").upper()
+            if self._is_static_or_informational(url):
+                continue
             url_lower = url.lower()
             if method == "GET" and any(kw in url_lower for kw in STATE_KEYWORDS):
                 state_eps.append(url)

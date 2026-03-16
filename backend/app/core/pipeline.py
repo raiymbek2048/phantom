@@ -7,6 +7,8 @@ Each phase runs sequentially, with AI making decisions between phases.
 import asyncio
 import json
 import logging
+import re
+from collections import defaultdict
 from datetime import datetime
 
 from sqlalchemy import select, and_, text
@@ -259,6 +261,26 @@ class ScanPipeline:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/").lower()
 
+    @staticmethod
+    def _normalize_biz_logic_title(title: str) -> str:
+        """Strip URL/endpoint-specific parts from a business logic title for conceptual dedup.
+
+        Examples:
+            'Workflow Bypass at /catalog' → 'Workflow Bypass'
+            'Price Manipulation: negative value accepted for fee (POST /api/order)' → 'Price Manipulation: negative value accepted for fee'
+        """
+        if not title:
+            return ""
+        # Remove trailing '(METHOD /path...)' or '(METHOD https://...)'
+        normalized = re.sub(r'\s*\((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\)\s*$', '', title, flags=re.IGNORECASE)
+        # Remove trailing 'at /path' or 'at https://...'
+        normalized = re.sub(r'\s+at\s+(?:https?://\S+|/\S+)\s*$', '', normalized, flags=re.IGNORECASE)
+        # Remove trailing 'on /path' or 'on https://...'
+        normalized = re.sub(r'\s+on\s+(?:https?://\S+|/\S+)\s*$', '', normalized, flags=re.IGNORECASE)
+        # Remove trailing '— /path' or '- /path'
+        normalized = re.sub(r'\s*[—–-]\s*(?:https?://\S+|/\S+)\s*$', '', normalized)
+        return normalized.strip()
+
     async def _save_vuln_deduped(
         self,
         db: AsyncSession,
@@ -291,6 +313,34 @@ class ScanPipeline:
         )
         if existing.scalar_one_or_none():
             return None  # Duplicate — skip
+
+        # Business logic conceptual dedup: same normalized title = same finding
+        # even on different URLs (e.g. "Price Manipulation" on /order vs /checkout)
+        if vuln.vuln_type == VulnType.BUSINESS_LOGIC and vuln.title:
+            norm_title = self._normalize_biz_logic_title(vuln.title)
+            if norm_title:
+                biz_existing = await db.execute(
+                    select(Vulnerability.id).where(and_(
+                        Vulnerability.target_id == vuln.target_id,
+                        Vulnerability.vuln_type == VulnType.BUSINESS_LOGIC,
+                        Vulnerability.scan_id == vuln.scan_id,
+                    ))
+                )
+                biz_ids = biz_existing.scalars().all()
+                if biz_ids:
+                    # Check titles of existing business_logic vulns in this scan
+                    biz_vulns = await db.execute(
+                        select(Vulnerability.title).where(
+                            Vulnerability.id.in_(biz_ids)
+                        )
+                    )
+                    existing_titles = biz_vulns.scalars().all()
+                    matches = sum(
+                        1 for t in existing_titles
+                        if self._normalize_biz_logic_title(t or "") == norm_title
+                    )
+                    if matches >= 3:
+                        return None  # Max 3 same-concept business logic findings per scan
 
         # Sanitize: AI sometimes returns list instead of str for text fields
         for attr in ("remediation", "description", "impact", "payload_used", "ai_analysis", "title"):
@@ -2752,8 +2802,22 @@ Respond in JSON:
 
                 sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
                            "medium": Severity.MEDIUM, "low": Severity.LOW}
-                saved = 0
+
+                # Pre-save conceptual dedup: group by normalized title, keep max 3 per concept
+                seen_biz_logic: dict[str, int] = defaultdict(int)
+                deduped_findings = []
                 for f in findings:
+                    title = f.get("title", "Business logic issue")
+                    concept_key = self._normalize_biz_logic_title(title) or title
+                    if seen_biz_logic[concept_key] >= 3:
+                        continue  # Already have 3 findings for this concept
+                    seen_biz_logic[concept_key] += 1
+                    deduped_findings.append(f)
+
+                concept_skipped = len(findings) - len(deduped_findings)
+
+                saved = 0
+                for f in deduped_findings:
                     vuln = Vulnerability(
                         target_id=self.context["target_id"],
                         scan_id=self.context["scan_id"],
@@ -2775,8 +2839,9 @@ Respond in JSON:
                     if result:
                         saved += 1
 
+                total_deduped = len(findings) - saved
                 await self.log(db, "business_logic",
-                    f"Business logic testing: {saved} new issues ({len(findings) - saved} deduped)", "warning")
+                    f"Business logic testing: {saved} new issues ({total_deduped} deduped, {concept_skipped} concept-grouped)", "warning")
             else:
                 await self.log(db, "business_logic", "No business logic vulnerabilities found")
         except Exception as e:

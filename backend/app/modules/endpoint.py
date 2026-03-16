@@ -12,6 +12,7 @@ import httpx
 
 from app.utils.tool_runner import run_command
 from app.utils.http_client import make_client
+from app.utils.url_utils import is_static_url
 
 
 # Common wordlists for directory/file fuzzing
@@ -209,9 +210,8 @@ class EndpointModule:
 
                             # Extract href links
                             links = re.findall(r'href=["\']([^"\'#]+)', resp.text)
-                            skip_exts = (".css", ".js", ".png", ".jpg", ".gif", ".ico", ".svg", ".woff", ".ttf")
                             for link in links:
-                                if any(link.lower().endswith(ext) for ext in skip_exts):
+                                if is_static_url(link):
                                     continue
                                 if link.startswith("http"):
                                     full_url = link
@@ -863,12 +863,7 @@ class EndpointModule:
 
         return endpoints
 
-    # Static file extensions — not useful for exploit testing
-    _STATIC_EXTS = frozenset([
-        ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
-        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp",
-        ".mp4", ".webm", ".mp3", ".pdf", ".zip", ".gz", ".br",
-    ])
+    # NOTE: Static file extension filtering now uses app.utils.url_utils.is_static_url
 
     async def _spa_render_discovery(self, base_url: str) -> list[dict]:
         """Use Playwright to render SPA pages and intercept API calls + discover routes."""
@@ -1055,7 +1050,7 @@ class EndpointModule:
         path_lower = url_lower.split("?")[0]
 
         # Skip static assets — never useful for exploitation
-        if any(path_lower.endswith(ext) for ext in self._STATIC_EXTS):
+        if is_static_url(url):
             endpoint["type"] = "static"
             endpoint["interest"] = "none"
             return endpoint
