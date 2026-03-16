@@ -231,6 +231,17 @@ class KnowledgeBase:
             "technologies_detected": technologies,
         }
 
+    async def get_graph_context(self, db: AsyncSession, technologies: list[str],
+                                domain: str | None = None) -> dict:
+        """Get knowledge graph context for AI briefings.
+        Queries the graph for attack surface intel and similar targets."""
+        try:
+            from app.core.knowledge_graph import KnowledgeGraph
+            return await KnowledgeGraph.get_graph_context(db, technologies, domain)
+        except Exception as e:
+            logger.debug(f"Graph context unavailable: {e}")
+            return {"graph_attack_surface": {}, "similar_targets": []}
+
     # ---- Learning Methods ----
 
     async def learn_from_scan(self, db: AsyncSession, scan_id: str):
@@ -274,6 +285,13 @@ class KnowledgeBase:
             await self.decay_old_patterns(db, days_threshold=30)
         except Exception as e:
             logger.warning(f"Knowledge decay error (non-fatal): {e}")
+
+        # 6. Build knowledge graph relationships
+        try:
+            from app.core.knowledge_graph import KnowledgeGraph
+            await KnowledgeGraph.learn_from_scan(db, scan_id)
+        except Exception as e:
+            logger.warning(f"Knowledge graph learning error (non-fatal): {e}")
 
         await db.commit()
         logger.info(f"Knowledge: learned from scan {scan_id} ({len(vulns)} vulns, {len(tech_lower)} techs)")

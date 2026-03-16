@@ -108,6 +108,7 @@ from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
 from app.modules.auto_register import AutoRegister
 from app.core.attack_planner import AttackPlanner
+from app.core.phase_optimizer import PhaseOptimizer
 
 # Phase definitions with progress percentages
 PHASES = [
@@ -601,9 +602,18 @@ class ScanPipeline:
                             await self.log(db, "intel", f"Cross-scan intel skipped: {e}", "warning")
                             await db.commit()
 
+                    # --- Dynamic Phase Refinement ---
+                    # After fingerprint completes, ask AI to optimize attack phase order
+                    # This runs recon phases internally, then reorders attack phases
+                    phases = await self._maybe_optimize_phases(db, phases, resume_from_index)
+
+                    # If recon phases were already run by optimizer, skip them in the main loop
+                    recon_already_run = self.context.pop("_recon_already_run", -1)
+                    effective_resume = max(resume_from_index, recon_already_run)
+
                     for idx, (phase_name, progress, phase_func) in enumerate(phases):
-                        # Skip phases already completed before crash
-                        if idx <= resume_from_index:
+                        # Skip phases already completed (by checkpoint or by optimizer)
+                        if idx <= effective_resume:
                             continue
                         await self._run_phase(db, scan, phase_name, progress, phase_func, phase_index=idx)
 
@@ -645,6 +655,7 @@ class ScanPipeline:
                                      "register_endpoint", "login_endpoint", "user_role")
                         } if self.context.get("auto_register_result") else {},
                         "phases_completed": [p[0] for p in phases],
+                        "phases_optimized": self.context.get("_phases_were_optimized", False),
                     }
                     from sqlalchemy.orm.attributes import flag_modified as _fm2
                     _fm2(scan, "data")
@@ -1095,6 +1106,123 @@ Respond in JSON:
             return all_phases
         else:
             return all_phases
+
+    async def _maybe_optimize_phases(
+        self, db, phases: list[tuple], resume_from_index: int
+    ) -> list[tuple]:
+        """Run AI phase optimization after fingerprint completes.
+
+        Splits phases into fixed recon phases (recon→subdomain→portscan→fingerprint)
+        and optimizable attack phases. Asks PhaseOptimizer to reorder attack phases.
+        Returns the full phase list with attack phases reordered.
+        Falls back to default order silently on any error.
+        """
+        from app.core.phase_optimizer import FIXED_RECON_PHASES
+
+        # Don't optimize if we're resuming past fingerprint
+        fingerprint_idx = None
+        for i, (name, _, _) in enumerate(phases):
+            if name == "fingerprint":
+                fingerprint_idx = i
+                break
+
+        if fingerprint_idx is None:
+            return phases  # No fingerprint phase (e.g., quick scan without it)
+
+        if resume_from_index >= fingerprint_idx:
+            return phases  # Already past fingerprint on resume — keep order
+
+        # Only optimize for scan types with attack phases
+        if len(phases) <= fingerprint_idx + 1:
+            return phases  # Recon-only scan
+
+        # Split into recon (fixed) and attack (optimizable) phases
+        recon_phases = phases[:fingerprint_idx + 1]
+        attack_phases = phases[fingerprint_idx + 1:]
+
+        # Run recon phases first to gather data for optimization
+        # (they should already be completed by the execution loop,
+        # but we need the data — this method is called BEFORE the loop)
+        # Actually, this is called before the loop, so we need to run recon first.
+        # Better approach: just run recon phases, then optimize, then rebuild.
+
+        # We need recon data to optimize. Since this is called before the main loop,
+        # we run recon phases now, then optimize attack phases, then return
+        # the combined list with recon phases marked so the loop skips them.
+
+        # Run recon phases
+        result = await db.execute(select(Scan).where(Scan.id == self.scan_id))
+        scan = result.scalar_one_or_none()
+        if not scan:
+            return phases
+
+        for idx, (phase_name, progress, phase_func) in enumerate(recon_phases):
+            if idx <= resume_from_index:
+                continue
+            await self._run_phase(db, scan, phase_name, progress, phase_func, phase_index=idx)
+
+        # Now we have recon data in self.context — run optimizer
+        attack_phase_names = [name for name, _, _ in attack_phases]
+        attack_func_map = {name: func for name, _, func in attack_phases}
+
+        try:
+            from app.ai.llm_engine import LLMEngine
+            llm = LLMEngine()
+            optimizer = PhaseOptimizer()
+            optimized_names = await optimizer.optimize_phases(
+                db, self.context, attack_phase_names, llm
+            )
+            await llm.close()
+
+            # Check if order actually changed
+            if optimized_names != attack_phase_names:
+                # Log the optimization
+                skipped = [n for n in attack_phase_names if n not in optimized_names]
+                await self.log(
+                    db, "phase_optimizer",
+                    f"AI optimized phase order: {optimized_names}"
+                    + (f" (skipped: {skipped})" if skipped else ""),
+                )
+                await db.commit()
+
+                # Rebuild attack phases with new order and recalculated progress
+                total_phases = len(recon_phases) + len(optimized_names)
+                new_attack_phases = []
+                for i, name in enumerate(optimized_names):
+                    func = attack_func_map.get(name)
+                    if func is None:
+                        continue  # Unknown phase — skip
+                    progress_pct = int(
+                        (len(recon_phases) + i + 1) / total_phases * 100
+                    )
+                    new_attack_phases.append((name, progress_pct, func))
+
+                # Mark recon phases with resume_from_index so main loop skips them
+                # We do this by returning a combined list where recon phases
+                # are already completed (the main loop checks idx <= resume_from_index)
+                # But since we can't modify resume_from_index from here, we set a flag
+                self.context["_recon_already_run"] = fingerprint_idx
+                self.context["_phases_were_optimized"] = True
+                return recon_phases + new_attack_phases
+            else:
+                await self.log(db, "phase_optimizer", "AI kept default phase order")
+                await db.commit()
+                self.context["_recon_already_run"] = fingerprint_idx
+                return phases
+
+        except Exception as e:
+            logger.warning("Phase optimization failed, using default order: %s", e)
+            try:
+                await self.log(
+                    db, "phase_optimizer",
+                    f"Phase optimization skipped (fallback to default): {e}",
+                    "warning",
+                )
+                await db.commit()
+            except Exception:
+                pass
+            self.context["_recon_already_run"] = fingerprint_idx
+            return phases
 
     async def _run_phase(self, db, scan, phase_name, progress, phase_func, phase_index: int = -1):
         # Check if scan was stopped/paused

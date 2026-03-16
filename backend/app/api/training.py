@@ -635,6 +635,57 @@ async def list_training_modules(
     }
 
 
+# ---- Knowledge Graph ----
+
+@router.get("/graph-summary")
+async def knowledge_graph_summary(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get knowledge graph node/edge statistics."""
+    from app.core.knowledge_graph import KnowledgeGraph
+    return await KnowledgeGraph.get_graph_summary(db)
+
+
+@router.get("/graph-tech-chain/{technology}")
+async def knowledge_graph_tech_chain(
+    technology: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get full knowledge chain for a technology (vulns, payloads, co-occurring techs)."""
+    from app.core.knowledge_graph import KnowledgeGraph
+    return await KnowledgeGraph.get_tech_chain(db, technology)
+
+
+@router.get("/graph-attack-surface")
+async def knowledge_graph_attack_surface(
+    technologies: str,  # comma-separated
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Query attack surface for given technologies (comma-separated).
+    Returns known vulns, effective techniques, and WAF bypasses."""
+    from app.core.knowledge_graph import KnowledgeGraph
+    tech_list = [t.strip() for t in technologies.split(",") if t.strip()]
+    if not tech_list:
+        raise HTTPException(status_code=400, detail="Provide at least one technology")
+    return await KnowledgeGraph.query_attack_surface(db, tech_list)
+
+
+@router.get("/graph-similar-targets")
+async def knowledge_graph_similar_targets(
+    domain: str,
+    technologies: str = "",  # comma-separated
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Find targets with similar tech stacks and what vulns were found on them."""
+    from app.core.knowledge_graph import KnowledgeGraph
+    tech_list = [t.strip() for t in technologies.split(",") if t.strip()]
+    return await KnowledgeGraph.find_similar_targets(db, domain, tech_list)
+
+
 # ---- Settings (Claude API Key) ----
 
 REDIS_KEY_CLAUDE = "phantom:settings:anthropic_api_key"

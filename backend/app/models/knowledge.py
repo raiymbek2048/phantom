@@ -11,8 +11,8 @@ Stores learned patterns from past scans so the AI improves over time:
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, DateTime, Text, JSON, Float, Integer, Boolean
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import String, DateTime, Text, JSON, Float, Integer, Boolean, ForeignKey, Index
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.database import Base
 
@@ -79,3 +79,57 @@ class AgentDecision(Base):
     # Did this action find anything useful?
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class KnowledgeNode(Base):
+    """Node in the knowledge graph — represents entities discovered during scanning."""
+    __tablename__ = "knowledge_nodes"
+    __table_args__ = (
+        Index("ix_kn_type_name", "node_type", "name", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    node_type: Mapped[str] = mapped_column(String(50), index=True)
+    # "technology", "vulnerability", "domain", "endpoint", "service", "waf", "credential", "technique"
+    name: Mapped[str] = mapped_column(String(255))
+    properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    scan_count: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Relationships
+    edges_out = relationship(
+        "KnowledgeEdge", foreign_keys="KnowledgeEdge.source_id",
+        back_populates="source_node", cascade="all, delete-orphan",
+    )
+    edges_in = relationship(
+        "KnowledgeEdge", foreign_keys="KnowledgeEdge.target_id",
+        back_populates="target_node", cascade="all, delete-orphan",
+    )
+
+
+class KnowledgeEdge(Base):
+    """Edge in the knowledge graph — represents relationships between entities."""
+    __tablename__ = "knowledge_edges"
+    __table_args__ = (
+        Index("ix_ke_src_tgt_type", "source_id", "target_id", "edge_type", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    source_id: Mapped[str] = mapped_column(
+        String, ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), index=True,
+    )
+    target_id: Mapped[str] = mapped_column(
+        String, ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), index=True,
+    )
+    edge_type: Mapped[str] = mapped_column(String(50), index=True)
+    # "runs_on", "vulnerable_to", "bypasses", "discovered_at", "effective_against",
+    # "co_occurs_with", "exploited_by"
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    source_node = relationship("KnowledgeNode", foreign_keys=[source_id], back_populates="edges_out")
+    target_node = relationship("KnowledgeNode", foreign_keys=[target_id], back_populates="edges_in")
