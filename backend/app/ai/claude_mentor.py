@@ -33,10 +33,8 @@ Rules:
 class ClaudeMentor:
     def __init__(self):
         self.client = None
-        from app.ai.get_claude_key import get_claude_api_key
-        api_key = get_claude_api_key()
-        if api_key:
-            self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        from app.ai.get_claude_key import make_anthropic_client
+        self.client = make_anthropic_client(sync=False)
         self.model = settings.claude_model
 
     async def analyze(self, prompt: str) -> str:

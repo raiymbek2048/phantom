@@ -145,10 +145,8 @@ class ClaudeCollaboration:
 
     def __init__(self):
         self.client = None
-        from app.ai.get_claude_key import get_claude_api_key
-        api_key = get_claude_api_key()
-        if api_key:
-            self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        from app.ai.get_claude_key import make_anthropic_client
+        self.client = make_anthropic_client(sync=False)
         self.model = settings.claude_model
         self.conversation: list[dict] = []
         self.actions_taken: list[dict] = []
@@ -480,11 +478,9 @@ What should I test to confirm? Give me specific actions."""
             try:
                 # Re-fetch API key on retry (handles token refresh)
                 if attempt > 0:
-                    from app.ai.get_claude_key import get_claude_api_key
-                    api_key = get_claude_api_key()
-                    if api_key:
-                        self.client = anthropic.AsyncAnthropic(api_key=api_key)
-                    else:
+                    from app.ai.get_claude_key import make_anthropic_client
+                    self.client = make_anthropic_client(sync=False)
+                    if not self.client:
                         logger.error("Claude API key unavailable on retry")
                         return None
 
