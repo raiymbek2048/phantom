@@ -489,7 +489,7 @@ class AttackPlanner:
     # ──────────────────────────────────────────
 
     async def _build_enriched_briefing(self, context: dict) -> str:
-        """Build briefing enriched with Sploitus exploit data."""
+        """Build briefing enriched with Sploitus exploit data and Knowledge Graph intelligence."""
         base_briefing = self._build_briefing(context)
 
         # Search for exploits based on detected technologies
@@ -497,7 +497,85 @@ class AttackPlanner:
         if exploit_section:
             base_briefing += f"\n\n{exploit_section}"
 
+        # Inject Knowledge Graph exploit chain intelligence
+        graph_section = self._build_graph_intelligence_section(context)
+        if graph_section:
+            base_briefing += f"\n\n{graph_section}"
+
         return base_briefing
+
+    def _build_graph_intelligence_section(self, context: dict) -> str:
+        """Build exploit chain intelligence section from Knowledge Graph data."""
+        graph_attack_surface = context.get("graph_attack_surface")
+        graph_similar_targets = context.get("graph_similar_targets")
+
+        if not graph_attack_surface and not graph_similar_targets:
+            return ""
+
+        lines = ["## Exploit Chain Intelligence (from Knowledge Graph)"]
+
+        # Known attack surface for tech stack
+        if graph_attack_surface:
+            vulns = graph_attack_surface.get("vulnerabilities", [])
+            techniques = graph_attack_surface.get("techniques", [])
+            waf_bypasses = graph_attack_surface.get("waf_bypasses", [])
+
+            if vulns:
+                lines.append("\n### Known Attack Surface for Your Tech Stack")
+                vuln_strs = [f"{v['vuln_type']} (weight:{v['weight']:.1f}, seen:{v['observations']}x)" for v in vulns[:8]]
+                lines.append(f"Historically vulnerable to: {', '.join(vuln_strs)}")
+
+            if techniques:
+                lines.append("\n### Effective Techniques")
+                for t in techniques[:8]:
+                    payload_preview = t.get("payload", "")[:80]
+                    lines.append(f"  - {t['technique'][:60]} → for {t['for_vuln']} (w:{t['weight']:.1f})")
+                    if payload_preview:
+                        lines.append(f"    payload: {payload_preview}")
+
+            if waf_bypasses:
+                lines.append("\n### WAF Bypass Intelligence")
+                for wb in waf_bypasses[:5]:
+                    lines.append(f"  - {wb['technique'][:60]} bypasses {wb['waf']} (w:{wb['weight']:.1f})")
+
+        # Similar targets intelligence
+        if graph_similar_targets:
+            lines.append("\n### What Worked on Similar Targets")
+            for st in graph_similar_targets[:5]:
+                shared = ", ".join(st.get("shared_technologies", [])[:5])
+                found_vulns = ", ".join(st.get("vulnerabilities_found", [])[:5])
+                if found_vulns:
+                    lines.append(f"  - {st['domain']} shares [{shared}] → found: {found_vulns}")
+
+        # Suggest exploit chains based on current findings + graph knowledge
+        existing_vulns = context.get("vulnerabilities", [])
+        if existing_vulns and graph_attack_surface:
+            found_types = set(v.get("vuln_type", "") for v in existing_vulns)
+            graph_vulns = set(v["vuln_type"] for v in graph_attack_surface.get("vulnerabilities", []))
+            unexplored = graph_vulns - found_types
+            if unexplored:
+                lines.append("\n### Suggested Exploit Chains")
+                lines.append("Based on findings so far, try these escalation paths:")
+                chain_suggestions = {
+                    "info_disclosure": "try SSRF to internal URLs → check for Redis/Docker → RCE",
+                    "ssrf": "read cloud metadata → pivot to internal services → RCE",
+                    "sqli": "extract credentials → auth bypass → admin access",
+                    "xss": "steal admin session → CSRF to change settings → account takeover",
+                    "auth_bypass": "access admin panel → find file upload → RCE",
+                    "misconfiguration": "enumerate exposed services → find debug endpoints → info leak → deeper exploit",
+                    "idor": "enumerate user data → find admin IDs → privilege escalation",
+                    "lfi": "read config files → extract secrets → auth bypass → RCE",
+                    "ssti": "confirm template engine → code execution → RCE",
+                }
+                for vtype in list(unexplored)[:5]:
+                    chain = chain_suggestions.get(vtype, f"investigate {vtype} attack vectors")
+                    lines.append(f"  - Graph suggests {vtype} is likely → {chain}")
+
+        result = "\n".join(lines)
+        # Keep concise — cap at 2000 chars
+        if len(result) > 2000:
+            result = result[:1997] + "..."
+        return result
 
     async def _gather_exploit_intelligence(self, context: dict) -> str:
         """Query Sploitus for real exploits matching the tech stack."""

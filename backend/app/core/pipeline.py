@@ -78,6 +78,15 @@ VULN_TYPE_ALIASES: dict[str, VulnType] = {
     "privilege_escalation": VulnType.PRIVILEGE_ESCALATION,
     "business_logic": VulnType.BUSINESS_LOGIC,
     "csrf": VulnType.CSRF,
+    "request_smuggling": VulnType.MISCONFIGURATION,
+    "http_request_smuggling": VulnType.MISCONFIGURATION,
+    "http_smuggling": VulnType.MISCONFIGURATION,
+    "mass_assignment": VulnType.MISCONFIGURATION,
+    "parameter_pollution": VulnType.MISCONFIGURATION,
+    "cache_poisoning": VulnType.MISCONFIGURATION,
+    "cache_deception": VulnType.INFO_DISCLOSURE,
+    "web_cache_poisoning": VulnType.MISCONFIGURATION,
+    "web_cache_deception": VulnType.INFO_DISCLOSURE,
 }
 from app.modules.recon import ReconModule
 from app.modules.subdomain import SubdomainModule
@@ -107,6 +116,9 @@ from app.modules.application_graph import ApplicationGraphBuilder
 from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
 from app.modules.auto_register import AutoRegister
+from app.modules.request_smuggling import RequestSmugglingModule
+from app.modules.mass_assignment import MassAssignmentModule
+from app.modules.cache_poisoning import CachePoisoningModule
 from app.core.attack_planner import AttackPlanner
 from app.core.phase_optimizer import PhaseOptimizer
 
@@ -735,7 +747,7 @@ class ScanPipeline:
         {
             "name": "Business Logic & API Abuse",
             "context_flags": {"round_focus": "business_logic", "test_race_conditions": True, "test_mass_assignment": True},
-            "phases": ["endpoint", "app_graph", "stateful_crawl", "auto_register", "vuln_scan", "exploit", "business_logic", "vuln_confirm", "ai_analysis"],
+            "phases": ["endpoint", "app_graph", "stateful_crawl", "auto_register", "vuln_scan", "exploit", "business_logic", "mass_assignment", "vuln_confirm", "ai_analysis"],
         },
         {
             "name": "Auth & JWT Deep Dive",
@@ -750,7 +762,7 @@ class ScanPipeline:
         {
             "name": "Full Re-Scan with New Intel",
             "context_flags": {"round_focus": "rescan", "use_previous_findings": True},
-            "phases": ["endpoint", "sensitive_files", "vuln_scan", "nuclei", "payload_gen", "exploit", "vuln_confirm", "service_attack", "auth_attack"],
+            "phases": ["endpoint", "sensitive_files", "vuln_scan", "nuclei", "payload_gen", "exploit", "vuln_confirm", "service_attack", "auth_attack", "request_smuggling", "cache_poisoning"],
         },
         {
             "name": "Stress & Edge Cases",
@@ -791,6 +803,9 @@ class ScanPipeline:
             "service_attack": self._phase_service_attack,
             "auth_attack": self._phase_auth_attack,
             "business_logic": self._phase_business_logic,
+            "request_smuggling": self._phase_request_smuggling,
+            "mass_assignment": self._phase_mass_assignment,
+            "cache_poisoning": self._phase_cache_poisoning,
             "stress_test": self._phase_stress_test,
             "claude_collab": self._phase_claude_collab,
             "attack_planner": self._phase_attack_planner,
@@ -1070,8 +1085,11 @@ Respond in JSON:
             ("exploit", 68, self._phase_exploit),
             ("service_attack", 73, self._phase_service_attack),
             ("auth_attack", 77, self._phase_auth_attack),
-            ("business_logic", 81, self._phase_business_logic),
-            ("stress_test", 84, self._phase_stress_test),
+            ("business_logic", 78, self._phase_business_logic),
+            ("request_smuggling", 80, self._phase_request_smuggling),
+            ("mass_assignment", 82, self._phase_mass_assignment),
+            ("cache_poisoning", 84, self._phase_cache_poisoning),
+            ("stress_test", 86, self._phase_stress_test),
             ("vuln_confirm", 88, self._phase_vuln_confirm),
             ("claude_collab", 90, self._phase_claude_collab),
             ("attack_planner", 94, self._phase_attack_planner),
@@ -1083,7 +1101,8 @@ Respond in JSON:
             # Skip heavy phases for quick scan
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
                     "evidence", "service_attack", "auth_attack", "stress_test",
-                    "stateful_crawl", "business_logic", "auto_register"}
+                    "stateful_crawl", "business_logic", "auto_register",
+                    "request_smuggling", "mass_assignment", "cache_poisoning"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
             # Recalculate progress evenly
             for i, (n, _, f) in enumerate(phases):
@@ -2495,6 +2514,153 @@ Respond in JSON:
         except Exception as e:
             await self.log(db, "business_logic", f"Business logic testing error (non-fatal): {e}", "error")
 
+    async def _phase_request_smuggling(self, db: AsyncSession):
+        """Test for HTTP Request Smuggling (CL.TE, TE.CL, TE.TE)."""
+        if self.context.get("stealth"):
+            await self.log(db, "request_smuggling", "Skipped in stealth mode")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = RequestSmugglingModule(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "request_smuggling")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                vt_map = {v.value: v for v in VulnType}
+
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "HTTP Request Smuggling")[:500],
+                        vuln_type=vt_map.get(f.get("vuln_type", "misconfiguration"), VulnType.MISCONFIGURATION),
+                        severity=sev_map.get(f.get("severity", "high"), Severity.HIGH),
+                        url=f.get("url", "")[:2000],
+                        method=f.get("method"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        response_data={"proof": f.get("proof", "")},
+                        ai_confidence=0.85,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "request_smuggling",
+                    f"Request smuggling: {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "request_smuggling", "No request smuggling vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "request_smuggling", f"Request smuggling testing error (non-fatal): {e}", "error")
+
+    async def _phase_mass_assignment(self, db: AsyncSession):
+        """Test for Mass Assignment / Parameter Pollution vulnerabilities."""
+        if self.context.get("stealth"):
+            await self.log(db, "mass_assignment", "Skipped in stealth mode")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = MassAssignmentModule(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "mass_assignment")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                vt_map = {v.value: v for v in VulnType}
+
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "Mass Assignment")[:500],
+                        vuln_type=vt_map.get(f.get("vuln_type", "misconfiguration"), VulnType.MISCONFIGURATION),
+                        severity=sev_map.get(f.get("severity", "high"), Severity.HIGH),
+                        url=f.get("url", "")[:2000],
+                        method=f.get("method"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        response_data={"proof": f.get("proof", "")},
+                        ai_confidence=0.8,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "mass_assignment",
+                    f"Mass assignment: {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "mass_assignment", "No mass assignment vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "mass_assignment", f"Mass assignment testing error (non-fatal): {e}", "error")
+
+    async def _phase_cache_poisoning(self, db: AsyncSession):
+        """Test for Web Cache Poisoning and Cache Deception."""
+        if self.context.get("stealth"):
+            await self.log(db, "cache_poisoning", "Skipped in stealth mode")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = CachePoisoningModule(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "cache_poisoning")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                vt_map = {v.value: v for v in VulnType}
+
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "Cache Poisoning")[:500],
+                        vuln_type=vt_map.get(f.get("vuln_type", "misconfiguration"), VulnType.MISCONFIGURATION),
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=f.get("url", "")[:2000],
+                        method=f.get("method"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        response_data={"proof": f.get("proof", "")},
+                        ai_confidence=0.75,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "cache_poisoning",
+                    f"Cache poisoning: {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "cache_poisoning", "No cache poisoning vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "cache_poisoning", f"Cache poisoning testing error (non-fatal): {e}", "error")
+
     async def _phase_stress_test(self, db: AsyncSession):
         """Test resilience — rate limiting, slow connections, large payloads."""
         if self.context.get("stealth"):
@@ -2787,6 +2953,25 @@ Respond in JSON:
                     self.context["_rag_context"] = "\nKB INTELLIGENCE:\n" + "\n".join(rag_parts) + "\n"
             except Exception:
                 pass
+
+        # Inject Knowledge Graph context for exploit chain intelligence
+        try:
+            from app.core.knowledge_graph import KnowledgeGraph
+            technologies = list((self.context.get("technologies") or {}).get("summary", {}).keys())
+            if technologies:
+                graph_intel = await KnowledgeGraph.query_attack_surface(db, technologies)
+                similar = await KnowledgeGraph.find_similar_targets(
+                    db, self.context.get("domain", ""), technologies
+                )
+                self.context["graph_attack_surface"] = graph_intel
+                self.context["graph_similar_targets"] = similar
+                logger.info(
+                    f"Graph intel injected: {len(graph_intel.get('vulnerabilities', []))} vulns, "
+                    f"{len(graph_intel.get('techniques', []))} techniques, "
+                    f"{len(similar)} similar targets"
+                )
+        except Exception as e:
+            logger.warning(f"Knowledge Graph query failed (non-fatal): {e}")
 
         # WebSocket callback
         async def on_planner_event(event: dict):

@@ -672,4 +672,25 @@ export async function stopAutopilot(taskId: string) {
   return data;
 }
 
+// Knowledge Graph
+export async function getGraphSummary() {
+  const { data } = await api.get("/training/graph-summary");
+  return data;
+}
+
+export async function getGraphTechChain(tech: string) {
+  const { data } = await api.get(`/training/graph-tech-chain/${encodeURIComponent(tech)}`);
+  return data;
+}
+
+export async function getGraphAttackSurface(techs: string[]) {
+  const { data } = await api.get(`/training/graph-attack-surface?technologies=${techs.join(",")}`);
+  return data;
+}
+
+export async function getGraphSimilarTargets(domain: string, techs: string[]) {
+  const { data } = await api.get(`/training/graph-similar-targets?domain=${encodeURIComponent(domain)}&technologies=${techs.join(",")}`);
+  return data;
+}
+
 export default api;

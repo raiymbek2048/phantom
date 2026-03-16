@@ -405,6 +405,7 @@ PIPELINE_PHASES = [
     "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
     "Payload Generation", "WAF Detection", "Exploit",
     "Service Attack", "Auth Attack", "Business Logic",
+    "Request Smuggling", "Mass Assignment", "Cache Poisoning",
     "Stress Test", "Vulnerability Confirmation",
     "Claude Collaboration", "AI Attack Planner", "Evidence Collection", "Report Generation",
 ]

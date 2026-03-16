@@ -24,6 +24,9 @@ import {
   Globe,
   Bell,
   ShieldCheck,
+  BarChart3,
+  Network,
+  Crosshair,
 } from "lucide-react";
 
 const linkDefs = [
@@ -36,6 +39,9 @@ const linkDefs = [
   { href: "/vulnerabilities", labelKey: "nav.vulnerabilities", icon: ShieldAlert },
   { href: "/timeline", labelKey: "nav.timeline", icon: GitBranch },
   { href: "/validate", labelKey: "nav.validate", icon: ShieldCheck },
+  { href: "/analytics", labelKey: "nav.analytics", icon: BarChart3 },
+  { href: "/knowledge-graph", labelKey: "nav.knowledge_graph", icon: Network },
+  { href: "/campaigns", labelKey: "nav.campaigns", icon: Crosshair },
   { href: "/training", labelKey: "nav.command_center", icon: Brain },
   { href: "/bounty", labelKey: "nav.bounty", icon: Trophy },
   { href: "/bounty/programs", labelKey: "nav.programs", icon: Bug },
