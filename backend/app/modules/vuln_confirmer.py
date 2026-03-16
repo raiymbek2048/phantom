@@ -39,6 +39,54 @@ class VulnConfirmer:
         self._auth_cookie = None
         self._custom_headers: dict = {}
 
+    @staticmethod
+    def _capture_exchange(
+        resp: httpx.Response,
+        method: str,
+        url: str,
+        payload: str | None = None,
+        param: str | None = None,
+        body_data: dict | str | None = None,
+    ) -> dict:
+        """Capture raw HTTP request/response for report evidence.
+
+        Returns {"request": {...}, "response": {...}} suitable for
+        request_data and response_data fields.
+        """
+        req_headers = {}
+        try:
+            if resp.request and resp.request.headers:
+                req_headers = {k: v for k, v in list(resp.request.headers.items())[:15]}
+        except Exception:
+            pass
+
+        request = {
+            "method": method.upper(),
+            "url": str(resp.request.url) if resp.request else url,
+            "headers": req_headers,
+        }
+        if body_data:
+            request["body"] = str(body_data)[:2000] if isinstance(body_data, (dict, str)) else str(body_data)[:2000]
+        if payload:
+            request["payload"] = str(payload)[:500]
+        if param:
+            request["parameter"] = param
+
+        resp_headers = {}
+        try:
+            resp_headers = {k: v for k, v in list(resp.headers.items())[:15]}
+        except Exception:
+            pass
+
+        response = {
+            "status_code": resp.status_code,
+            "headers": resp_headers,
+            "body_preview": resp.text[:3000] if resp.text else "",
+            "content_length": len(resp.text) if resp.text else 0,
+        }
+
+        return {"request": request, "response": response}
+
     def _http_client(self, **kwargs) -> httpx.AsyncClient:
         extra = dict(self._custom_headers)
         if self._auth_cookie:
@@ -145,7 +193,12 @@ class VulnConfirmer:
                 logger.debug(f"KB retry failed for {vuln.id}: {e}")
 
         if result.get("confirmed"):
-            # Update vulnerability with confirmation proof
+            # Save HTTP request data as evidence
+            http_exchange = result.get("http_exchange", {})
+            if http_exchange.get("request"):
+                vuln.request_data = http_exchange["request"]
+
+            # Update vulnerability with confirmation proof + HTTP response
             response_data = vuln.response_data or {}
             response_data["confirmation"] = {
                 "confirmed": True,
@@ -154,6 +207,9 @@ class VulnConfirmer:
                 "extracted_data": result.get("extracted_data"),
                 "exploitation_depth": result.get("depth", "basic"),
             }
+            # Merge HTTP response evidence into response_data
+            if http_exchange.get("response"):
+                response_data["http_response"] = http_exchange["response"]
             vuln.response_data = response_data
 
             # Escalate severity if exploitation proved critical impact
@@ -273,6 +329,10 @@ class VulnConfirmer:
                                         "depth": "reflected_xss",
                                         "title_detail": f"Reflected in {context['context']}",
                                         "impact_addition": f"XSS payload `{test_payload[:80]}` was reflected unescaped in the response body within {context['context']} context. This allows arbitrary JavaScript execution in victim's browser.",
+                                        "http_exchange": self._capture_exchange(
+                                            resp, method, url, test_payload, vuln.parameter,
+                                            {vuln.parameter or "input": test_payload} if method.upper() == "POST" else None,
+                                        ),
                                     }
 
                                     if csp_blocks:
@@ -566,6 +626,9 @@ class VulnConfirmer:
                                         "escalate_to": severity,
                                         "title_detail": f"Read {desc}",
                                         "impact_addition": f"SSRF confirmed: server-side request to `{target_url}` returned internal data:\n```\n{json.dumps(extracted, indent=2)[:500]}\n```",
+                                        "http_exchange": self._capture_exchange(
+                                            resp, method, url, target_url, param,
+                                        ),
                                     }
 
                                 # AWS credential chain: if we found IAM role list, get full creds
@@ -590,6 +653,9 @@ class VulnConfirmer:
                                                     "escalate_to": "critical",
                                                     "title_detail": f"AWS IAM Credentials Stolen (role: {role_name})",
                                                     "impact_addition": f"Critical SSRF chain: discovered IAM role `{role_name}` and extracted AWS credentials. Full AWS account compromise possible.",
+                                                    "http_exchange": self._capture_exchange(
+                                                        creds_resp, method, url, creds_url, param,
+                                                    ),
                                                 }
 
                         except Exception:
@@ -858,6 +924,10 @@ class VulnConfirmer:
                                     "escalate_to": escalate,
                                     "title_detail": f"{desc} — Code Execution",
                                     "impact_addition": f"SSTI confirmed: `{payload}` was evaluated by the template engine, producing `{expected}`. This proves server-side code execution capability.",
+                                    "http_exchange": self._capture_exchange(
+                                        resp, method, url, payload, param,
+                                        {param: payload} if method.upper() == "POST" else None,
+                                    ),
                                 }
 
                             # Special: config leak — look for secrets in response
@@ -878,6 +948,10 @@ class VulnConfirmer:
                                         "escalate_to": "critical",
                                         "title_detail": "Secrets Leaked",
                                         "impact_addition": f"SSTI config leak: application secrets extracted via `{payload}`.",
+                                        "http_exchange": self._capture_exchange(
+                                            resp, method, url, payload, param,
+                                            {param: payload} if method.upper() == "POST" else None,
+                                        ),
                                     }
                         except Exception:
                             continue
@@ -1045,6 +1119,22 @@ class VulnConfirmer:
                     if reverse_shells:
                         impact_parts.append(f"Reverse shell payloads available ({len(reverse_shells)} variants).")
 
+                    # Capture HTTP exchange from the initial confirming request
+                    cmd_exchange = {}
+                    try:
+                        # Re-send the initial confirming payload to capture exchange
+                        cmd_probes_map = {desc: payload for payload, _, desc in cmd_probes}
+                        init_payload = cmd_probes_map.get(initial_confirmed["method"], "")
+                        if init_payload:
+                            cap_resp = await self._cmd_send(client, url, param, method, init_payload)
+                            if cap_resp:
+                                cmd_exchange = self._capture_exchange(
+                                    cap_resp, method, url, init_payload, param,
+                                    {param: init_payload} if method.upper() == "POST" else None,
+                                )
+                    except Exception:
+                        pass
+
                     return {
                         "confirmed": True,
                         "method": initial_confirmed["method"],
@@ -1058,6 +1148,7 @@ class VulnConfirmer:
                         "escalate_to": "critical",
                         "title_detail": f"Full RCE via {initial_confirmed['method']}" + (" + File Write" if can_write else ""),
                         "impact_addition": "\n".join(impact_parts),
+                        "http_exchange": cmd_exchange,
                     }
             except Exception:
                 pass
@@ -1149,6 +1240,10 @@ class VulnConfirmer:
                                     "escalate_to": escalate,
                                     "title_detail": f"Read {desc}",
                                     "impact_addition": f"LFI confirmed: `{payload}` read sensitive file. Extracted {len(extracted)} data points.",
+                                    "http_exchange": self._capture_exchange(
+                                        resp, method, url, payload, param,
+                                        {param: payload} if param and method.upper() == "POST" else None,
+                                    ),
                                 }
                         except Exception:
                             continue
@@ -1215,6 +1310,15 @@ class VulnConfirmer:
                 pass
 
         if len(accessed_records) >= 2:
+            # Build exchange from the last successful request
+            idor_exchange = {}
+            try:
+                last_rec = accessed_records[-1]
+                async with self._http_client(timeout=10.0, follow_redirects=True) as cap_client:
+                    cap_resp = await cap_client.get(last_rec["url"])
+                    idor_exchange = self._capture_exchange(cap_resp, "GET", last_rec["url"])
+            except Exception:
+                pass
             return {
                 "confirmed": True,
                 "method": f"Sequential ID enumeration ({len(accessed_records)} records accessed)",
@@ -1227,6 +1331,7 @@ class VulnConfirmer:
                 "escalate_to": "high",
                 "title_detail": f"{len(accessed_records)} Users' Data Accessed",
                 "impact_addition": f"IDOR confirmed: accessed {len(accessed_records)} different users' records by changing the numeric ID in the URL. Data includes PII fields.",
+                "http_exchange": idor_exchange,
             }
 
         return {"confirmed": False}
@@ -1263,6 +1368,7 @@ class VulnConfirmer:
                             "escalate_to": escalate,
                             "title_detail": f"{len(extracted)} Secrets Extracted",
                             "impact_addition": f"Sensitive data extracted from exposed endpoint. Found: {', '.join(extracted.keys())}",
+                            "http_exchange": self._capture_exchange(resp, "GET", url),
                         }
             except Exception:
                 pass
@@ -1483,6 +1589,15 @@ class VulnConfirmer:
 
         if accessed:
             unique_bypasses = list(set(bypass_methods_used))
+            # Capture exchange from the first bypassed endpoint
+            auth_exchange = {}
+            try:
+                first = accessed[0]
+                async with make_client(timeout=10.0) as cap_client:
+                    cap_resp = await cap_client.get(first["url"], follow_redirects=False)
+                    auth_exchange = self._capture_exchange(cap_resp, first.get("method", "GET"), first["url"])
+            except Exception:
+                pass
             return {
                 "confirmed": True,
                 "method": f"Auth bypass via {len(unique_bypasses)} technique(s): {', '.join(unique_bypasses[:5])}",
@@ -1497,6 +1612,7 @@ class VulnConfirmer:
                 ) else "high",
                 "title_detail": f"{len(accessed)} Endpoints via {', '.join(unique_bypasses[:3])}",
                 "impact_addition": f"Auth bypass confirmed: {len(accessed)} protected endpoints accessible. Bypass techniques: {', '.join(unique_bypasses)}.",
+                "http_exchange": auth_exchange,
             }
 
         return {"confirmed": False}
@@ -1543,6 +1659,7 @@ class VulnConfirmer:
                                         "depth": "redirect_confirmed",
                                         "title_detail": "Redirects to External Domain",
                                         "impact_addition": f"Open redirect confirmed: server redirects to `{location}` when given `{target}` as input. Can be used for phishing.",
+                                        "http_exchange": self._capture_exchange(resp, "GET", test_url, target, param),
                                     }
                         except Exception:
                             continue
@@ -1592,6 +1709,7 @@ class VulnConfirmer:
                                     "escalate_to": "critical" if is_critical else None,
                                     "title_detail": f"Origin Reflection{' with Credentials' if is_critical else ''}",
                                     "impact_addition": f"CORS misconfiguration confirmed: `Origin: {origin}` reflected in ACAO header. Credentials: {acac}.",
+                                    "http_exchange": self._capture_exchange(resp, "GET", url),
                                 }
                         except Exception:
                             continue
@@ -1768,6 +1886,32 @@ class VulnConfirmer:
 
                         extracted["exploitability"] = exploitability
 
+                        # Capture HTTP exchange — re-send last successful payload
+                        sqli_exchange = {}
+                        try:
+                            # Use the last confirmed payload to capture exchange
+                            last_payload = None
+                            if confirmed_technique.startswith("error"):
+                                for ep, dbt in error_payloads:
+                                    if dbt == extracted.get("db_type"):
+                                        last_payload = ep
+                                        break
+                            elif confirmed_technique.startswith("UNION") and extracted.get("column_count"):
+                                cc = extracted["column_count"]
+                                cols = ["NULL"] * cc
+                                ic = extracted.get("injectable_column", 0)
+                                cols[ic] = "CONCAT('pHnT0m_',@@version,'_pHnT0m')"
+                                last_payload = f"-1 UNION SELECT {','.join(cols)}-- -"
+                            if last_payload:
+                                cap_resp = await self._sqli_send(client, url, param, method, last_payload)
+                                if cap_resp:
+                                    sqli_exchange = self._capture_exchange(
+                                        cap_resp, method, url, last_payload, param,
+                                        {param: last_payload} if method.upper() == "POST" else None,
+                                    )
+                        except Exception:
+                            pass
+
                         return {
                             "confirmed": True,
                             "method": confirmed_technique,
@@ -1777,6 +1921,7 @@ class VulnConfirmer:
                             "escalate_to": self._escalate_severity(extracted),
                             "title_detail": f"SQLi ({confirmed_technique})",
                             "impact_addition": f"SQL injection confirmed via {confirmed_technique}. DB version: {extracted.get('db_version', 'N/A')}. User: {extracted.get('db_user', 'N/A')}. Database: {extracted.get('db_name', extracted.get('db_name_partial', 'N/A'))}.",
+                            "http_exchange": sqli_exchange,
                         }
 
             except Exception as e:
@@ -1898,6 +2043,7 @@ class VulnConfirmer:
                                 "depth": "config_issue",
                                 "title_detail": ", ".join(found.keys()),
                                 "impact_addition": f"Misconfiguration confirmed: {json.dumps(found, indent=2)}",
+                                "http_exchange": self._capture_exchange(resp, "GET", url),
                             }
             except Exception:
                 pass

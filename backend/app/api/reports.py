@@ -620,10 +620,12 @@ def _render_scan_report_html(scan, target, vulns: list) -> str:
         response_info = ""
         resp_data = v.response_data if isinstance(v.response_data, dict) else {}
         if resp_data:
-            status_code = resp_data.get("status_code", "")
-            resp_headers = resp_data.get("headers", {})
-            body_preview = str(resp_data.get("body_preview") or resp_data.get("body", ""))[:1500]
-            body_length = resp_data.get("body_length", "")
+            # Check for HTTP response at top level or nested under http_response key
+            http_resp = resp_data.get("http_response", {}) if isinstance(resp_data.get("http_response"), dict) else {}
+            status_code = resp_data.get("status_code", "") or http_resp.get("status_code", "")
+            resp_headers = resp_data.get("headers", {}) or http_resp.get("headers", {})
+            body_preview = str(resp_data.get("body_preview") or resp_data.get("body", "") or http_resp.get("body_preview", ""))[:1500]
+            body_length = resp_data.get("body_length", "") or resp_data.get("content_length", "") or http_resp.get("content_length", "")
 
             raw_response_lines = []
             if status_code:

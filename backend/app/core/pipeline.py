@@ -1619,6 +1619,8 @@ Respond in JSON:
                         ),
                         impact="Leaked credentials or API keys in client-side code can lead to unauthorized access.",
                         remediation="Move secrets to server-side configuration. Use environment variables or a secrets manager.",
+                        request_data={"method": "GET", "url": key_info.get("file", "")},
+                        response_data={"key_type": key_info["type"], "key_prefix": key_info.get("key_prefix", "")},
                     )
                     await self._save_vuln_deduped(db, vuln)
 
@@ -1644,6 +1646,8 @@ Respond in JSON:
                         ),
                         impact="Source maps expose original unminified source code, revealing internal application logic, comments, and potentially sensitive information.",
                         remediation="Remove source map files from production or restrict access via server configuration.",
+                        request_data={"method": "GET", "url": smap["url"]},
+                        response_data={"original_files": smap.get("original_files", [])[:10], "accessible": True},
                     )
                     await self._save_vuln_deduped(db, vuln)
 
@@ -1684,6 +1688,8 @@ Respond in JSON:
                     url=(finding.get("endpoint") or api_base)[:2000],
                     description=finding.get("description", ""),
                     remediation=finding.get("remediation", ""),
+                    request_data=finding.get("request_data"),
+                    response_data=finding.get("response_data"),
                 )
                 await self._save_vuln_deduped(db, vuln)
 
@@ -1793,6 +1799,8 @@ Respond in JSON:
                         payload_used=f.get("payload", ""),
                         remediation=f.get("remediation", ""),
                         ai_analysis=f.get("csp_grade", ""),
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data"),
                     )
                     result = await self._save_vuln_deduped(db, vuln)
                     if result:
@@ -2291,6 +2299,8 @@ Respond in JSON:
                             method="GET",
                             description=oob_vuln.get("description", ""),
                             ai_confidence=oob_vuln.get("ai_confidence", 0.95),
+                            request_data=oob_vuln.get("request_data"),
+                            response_data=oob_vuln.get("response_data", {"oob_callback": oob_vuln.get("callback_data")}),
                         )
                         await self._save_vuln_deduped(db, vuln, scan=scan_obj, track_context=True, finding_dict=oob_vuln)
                     await self.log(db, "exploit",
@@ -2335,6 +2345,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.9,
+                    request_data=f.get("request_data", {"method": f.get("method", "GET"), "url": f.get("url", "")}),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
@@ -2375,6 +2387,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.95,
+                    request_data=f.get("request_data"),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
@@ -2414,6 +2428,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.9,
+                    request_data=f.get("request_data"),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
@@ -2453,6 +2469,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.85,
+                    request_data=f.get("request_data"),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
@@ -2492,6 +2510,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.9,
+                    request_data=f.get("request_data"),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
@@ -2639,6 +2659,8 @@ Respond in JSON:
                         impact=str(f.get("impact", "")),
                         remediation=str(f.get("remediation", "")),
                         ai_confidence=f.get("ai_confidence", 0.8),
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data"),
                     )
                     r = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                     if r:
@@ -2696,6 +2718,7 @@ Respond in JSON:
                         impact=f.get("impact", ""),
                         remediation=f.get("remediation", ""),
                         payload_used=f.get("payload_used"),
+                        request_data=f.get("request_data"),
                         response_data=f.get("response_data"),
                         ai_confidence=f.get("ai_confidence", 0.7),
                     )
@@ -2794,7 +2817,8 @@ Respond in JSON:
                         impact=f.get("impact", ""),
                         remediation=f.get("remediation", ""),
                         payload_used=f.get("payload"),
-                        response_data={"proof": f.get("proof", "")},
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data", {"proof": f.get("proof", "")}),
                         ai_confidence=0.85,
                     )
                     result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
@@ -2843,7 +2867,8 @@ Respond in JSON:
                         impact=f.get("impact", ""),
                         remediation=f.get("remediation", ""),
                         payload_used=f.get("payload"),
-                        response_data={"proof": f.get("proof", "")},
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data", {"proof": f.get("proof", "")}),
                         ai_confidence=0.8,
                     )
                     result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
@@ -2892,7 +2917,8 @@ Respond in JSON:
                         impact=f.get("impact", ""),
                         remediation=f.get("remediation", ""),
                         payload_used=f.get("payload"),
-                        response_data={"proof": f.get("proof", "")},
+                        request_data=f.get("request_data"),
+                        response_data=f.get("response_data", {"proof": f.get("proof", "")}),
                         ai_confidence=0.75,
                     )
                     result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
@@ -2939,6 +2965,8 @@ Respond in JSON:
                     payload_used=f.get("payload"),
                     remediation=f.get("remediation"),
                     ai_confidence=0.85,
+                    request_data=f.get("request_data"),
+                    response_data=f.get("response_data"),
                 )
                 result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
                 if result:
