@@ -28,6 +28,166 @@ logger = logging.getLogger(__name__)
 
 BODY_LIMIT = 12000
 
+# ──────────────────────────────────────────
+# Native Anthropic tool definitions
+# ──────────────────────────────────────────
+
+PLANNER_TOOLS = [
+    {
+        "name": "http_request",
+        "description": "Send an HTTP request to the target. Use this to test endpoints, inject payloads, check responses. Supports all HTTP methods.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"], "description": "HTTP method"},
+                "url": {"type": "string", "description": "Full URL to request"},
+                "headers": {"type": "object", "description": "Optional custom headers"},
+                "body": {"description": "Request body (object for JSON, string for raw)"},
+            },
+            "required": ["method", "url"],
+        },
+    },
+    {
+        "name": "jwt_decode",
+        "description": "Decode a JWT token without verification. Shows header (algorithm) and payload (claims).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {"type": "string", "description": "JWT token to decode"},
+            },
+            "required": ["token"],
+        },
+    },
+    {
+        "name": "jwt_forge",
+        "description": "Forge a JWT with specified algorithm and payload. Use 'none' algorithm for alg:none attack.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "algorithm": {"type": "string", "enum": ["none", "HS256", "HS384", "HS512"], "description": "JWT algorithm"},
+                "payload": {"type": "object", "description": "JWT payload claims"},
+                "secret": {"type": "string", "description": "HMAC secret (empty for none)"},
+            },
+            "required": ["algorithm", "payload"],
+        },
+    },
+    {
+        "name": "diff_requests",
+        "description": "Compare two HTTP responses side by side. Use for IDOR testing (same endpoint, different auth) or auth bypass (with/without auth).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request_a": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "method": {"type": "string", "default": "GET"},
+                        "headers": {"type": "object"},
+                        "body": {},
+                    },
+                    "required": ["url"],
+                },
+                "request_b": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "method": {"type": "string", "default": "GET"},
+                        "headers": {"type": "object"},
+                        "body": {},
+                    },
+                    "required": ["url"],
+                },
+            },
+            "required": ["request_a", "request_b"],
+        },
+    },
+    {
+        "name": "login",
+        "description": "Attempt login and store session cookies/tokens for subsequent requests. Auto-extracts JWT/session tokens.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Login endpoint URL"},
+                "body": {"type": "object", "description": "Login credentials"},
+                "headers": {"type": "object"},
+                "extract_token": {"type": "boolean", "default": True, "description": "Auto-extract token from response"},
+            },
+            "required": ["url", "body"],
+        },
+    },
+    {
+        "name": "fuzz",
+        "description": "Fuzz a parameter with multiple values. Tests each value and reports which ones caused different behavior.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to fuzz"},
+                "param": {"type": "string", "description": "Parameter name to fuzz"},
+                "values": {"type": "array", "items": {"type": "string"}, "description": "Values to test"},
+                "method": {"type": "string", "default": "GET"},
+            },
+            "required": ["url", "param", "values"],
+        },
+    },
+    {
+        "name": "extract_page",
+        "description": "Extract page structure: forms, hidden inputs, scripts, links, comments, API endpoints.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to extract from"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "search_exploits",
+        "description": "Search Sploitus for real CVE exploits and tools matching a technology or vulnerability.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query (e.g. 'Apache 2.4.49 RCE', 'CVE-2021-44228')"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "report_vuln",
+        "description": "Report a confirmed vulnerability. Only use when you have PROOF from actual HTTP responses.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Vulnerability title"},
+                "vuln_type": {"type": "string", "enum": [
+                    "sqli", "xss", "ssrf", "idor", "auth_bypass", "rce", "ssti",
+                    "lfi", "cors", "info_disclosure", "business_logic", "misconfiguration",
+                    "cmd_injection", "xxe", "open_redirect", "path_traversal", "jwt",
+                    "race_condition", "deserialization",
+                ]},
+                "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                "url": {"type": "string"},
+                "parameter": {"type": "string"},
+                "description": {"type": "string"},
+                "impact": {"type": "string"},
+                "payload": {"type": "string", "description": "The payload that proved the vulnerability"},
+                "proof": {"type": "string", "description": "Explain what in the response proves exploitation"},
+            },
+            "required": ["title", "vuln_type", "severity", "url", "description", "proof"],
+        },
+    },
+    {
+        "name": "done",
+        "description": "Signal that testing is complete. Use when you've exhausted all promising attack vectors.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Summary of what was tested and found"},
+            },
+            "required": ["summary"],
+        },
+    },
+]
+
 PLANNER_SYSTEM = """You are an elite penetration tester with 15+ years of experience. You are the BRAIN of PHANTOM — an autonomous pentesting platform.
 
 The automated pipeline already ran and found some results. Now it's YOUR turn to think like a real hacker.
@@ -41,53 +201,9 @@ Find vulnerabilities that automated scanners MISS. Think creatively. Chain findi
 - You understand context: JWT algorithm tells you what to forge, tech stack tells you what exploits exist
 - You try the NON-OBVIOUS: parameter pollution, HTTP verb tampering, race conditions, deserialization
 
-## AVAILABLE TOOLS
-
-Execute these by writing ```action blocks:
-
-```action
-{"tool": "http", "method": "GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD", "url": "https://...", "headers": {}, "body": {}}
-```
-
-```action
-{"tool": "jwt_decode", "token": "eyJ..."}
-```
-
-```action
-{"tool": "jwt_forge", "algorithm": "none|HS256", "payload": {"sub": "admin"}, "secret": ""}
-```
-
-```action
-{"tool": "diff", "request_a": {"url": "...", "method": "GET"}, "request_b": {"url": "...", "method": "GET"}}
-```
-
-```action
-{"tool": "login", "url": "https://...", "body": {"username": "admin", "password": "admin"}, "extract_token": true}
-```
-
-```action
-{"tool": "fuzz", "url": "https://...", "param": "id", "values": ["1", "2", "0", "-1", "admin", "{{7*7}}", "<script>"], "method": "GET"}
-```
-
-```action
-{"tool": "extract", "url": "https://..."}
-```
-
-```action
-{"tool": "search_exploits", "query": "Apache 2.4.49 RCE"}
-```
-
-```action
-{"tool": "report_vuln", "title": "...", "vuln_type": "sqli|xss|ssrf|idor|auth_bypass|rce|ssti|lfi|cors|info_disclosure|business_logic|misconfiguration", "severity": "critical|high|medium|low", "url": "https://...", "parameter": "...", "description": "...", "impact": "...", "payload": "...", "proof": "Explain what response proves exploitation"}
-```
-
-```action
-{"tool": "done", "summary": "What was found and tested"}
-```
-
 ## RULES
-1. ALWAYS use ```action blocks — never just describe what you'd do
-2. You can include MULTIPLE action blocks in ONE response
+1. ALWAYS use tools — never just describe what you'd do
+2. You can call MULTIPLE tools in ONE response
 3. After seeing results, analyze them and decide next steps
 4. Report ONLY vulnerabilities you PROVED with actual HTTP responses
 5. Don't re-report vulnerabilities already found by the scanner
@@ -95,25 +211,10 @@ Execute these by writing ```action blocks:
 7. When stuck, try a completely different attack vector instead of repeating
 8. Use search_exploits to find real CVE exploits when you identify specific tech versions
 
-You can include multiple ```action blocks in a single response. I'll execute them all and show you results.
-Keep going until you've exhausted all promising attack paths, then use the "done" tool."""
+Think step by step. Call tools to test your hypotheses. Keep going until you've exhausted all promising attack paths, then use the done tool."""
 
 # Reflector prompt — forces Claude back into tool-call format
-REFLECTOR_PROMPT = """Your response did not contain any ```action blocks. You MUST use structured tool calls.
-
-REMINDER: Always respond with ```action blocks. Do NOT just describe what you would do — actually DO it.
-
-If you're done testing, use:
-```action
-{"tool": "done", "summary": "..."}
-```
-
-If you want to test something, use:
-```action
-{"tool": "http", "method": "GET", "url": "..."}
-```
-
-Rewrite your response with proper ```action blocks now."""
+REFLECTOR_PROMPT = "You must use the provided tools. Call http_request, fuzz, extract_page, search_exploits, or done."
 
 # Execution monitor prompt — injected when loop is detected
 MONITOR_PROMPT = """⚠️ EXECUTION MONITOR: I've detected you may be stuck in a loop.
@@ -188,7 +289,6 @@ class AttackPlanner:
                 headers=self._get_rotating_ua(),
             )
 
-            consecutive_empty = 0
             consecutive_no_response = 0
 
             while self.rounds < self.max_rounds:
@@ -204,64 +304,140 @@ class AttackPlanner:
                 # Context compression before sending to Claude
                 self._maybe_compress_context()
 
-                response = await self._ask_claude()
-                if not response:
+                message = await self._ask_claude()
+                if not message:
                     consecutive_no_response += 1
                     if consecutive_no_response >= 3:
                         logger.warning("Attack Planner: 3 consecutive API failures, aborting")
                         break
                     self.conversation.append({
                         "role": "user",
-                        "content": "No response received. Please provide ```action blocks or use the done tool."
+                        "content": "No response received. Please use tools to continue testing or call done."
                     })
                     continue
                 consecutive_no_response = 0
 
-                actions = self._parse_actions(response)
+                # Extract tool_use blocks from native response
+                tool_calls = []
+                text_parts = []
+                for block in message.content:
+                    if block.type == "tool_use":
+                        tool_calls.append(block)
+                    elif block.type == "text":
+                        text_parts.append(block.text)
 
-                # === REFLECTOR: force tool-call format ===
-                if not actions and self._reflector_uses < 3:
+                # If no tool calls, check for legacy ```action format in text
+                if not tool_calls and text_parts:
+                    full_text = "\n".join(text_parts)
+                    legacy_actions = self._parse_actions(full_text)
+                    if legacy_actions:
+                        # Convert legacy actions to pseudo tool calls
+                        tool_calls = legacy_actions
+                        logger.info("Using legacy ```action parsing (fallback)")
+
+                # If still no tool calls — reflector
+                if not tool_calls and self._reflector_uses < 3:
                     self._reflector_uses += 1
                     logger.info(f"Reflector triggered ({self._reflector_uses}/3)")
-                    self.conversation.append({"role": "user", "content": REFLECTOR_PROMPT})
-                    # Re-ask Claude
-                    response2 = await self._ask_claude()
-                    if response2:
-                        actions = self._parse_actions(response2)
-
-                # Check for done
-                done_actions = [a for a in actions if a.get("tool") == "done"]
-                if done_actions:
-                    logger.info(f"Attack Planner done after {self.rounds} rounds: {done_actions[0].get('summary', '')}")
-                    break
-
-                # Check for reported vulns
-                vuln_reports = [a for a in actions if a.get("tool") == "report_vuln"]
-                for vr in vuln_reports:
-                    self.findings.append(vr)
-                    await _emit({
-                        "type": "planner_finding",
-                        "finding": vr,
-                    })
-
-                # Execute non-report actions
-                executable = [a for a in actions if a.get("tool") not in ("report_vuln", "done")]
-
-                if not executable and not vuln_reports:
-                    consecutive_empty += 1
-                    if consecutive_empty >= 2:
-                        break
                     self.conversation.append({
                         "role": "user",
-                        "content": "I need concrete ```action blocks. Give me specific tests to run, or use the done tool."
+                        "content": "You must use the provided tools. Call http_request, fuzz, extract_page, or done."
                     })
                     continue
-                else:
-                    consecutive_empty = 0
 
-                # === EXECUTION MONITOR: detect loops ===
-                if executable:
-                    self._track_actions(executable)
+                if not tool_calls:
+                    break  # Exhausted reflector retries
+
+                # Process tool calls
+                should_stop = False
+                tool_results = []
+
+                for tc in tool_calls:
+                    # Handle both native ToolUseBlock and legacy dict
+                    if isinstance(tc, dict):
+                        tool_name = tc.get("tool", "")
+                        tool_input = tc
+                        tool_id = f"legacy_{self.rounds}_{len(tool_results)}"
+                    else:
+                        tool_name = tc.name
+                        tool_input = tc.input
+                        tool_id = tc.id
+
+                    # Map native tool names to executor methods
+                    TOOL_MAP = {
+                        "http_request": "http",
+                        "jwt_decode": "jwt_decode",
+                        "jwt_forge": "jwt_forge",
+                        "diff_requests": "diff",
+                        "login": "login",
+                        "fuzz": "fuzz",
+                        "extract_page": "extract",
+                        "search_exploits": "search_exploits",
+                        "report_vuln": "report_vuln",
+                        "done": "done",
+                        # Legacy names from ```action
+                        "http": "http",
+                        "diff": "diff",
+                        "extract": "extract",
+                    }
+                    internal_name = TOOL_MAP.get(tool_name, tool_name)
+
+                    if internal_name == "done":
+                        summary = tool_input.get("summary", "") if isinstance(tool_input, dict) else ""
+                        logger.info(f"Attack Planner done after {self.rounds} rounds: {summary}")
+                        tool_results.append({
+                            "tool_use_id": tool_id,
+                            "content": json.dumps({"status": "done", "summary": summary}),
+                        })
+                        should_stop = True
+                        continue
+
+                    if internal_name == "report_vuln":
+                        finding = tool_input if isinstance(tool_input, dict) else {}
+                        self.findings.append(finding)
+                        await _emit({"type": "planner_finding", "finding": finding})
+                        tool_results.append({
+                            "tool_use_id": tool_id,
+                            "content": json.dumps({"status": "recorded", "title": finding.get("title", "")}),
+                        })
+                        continue
+
+                    # Execute the tool
+                    action = dict(tool_input) if isinstance(tool_input, dict) else {}
+                    action["tool"] = internal_name
+                    self._track_actions([action])
+
+                    try:
+                        results = await self._execute_actions([action], http_client, domain)
+                        result = results[0] if results else {"error": "no result"}
+                    except Exception as e:
+                        result = {"error": str(e)}
+
+                    self._action_log.append({"tool": internal_name, "round": self.rounds})
+
+                    # Auto-summarize large bodies
+                    result_str = json.dumps(result, default=str)
+                    if len(result_str) > 8000:
+                        from app.core.context_manager import summarize_large_response
+                        result_str = await summarize_large_response(result_str, max_chars=6000, llm=self._llm)
+
+                    tool_results.append({
+                        "tool_use_id": tool_id,
+                        "content": result_str,
+                    })
+
+                # Send tool results back to Claude
+                if tool_results:
+                    # Build tool_result messages
+                    result_content = []
+                    for tr in tool_results:
+                        result_content.append({
+                            "type": "tool_result",
+                            "tool_use_id": tr["tool_use_id"],
+                            "content": tr["content"],
+                        })
+
+                    # Add monitor warning if needed
                     monitor_msg = self._check_for_loops()
                     if monitor_msg:
                         self._monitor_triggers += 1
@@ -269,24 +445,23 @@ class AttackPlanner:
                         if self._monitor_triggers >= 3:
                             logger.warning("Attack Planner: too many loop detections, stopping")
                             break
-
-                if executable:
-                    results = await self._execute_actions(executable, http_client, domain)
-                    results_text = await self._format_results_smart(results)
-
-                    # Add monitor warning if needed
-                    monitor_msg = self._check_for_loops()
-                    if monitor_msg:
-                        results_text += f"\n\n{monitor_msg}"
+                        result_content.append({
+                            "type": "text",
+                            "text": monitor_msg,
+                        })
                     elif len(self._action_log) > 5:
-                        results_text += f"\n\n[{len(self._action_log)} actions executed so far. Avoid repeating tested URLs/payloads.]"
+                        result_content.append({
+                            "type": "text",
+                            "text": f"[{len(self._action_log)} actions so far. Avoid repeating tested URLs/payloads.]",
+                        })
 
-                    self.conversation.append({"role": "user", "content": results_text})
-                elif vuln_reports:
                     self.conversation.append({
                         "role": "user",
-                        "content": f"Recorded {len(vuln_reports)} vulnerability report(s). Continue testing or use done tool."
+                        "content": result_content,
                     })
+
+                if should_stop:
+                    break
 
         except Exception as e:
             logger.error(f"Attack Planner error: {e}", exc_info=True)
@@ -614,8 +789,12 @@ What do you want to test first?"""
     # Claude communication
     # ──────────────────────────────────────────
 
-    async def _ask_claude(self) -> str | None:
-        """Send conversation to Claude."""
+    async def _ask_claude(self):
+        """Send conversation to Claude with native tool_use.
+
+        Returns the full Message object (not just text) so the caller can
+        inspect tool_use blocks.
+        """
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
@@ -630,10 +809,14 @@ What do you want to test first?"""
                     max_tokens=4096,
                     system=PLANNER_SYSTEM,
                     messages=self.conversation,
+                    tools=PLANNER_TOOLS,
                 )
-                text = message.content[0].text
-                self.conversation.append({"role": "assistant", "content": text})
-                return text
+                # Store the full response in conversation (content blocks)
+                self.conversation.append({
+                    "role": "assistant",
+                    "content": message.content,
+                })
+                return message
             except anthropic.AuthenticationError:
                 if attempt == max_retries:
                     return None
