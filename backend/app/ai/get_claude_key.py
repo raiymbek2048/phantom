@@ -68,13 +68,17 @@ def make_anthropic_client(sync: bool = False):
         return None
 
     if is_oauth_token(key):
-        # OAuth tokens need Bearer auth + beta header, not x-api-key
+        # OAuth tokens need Bearer auth + beta header, not x-api-key.
+        # SDK always sends X-Api-Key from api_key param; we override it
+        # in default_headers and provide a dummy api_key to prevent
+        # the SDK from reading ANTHROPIC_API_KEY from env.
         cls = anthropic.Anthropic if sync else anthropic.AsyncAnthropic
         return cls(
-            api_key="placeholder",  # required but overridden by headers
+            api_key="sk-ant-dummy00000000000000000000000000000000000000000000",
             default_headers={
                 "Authorization": f"Bearer {key}",
                 "anthropic-beta": "oauth-2025-04-20",
+                "X-Api-Key": "",
             },
         )
     else:
