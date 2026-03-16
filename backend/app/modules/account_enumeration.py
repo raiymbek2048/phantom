@@ -387,7 +387,7 @@ class AccountEnumerationModule:
         avg_fake = statistics.mean(fake_lens) if fake_lens else 0
         if avg_existing > 0 and avg_fake > 0:
             diff_pct = abs(avg_existing - avg_fake) / max(avg_existing, avg_fake) * 100
-            if diff_pct > 10:
+            if diff_pct > 30:
                 differentiators.append(
                     f"Response length differs by {diff_pct:.0f}%: "
                     f"existing avg={avg_existing:.0f}, fake avg={avg_fake:.0f}"
@@ -412,13 +412,27 @@ class AccountEnumerationModule:
                 f"fake → {list(fake_headers)[:2]}"
             )
 
-        if differentiators:
+        # Require at least 2 differentiators for confidence, or 1 strong one (explicit error msg)
+        has_strong = any("Wrong-password" in d or "User-not-found" in d for d in differentiators)
+        if differentiators and (len(differentiators) >= 2 or has_strong):
+            # Include sample request/response as proof
+            sample_existing = existing_responses[0] if existing_responses else {}
+            sample_fake = fake_responses[0] if fake_responses else {}
             return {
                 "title": "Account enumeration via login error message differentiation",
                 "url": url,
                 "severity": "medium",
                 "vuln_type": "info_disclosure",
+                "method": "POST",
                 "payload": f"Compare login responses for existing vs non-existing users",
+                "request_data": {
+                    "method": "POST", "url": url,
+                    "body": f"{username_field}=admin&{password_field}=wrong",
+                },
+                "response_data": {
+                    "existing_user": {"status": sample_existing.get("status"), "body_preview": sample_existing.get("body", "")[:500]},
+                    "fake_user": {"status": sample_fake.get("status"), "body_preview": sample_fake.get("body", "")[:500]},
+                },
                 "impact": f"The login endpoint reveals whether a username exists via different "
                           f"responses. Differences found: {'; '.join(differentiators[:3])}. "
                           f"Attackers can enumerate valid accounts before brute-forcing passwords.",
@@ -467,7 +481,7 @@ class AccountEnumerationModule:
             return None
         rel_diff = abs_diff / max_avg
 
-        if rel_diff > 0.30:
+        if rel_diff > 0.50 and abs_diff > 0.1:  # 50%+ relative AND 100ms+ absolute
             slower = "existing" if avg_existing > avg_fake else "non-existing"
             return {
                 "title": "Account enumeration via timing side-channel",
@@ -702,7 +716,7 @@ class AccountEnumerationModule:
         avg_fake = statistics.mean(fake_lens) if fake_lens else 0
         if avg_existing > 0 and avg_fake > 0:
             diff_pct = abs(avg_existing - avg_fake) / max(avg_existing, avg_fake) * 100
-            if diff_pct > 10:
+            if diff_pct > 30:
                 differentiators.append(
                     f"Response length differs by {diff_pct:.0f}%"
                 )
@@ -718,13 +732,26 @@ class AccountEnumerationModule:
                     f"Timing: existing avg {avg_et*1000:.0f}ms, fake avg {avg_ft*1000:.0f}ms"
                 )
 
-        if differentiators:
+        # Require at least 2 differentiators or 1 strong one (explicit error pattern)
+        has_strong = any("user not found" in d.lower() or "not_found_pattern" in d for d in differentiators)
+        if differentiators and (len(differentiators) >= 2 or has_strong):
+            sample_existing = existing_responses[0] if existing_responses else {}
+            sample_fake = fake_responses[0] if fake_responses else {}
             return {
                 "title": "Account enumeration via password reset endpoint",
                 "url": url,
                 "severity": "medium",
                 "vuln_type": "info_disclosure",
+                "method": "POST",
                 "payload": f"POST {url} with existing vs fake emails",
+                "request_data": {
+                    "method": "POST", "url": url,
+                    "body": f"{fields.get('email_field', 'email')}=admin@{domain}",
+                },
+                "response_data": {
+                    "existing_email": {"status": sample_existing.get("status"), "body_preview": sample_existing.get("body", "")[:500]},
+                    "fake_email": {"status": sample_fake.get("status"), "body_preview": sample_fake.get("body", "")[:500]},
+                },
                 "impact": f"Password reset endpoint reveals whether an account exists. "
                           f"Differences: {'; '.join(differentiators[:3])}. "
                           f"Attackers can enumerate valid accounts.",

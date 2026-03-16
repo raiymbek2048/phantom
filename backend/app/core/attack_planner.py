@@ -211,6 +211,27 @@ Find vulnerabilities that automated scanners MISS. Think creatively. Chain findi
 7. When stuck, try a completely different attack vector instead of repeating
 8. Use search_exploits to find real CVE exploits when you identify specific tech versions
 
+## CRITICAL: PROOF STANDARDS (what counts as a VALID finding)
+Before calling report_vuln, you MUST have:
+- An HTTP response that PROVES exploitation (not just a hypothesis)
+- The EXACT payload that triggered the vulnerability
+- The SPECIFIC part of the response that proves it (not just "200 OK")
+
+What does NOT count as proof:
+- Response length/timing differences alone (can be CSRF tokens, timestamps, caching)
+- A GET request to a page that requires POST (test with the correct method!)
+- "Possible XSS" without seeing your payload REFLECTED unencoded in response
+- "Possible SQLi" without seeing SQL error messages or data extraction
+- Finding staging/test subdomains (these are normal for any company)
+- Getting rate-limited (429) — this is GOOD security, not a vulnerability
+- Prototype pollution markers echoed back without proof of object pollution
+- Account enumeration without comparing POST responses with actual email/username parameters
+
+DO NOT inflate findings:
+- 8 payloads on the same endpoint = 1 finding (the BEST one), not 8
+- Report the strongest proof only, not every test attempt
+- If GET returns 401/403/405, don't report it as a finding — test with the correct method first
+
 Think step by step. Call tools to test your hypotheses. Keep going until you've exhausted all promising attack paths, then use the done tool."""
 
 # Reflector prompt — forces Claude back into tool-call format
@@ -395,6 +416,18 @@ class AttackPlanner:
 
                     if internal_name == "report_vuln":
                         finding = tool_input if isinstance(tool_input, dict) else {}
+
+                        # Validate finding has real proof before accepting
+                        rejection = self._validate_finding(finding)
+                        if rejection:
+                            logger.info(f"Attack Planner: rejected finding '{finding.get('title', '')}': {rejection}")
+                            tool_results.append({
+                                "tool_use_id": tool_id,
+                                "content": json.dumps({"status": "rejected", "reason": rejection,
+                                    "hint": "Re-test with the correct HTTP method, verify exploitation in the response, and provide concrete proof."}),
+                            })
+                            continue
+
                         self.findings.append(finding)
                         await _emit({"type": "planner_finding", "finding": finding})
                         tool_results.append({
@@ -793,6 +826,54 @@ What do you want to test first?"""
     # ──────────────────────────────────────────
     # Loop detection and execution monitor
     # ──────────────────────────────────────────
+
+    def _validate_finding(self, finding: dict) -> str | None:
+        """Validate a finding has real proof. Returns rejection reason or None if valid."""
+        proof = (finding.get("proof") or "").strip()
+        title = (finding.get("title") or "").lower()
+        vuln_type = (finding.get("vuln_type") or "").lower()
+        description = (finding.get("description") or "").lower()
+
+        # Must have proof field
+        if not proof or len(proof) < 20:
+            return "Proof is missing or too short — explain what in the HTTP response proves exploitation"
+
+        # Reject non-vulnerabilities
+        if "rate limit" in title or "rate limit" in description:
+            if "bypass" not in title and "bypass" not in description:
+                return "Rate limiting is a security feature, not a vulnerability"
+
+        if "staging" in title or "test environment" in title:
+            return "Staging/test environments are not vulnerabilities"
+
+        # Check for duplicate findings (same URL + same type already reported)
+        url = (finding.get("url") or "")
+        url_path = urlparse(url).path.rstrip("/").lower() if url else ""
+        for existing in self.findings:
+            existing_url = (existing.get("url") or "")
+            existing_path = urlparse(existing_url).path.rstrip("/").lower() if existing_url else ""
+            if (existing.get("vuln_type") == finding.get("vuln_type")
+                    and existing_path == url_path and url_path):
+                return f"Duplicate: {vuln_type} on {url_path} already reported — combine payloads into one finding"
+
+        # Weak proof patterns
+        weak_patterns = [
+            "possible", "might be", "could be", "appears to be vulnerable",
+            "may indicate", "suggests that", "potentially",
+        ]
+        proof_lower = proof.lower()
+        if any(p in proof_lower for p in weak_patterns) and "confirmed" not in proof_lower:
+            return "Proof uses speculative language ('possible', 'might be') — provide concrete evidence from HTTP response"
+
+        # XSS without reflection proof
+        if vuln_type == "xss" and "reflect" not in proof_lower and "execut" not in proof_lower and "dom" not in proof_lower:
+            return "XSS requires proof of payload reflection or execution in the response"
+
+        # Race condition with GET
+        if vuln_type == "race_condition" and "get" in proof_lower and "post" not in proof_lower:
+            return "Race condition cannot be proven with GET requests — requires state-changing operations (POST/PUT/DELETE)"
+
+        return None
 
     def _track_actions(self, actions: list[dict]):
         """Track action URLs and tools for loop detection."""

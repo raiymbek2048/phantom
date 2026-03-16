@@ -283,10 +283,9 @@ class ScanPipeline:
             parsed = urlparse(vuln.url or "")
             url_path = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
             conditions.append(Vulnerability.url.like(f"{url_path}%"))
-        # Match on parameter if present
-        if vuln.parameter:
-            conditions.append(Vulnerability.parameter == vuln.parameter)
 
+        # First check: same URL path + same type (regardless of parameter)
+        # This catches duplicate findings like 8 XSS on same endpoint with different payloads
         existing = await db.execute(
             select(Vulnerability.id).where(and_(*conditions)).limit(1)
         )
@@ -455,7 +454,44 @@ class ScanPipeline:
             await self.log(db, phase,
                 f"FP intelligence: filtered {filtered_count} likely false positives, kept {len(kept)} findings")
 
-        return kept
+        # Structural FP filter: reject common non-vulnerabilities regardless of KB
+        final = []
+        structural_filtered = 0
+        for finding in kept:
+            reason = self._structural_fp_check(finding)
+            if reason:
+                structural_filtered += 1
+            else:
+                final.append(finding)
+
+        if structural_filtered:
+            await self.log(db, phase,
+                f"Structural FP filter: removed {structural_filtered} non-vulnerabilities")
+
+        return final
+
+    @staticmethod
+    def _structural_fp_check(finding: dict) -> str | None:
+        """Check for common structural false positives. Returns reason or None."""
+        title = (finding.get("title") or "").lower()
+        description = (finding.get("description") or "").lower()
+        vuln_type = (finding.get("vuln_type") or "").lower()
+        severity = (finding.get("severity") or "").lower()
+        url = (finding.get("url") or "").lower()
+
+        # Rate limiting is a security feature
+        if "rate limit" in title and "bypass" not in title:
+            return "rate_limiting_is_good"
+
+        # Staging/test environments are not vulns
+        if "staging" in title or "test environment" in title or "test subdomain" in title:
+            return "staging_not_vuln"
+
+        # Info-only findings with no real impact
+        if severity == "info" and vuln_type not in ("info_disclosure",):
+            return "info_severity_filtered"
+
+        return None
 
     async def run(self):
         async with _db.async_session() as db:
@@ -3225,6 +3261,12 @@ Respond in JSON:
                 if chain_info:
                     description = f"{description}\n\nAttack Chain: {chain_info}"
 
+                # Set confidence based on whether proof is concrete
+                proof = f.get("proof", "")
+                has_concrete_proof = bool(proof and len(str(proof)) > 30
+                    and not any(w in str(proof).lower() for w in ("possible", "might", "could be", "appears")))
+                confidence = 0.75 if has_concrete_proof else 0.5
+
                 vuln = Vulnerability(
                     target_id=self.context["target_id"],
                     scan_id=self.context["scan_id"],
@@ -3237,8 +3279,9 @@ Respond in JSON:
                     impact=f.get("impact"),
                     remediation=f.get("remediation"),
                     payload_used=f.get("payload"),
-                    ai_confidence=0.8,
+                    ai_confidence=confidence,
                     ai_analysis=json.dumps(f, default=str),
+                    response_data={"proof": proof} if proof else None,
                 )
 
                 saved = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict={
