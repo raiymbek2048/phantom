@@ -207,6 +207,12 @@ class SensitiveFilesModule:
                                     "impact": f"Path /{path} exists on the server (403). "
                                              "Verify it's properly secured.",
                                     "remediation": f"Remove /{path} from web-accessible directory.",
+                                    "request_data": {"method": "GET", "url": url},
+                                    "response_data": {
+                                        "status_code": resp.status_code,
+                                        "headers": {k: v for k, v in list(resp.headers.items())[:15]},
+                                        "body_preview": resp.text[:2000],
+                                    },
                                 }
                         return None
 
@@ -264,6 +270,12 @@ class SensitiveFilesModule:
                         "method": "GET",
                         "response_preview": preview,
                         "secrets_found": len(secrets_found) if secrets_found else 0,
+                        "request_data": {"method": "GET", "url": url},
+                        "response_data": {
+                            "status_code": resp.status_code,
+                            "headers": {k: v for k, v in list(resp.headers.items())[:15]},
+                            "body_preview": resp.text[:2000],
+                        },
                     }
 
             except Exception:

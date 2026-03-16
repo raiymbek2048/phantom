@@ -355,6 +355,8 @@ class AuthAttackModule:
                         "remediation": "Change default credentials immediately. "
                                       "Enforce strong password policy. "
                                       "Implement account lockout after failed attempts.",
+                        "request_data": result.get("request_data"),
+                        "response_data": result.get("response_data"),
                     })
                     successful += 1
                     if successful >= 3:
@@ -415,11 +417,24 @@ class AuthAttackModule:
                     if any(s in body for s in ["invalid", "incorrect", "wrong", "failed", "error", "denied"]):
                         indicators.append("error_message")
 
+                    req_headers = dict(resp.request.headers) if resp.request else {}
+                    resp_headers = dict(resp.headers)
                     return {
                         "status": resp.status_code,
                         "body_len": len(resp.text),
                         "indicators": indicators,
                         "body_snippet": body[:500],
+                        "request_data": {
+                            "method": form["method"],
+                            "url": form["action_url"],
+                            "headers": dict(list(req_headers.items())[:15]),
+                            "body": data,
+                        },
+                        "response_data": {
+                            "status_code": resp.status_code,
+                            "headers": dict(list(resp_headers.items())[:15]),
+                            "body_preview": resp.text[:2000],
+                        },
                     }
 
             except Exception:
@@ -499,6 +514,8 @@ class AuthAttackModule:
                              f"Attackers can enumerate valid usernames.",
                     "remediation": "Return identical error messages for invalid username "
                                   "and invalid password scenarios.",
+                    "request_data": valid_resp.get("request_data"),
+                    "response_data": valid_resp.get("response_data"),
                 }
 
         return None
@@ -508,11 +525,13 @@ class AuthAttackModule:
         start_time = time.time()
         success_count = 0
         total_attempts = 10
+        last_result = None
 
         for i in range(total_attempts):
             result = await self._attempt_login(form, f"testuser{i}", "wrongpass")
             if result and result["status"] not in (429, 503):
                 success_count += 1
+                last_result = result
             elif result and result["status"] == 429:
                 # Rate limiting detected
                 return None  # Good — rate limiting works
@@ -534,6 +553,8 @@ class AuthAttackModule:
                 "remediation": "Implement rate limiting (e.g., max 5 attempts per minute). "
                               "Add CAPTCHA after 3 failed attempts. "
                               "Implement progressive delays or account lockout.",
+                "request_data": last_result.get("request_data") if last_result else None,
+                "response_data": last_result.get("response_data") if last_result else None,
             }
 
         return None
@@ -589,6 +610,8 @@ class AuthAttackModule:
 
                             if resp.status_code == 429:
                                 rate_limited = True
+                                req_headers = dict(resp.request.headers) if resp.request else {}
+                                resp_headers = dict(resp.headers)
                                 findings.append({
                                     "title": f"Rate limiting active on {api_url}",
                                     "url": api_url,
@@ -597,6 +620,17 @@ class AuthAttackModule:
                                     "method": "POST",
                                     "impact": "Rate limiting is enforced on login endpoint.",
                                     "remediation": "Good — rate limiting is in place.",
+                                    "request_data": {
+                                        "method": "POST",
+                                        "url": api_url,
+                                        "headers": dict(list(req_headers.items())[:15]),
+                                        "body": payload,
+                                    },
+                                    "response_data": {
+                                        "status_code": resp.status_code,
+                                        "headers": dict(list(resp_headers.items())[:15]),
+                                        "body_preview": resp.text[:2000],
+                                    },
                                 })
                                 break
 
@@ -614,6 +648,8 @@ class AuthAttackModule:
                                         token = (data.get("token") or data.get("access_token")
                                                 or data.get("jwt") or data.get("data", {}).get("token", "") or "")
                                         if isinstance(token, str) and len(token) > 20:
+                                            req_headers_api = dict(resp.request.headers) if resp.request else {}
+                                            resp_headers_api = dict(resp.headers)
                                             findings.append({
                                                 "title": f"API default credentials: {username}:{password}",
                                                 "url": api_url,
@@ -626,6 +662,17 @@ class AuthAttackModule:
                                                          f"JWT/token obtained: {token[:30]}...",
                                                 "remediation": "Change default API credentials. "
                                                               "Enforce strong passwords.",
+                                                "request_data": {
+                                                    "method": "POST",
+                                                    "url": api_url,
+                                                    "headers": dict(list(req_headers_api.items())[:15]),
+                                                    "body": payload,
+                                                },
+                                                "response_data": {
+                                                    "status_code": resp.status_code,
+                                                    "headers": dict(list(resp_headers_api.items())[:15]),
+                                                    "body_preview": resp.text[:2000],
+                                                },
                                             })
                                             # Found valid creds — skip other field variants
                                             break

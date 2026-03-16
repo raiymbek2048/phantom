@@ -503,6 +503,17 @@ class ServiceAttackModule:
                         "remediation": "Enable X-Pack Security. Use authentication. Bind to 127.0.0.1.",
                         "method": "GET",
                         "response_preview": f"Indices: {indices}",
+                        "request_data": {
+                            "method": "GET",
+                            "url": f"http://{ip}:{port}/",
+                            "headers": dict(list(resp.request.headers.items())[:15]),
+                            "body": None,
+                        },
+                        "response_data": {
+                            "status_code": resp.status_code,
+                            "headers": {k: v for k, v in list(resp.headers.items())[:15]},
+                            "body_preview": resp.text[:2000],
+                        },
                     })
         except Exception:
             pass
