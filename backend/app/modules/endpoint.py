@@ -562,7 +562,53 @@ class EndpointModule:
                     re.I,
                 )
 
-                for js_url in list(js_urls)[:15]:
+                # ── Additional extraction patterns ──
+                # React/Vue/Angular route definitions
+                route_pattern = re.compile(
+                    r'(?:path|route|url)\s*[:=]\s*["\'](/[a-zA-Z0-9/_\-\.:{}*]+)["\']',
+                    re.I,
+                )
+                # fetch/axios/XMLHttpRequest calls
+                fetch_pattern = re.compile(
+                    r'(?:fetch|axios\.(?:get|post|put|delete|patch)|\.open)\s*\(\s*["\']'
+                    r'(/[a-zA-Z0-9/_\-\.?&={}:$]+)["\']',
+                    re.I,
+                )
+                # Template literal API calls: `${baseUrl}/api/users`
+                template_api_pattern = re.compile(
+                    r'`[^`]*\$\{[^}]+\}(/(?:api|v[0-9]|rest|auth)[a-zA-Z0-9/_\-\.]*)`',
+                )
+                # GraphQL operations in JS
+                graphql_op_pattern = re.compile(
+                    r'(?:query|mutation|subscription)\s+(\w+)\s*[\({]',
+                )
+                # Webpack chunk manifests (map chunk IDs to filenames)
+                chunk_pattern = re.compile(
+                    r'["\']([a-f0-9]+\.chunk\.js|[a-f0-9]+\.[a-f0-9]+\.js)["\']',
+                )
+                # Environment/config variables
+                env_pattern = re.compile(
+                    r'(?:process\.env\.|import\.meta\.env\.|window\.__)'
+                    r'([A-Z_]{3,})\s*(?:[\|&]|$)',
+                )
+                # Hardcoded AWS/GCP/Azure keys
+                cloud_key_pattern = re.compile(
+                    r'(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|'
+                    r'ya29\.[0-9A-Za-z_-]+|'
+                    r'sk_live_[0-9a-zA-Z]{24,}|'
+                    r'ghp_[0-9a-zA-Z]{36}|'
+                    r'glpat-[0-9a-zA-Z_-]{20,}|'
+                    r'xox[bpors]-[0-9a-zA-Z-]+)'
+                )
+                # Header/cookie patterns
+                header_pattern = re.compile(
+                    r'(?:headers|setRequestHeader)\s*[\[.(]\s*["\']'
+                    r'(Authorization|X-Api-Key|X-Auth-Token|X-CSRF-Token)["\']'
+                    r'\s*[,):\]]\s*["\']?([^"\';\n]{5,})',
+                    re.I,
+                )
+
+                for js_url in list(js_urls)[:20]:  # increased from 15
                     try:
                         js_resp = await client.get(js_url)
                         if js_resp.status_code != 200 or len(js_resp.text) > 2_000_000:
@@ -585,6 +631,51 @@ class EndpointModule:
                             ep["discovery"] = "js_extraction"
                             endpoints.append(ep)
 
+                        # Extract route definitions (React Router, Vue Router, Angular)
+                        for m in route_pattern.finditer(js_text):
+                            path = m.group(1)
+                            # Skip template params like :id — keep the path prefix
+                            clean_path = re.sub(r':[a-zA-Z_]+', '1', path)
+                            clean_path = re.sub(r'\{[^}]+\}', '1', clean_path)
+                            if clean_path.count('/') >= 1 and not clean_path.endswith('*'):
+                                full = base_url + clean_path
+                                ep = self._classify_endpoint(full)
+                                ep["discovery"] = "js_route"
+                                ep["source_js"] = js_url
+                                endpoints.append(ep)
+
+                        # Extract fetch/axios API calls
+                        for m in fetch_pattern.finditer(js_text):
+                            path = m.group(1)
+                            clean_path = re.sub(r'\$\{[^}]+\}', '1', path)
+                            clean_path = re.sub(r':[a-zA-Z_]+', '1', clean_path)
+                            full = base_url + clean_path
+                            ep = self._classify_endpoint(full)
+                            ep["discovery"] = "js_fetch"
+                            ep["source_js"] = js_url
+                            ep["interest"] = "high"  # explicit API call = high interest
+                            endpoints.append(ep)
+
+                        # Extract template literal API paths
+                        for m in template_api_pattern.finditer(js_text):
+                            path = m.group(1)
+                            full = base_url + path
+                            ep = self._classify_endpoint(full)
+                            ep["discovery"] = "js_template"
+                            ep["source_js"] = js_url
+                            endpoints.append(ep)
+
+                        # Detect GraphQL operations
+                        graphql_ops = graphql_op_pattern.findall(js_text)
+                        if graphql_ops and not any(
+                            "graphql" in e.get("url", "").lower() for e in endpoints
+                        ):
+                            ep = self._classify_endpoint(base_url + "/graphql")
+                            ep["discovery"] = "js_graphql"
+                            ep["type"] = "api"
+                            ep["interest"] = "high"
+                            endpoints.append(ep)
+
                         # Extract potential secrets/API keys
                         for m in secret_pattern.finditer(js_text):
                             secret_val = m.group(1)
@@ -598,6 +689,42 @@ class EndpointModule:
                                 "discovery": "js_secret",
                                 "secret_hint": secret_val[:20] + "...",
                             })
+
+                        # Extract cloud provider keys
+                        for m in cloud_key_pattern.finditer(js_text):
+                            endpoints.append({
+                                "url": js_url,
+                                "type": "sensitive",
+                                "interest": "critical",
+                                "params": [],
+                                "discovery": "js_cloud_key",
+                                "secret_hint": m.group(0)[:20] + "...",
+                            })
+
+                        # Extract hardcoded auth headers/tokens
+                        for m in header_pattern.finditer(js_text):
+                            header_name = m.group(1)
+                            header_val = m.group(2).strip()
+                            if len(header_val) > 8 and header_val not in (
+                                "undefined", "null", "Bearer ", "token",
+                            ):
+                                endpoints.append({
+                                    "url": js_url,
+                                    "type": "sensitive",
+                                    "interest": "critical",
+                                    "params": [],
+                                    "discovery": "js_hardcoded_auth",
+                                    "secret_hint": f"{header_name}: {header_val[:20]}...",
+                                })
+
+                        # Discover webpack chunks for additional JS files
+                        for m in chunk_pattern.finditer(js_text):
+                            chunk_file = m.group(1)
+                            # Resolve chunk URL relative to this JS file
+                            js_base = js_url.rsplit("/", 1)[0] + "/"
+                            chunk_url = js_base + chunk_file
+                            if chunk_url not in js_urls and len(js_urls) < 30:
+                                js_urls.add(chunk_url)
 
                     except Exception:
                         continue

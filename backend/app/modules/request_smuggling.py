@@ -78,6 +78,16 @@ class RequestSmugglingModule:
                 if result:
                     findings.append(result)
 
+                # Test CL-CL discrepancy (duplicate Content-Length)
+                result = await self._test_cl_cl(url)
+                if result:
+                    findings.append(result)
+
+                # Test header injection via newlines (HTTP header splitting)
+                result = await self._test_header_injection(url)
+                if result:
+                    findings.append(result)
+
             except Exception as e:
                 logger.debug(f"Request smuggling test error for {url}: {e}")
 
@@ -477,5 +487,141 @@ class RequestSmugglingModule:
 
         except Exception as e:
             logger.debug(f"Response poisoning check error: {e}")
+
+        return None
+
+    async def _test_cl_cl(self, url: str) -> dict | None:
+        """Duplicate Content-Length test.
+
+        Some proxies use the first CL, backends the last (or vice versa).
+        Send a request with two CL headers — if they disagree, the
+        proxy forwards a different amount than the backend expects.
+        """
+        host, port, use_ssl, path = self._parse_url(url)
+        if not host:
+            return None
+
+        try:
+            baseline = await self._get_baseline_time(host, port, use_ssl, path)
+            threshold = max(5.0, baseline * 4)
+
+            ua = get_random_ua()
+            body = "GPOST / HTTP/1.1\r\nHost: a\r\n\r\n"
+            # Two CL headers: first says small (proxy forwards partial), second says full
+            smuggle_req = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {ua}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: 0\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+                f"{body}"
+            ).encode()
+
+            elapsed, response, reset = await self._raw_request(
+                host, port, use_ssl, smuggle_req, timeout=self.smuggle_timeout
+            )
+
+            if reset:
+                return None
+
+            # If server processed the body (didn't reject duplicate CL)
+            # and timing is anomalous, it's vulnerable
+            if elapsed > threshold:
+                return {
+                    "title": f"HTTP Request Smuggling (CL-CL) at {path}",
+                    "url": url,
+                    "severity": "high",
+                    "vuln_type": "misconfiguration",
+                    "description": (
+                        f"Server accepts duplicate Content-Length headers with different "
+                        f"values. Frontend and backend may disagree on body boundaries, "
+                        f"enabling request smuggling. "
+                        f"Baseline: {baseline:.2f}s, test: {elapsed:.2f}s."
+                    ),
+                    "impact": (
+                        "Duplicate CL smuggling enables request hijacking, cache poisoning, "
+                        "and security control bypass."
+                    ),
+                    "remediation": (
+                        "Reject requests with duplicate Content-Length headers. "
+                        "RFC 7230 Section 3.3.2 mandates rejection."
+                    ),
+                    "payload": "POST with two CL headers: CL:0 + CL:N",
+                    "proof": f"Timing: baseline={baseline:.2f}s, smuggle={elapsed:.2f}s",
+                    "method": "POST",
+                }
+
+            # Even without timing anomaly, check if server returns 400 (proper rejection)
+            # vs processes normally (improper handling)
+            if response and "400" not in response.split("\r\n")[0]:
+                # Server accepted duplicate CL without rejecting — potential issue
+                # but lower confidence without timing differential
+                pass
+
+        except Exception as e:
+            logger.debug(f"CL-CL test error for {url}: {e}")
+
+        return None
+
+    async def _test_header_injection(self, url: str) -> dict | None:
+        """Test for HTTP header injection via CRLF in header values.
+
+        If a backend echoes or processes injected headers, it can lead to
+        response splitting or request smuggling.
+        """
+        host, port, use_ssl, path = self._parse_url(url)
+        if not host:
+            return None
+
+        try:
+            ua = get_random_ua()
+            marker = f"phantom-header-{random.randint(100000, 999999)}"
+
+            # Inject CRLF in a header value to add a fake header
+            injected_header = f"normalvalue\r\nX-Injected: {marker}"
+
+            test_req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {ua}\r\n"
+                f"X-Test: {injected_header}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode()
+
+            elapsed, response, reset = await self._raw_request(
+                host, port, use_ssl, test_req
+            )
+
+            if response and marker in response:
+                return {
+                    "title": f"HTTP Header Injection (CRLF) at {path}",
+                    "url": url,
+                    "severity": "high",
+                    "vuln_type": "misconfiguration",
+                    "description": (
+                        "Server is vulnerable to CRLF injection in HTTP headers. "
+                        "An injected header value containing \\r\\n was reflected "
+                        "in the response, indicating the server does not sanitize "
+                        "header values."
+                    ),
+                    "impact": (
+                        "HTTP response splitting allows cache poisoning, XSS via "
+                        "injected response headers, and session fixation."
+                    ),
+                    "remediation": (
+                        "Strip or reject CRLF characters in all header values. "
+                        "Use a modern HTTP framework that handles this automatically."
+                    ),
+                    "payload": f"X-Test: value\\r\\nX-Injected: {marker}",
+                    "proof": f"Injected header marker '{marker}' reflected in response",
+                    "method": "GET",
+                }
+
+        except Exception as e:
+            logger.debug(f"Header injection test error for {url}: {e}")
 
         return None

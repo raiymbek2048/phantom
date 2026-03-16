@@ -22,33 +22,137 @@ from app.utils.http_client import make_client
 
 logger = logging.getLogger(__name__)
 
-# Common subdomains for DNS brute-force
+# Common subdomains for DNS brute-force (500+ entries)
 COMMON_SUBDOMAINS = [
-    "www", "mail", "ftp", "smtp", "pop", "imap", "webmail",
-    "admin", "portal", "vpn", "remote", "gateway",
-    "api", "api2", "api3", "rest", "graphql",
-    "dev", "development", "staging", "stage", "stg", "qa", "uat", "test", "testing",
-    "beta", "alpha", "demo", "sandbox", "preview",
-    "app", "apps", "mobile", "m",
-    "cdn", "static", "assets", "media", "images", "img",
-    "blog", "cms", "wp", "wordpress",
-    "git", "gitlab", "github", "bitbucket", "svn", "repo",
-    "ci", "cd", "jenkins", "travis", "drone", "build",
-    "monitor", "monitoring", "grafana", "prometheus", "kibana", "elastic",
-    "db", "database", "mysql", "postgres", "mongo", "redis", "memcached",
-    "mq", "rabbit", "rabbitmq", "kafka", "queue",
-    "auth", "sso", "login", "oauth", "identity", "id",
-    "docs", "documentation", "help", "support", "wiki", "kb",
+    # ── Core services ──
+    "www", "www1", "www2", "www3", "mail", "mail2", "email",
+    "ftp", "sftp", "smtp", "pop", "pop3", "imap", "webmail", "exchange",
+    "mx", "mx1", "mx2", "mx3", "relay", "mta",
+    # ── Admin / management ──
+    "admin", "admin2", "administrator", "portal", "manage", "manager",
+    "panel", "cpanel", "control", "dashboard", "console", "cockpit",
+    "webadmin", "sysadmin", "root",
+    # ── Network / infrastructure ──
+    "vpn", "remote", "gateway", "gw", "fw", "firewall",
+    "proxy", "lb", "loadbalancer", "haproxy", "nginx",
+    "router", "switch", "nat", "edge",
+    "ns1", "ns2", "ns3", "ns4", "dns", "dns1", "dns2",
+    # ── API / backend ──
+    "api", "api1", "api2", "api3", "api-v1", "api-v2",
+    "rest", "graphql", "grpc", "ws", "websocket", "wss",
+    "backend", "server", "service", "services", "microservice",
+    "gateway-api", "api-gateway", "kong",
+    # ── Development / staging ──
+    "dev", "dev1", "dev2", "development", "develop",
+    "staging", "stage", "stg", "stg1", "stg2",
+    "qa", "qa1", "qa2", "uat", "uat1",
+    "test", "test1", "test2", "test3", "testing",
+    "beta", "alpha", "demo", "demo1", "demo2",
+    "sandbox", "sandbox1", "preview", "canary",
+    "pre", "preprod", "pre-prod", "pre-production",
+    "rc", "release", "next",
+    # ── Applications ──
+    "app", "app1", "app2", "apps", "application",
+    "mobile", "m", "ios", "android",
+    "web", "webapp", "web-app",
+    "crm", "erp", "hr", "helpdesk",
+    # ── Content / CDN ──
+    "cdn", "cdn1", "cdn2", "static", "static1", "static2",
+    "assets", "asset", "media", "images", "img", "img1",
+    "video", "audio", "stream", "streaming",
+    "cache", "cache1", "edge", "cloudfront",
+    # ── Blog / CMS ──
+    "blog", "blogs", "news", "press",
+    "cms", "wp", "wordpress", "drupal", "joomla",
+    "content", "editorial", "publish",
+    # ── Source control / CI/CD ──
+    "git", "gitlab", "github", "bitbucket", "svn", "repo", "repos",
+    "ci", "cd", "jenkins", "travis", "drone", "build", "builds",
+    "deploy", "deployment", "release", "artifacts", "registry",
+    "docker", "k8s", "kubernetes", "rancher", "harbor",
+    "sonar", "sonarqube", "nexus", "maven",
+    "argo", "argocd", "flux", "terraform",
+    # ── Monitoring / observability ──
+    "monitor", "monitoring", "mon",
+    "grafana", "prometheus", "alertmanager",
+    "kibana", "elastic", "elasticsearch", "logstash", "elk",
+    "apm", "sentry", "datadog", "newrelic",
+    "zabbix", "nagios", "icinga", "cacti",
+    "splunk", "graylog", "fluentd",
+    "status", "health", "ping", "uptime",
+    # ── Database ──
+    "db", "db1", "db2", "database", "data",
+    "mysql", "postgres", "postgresql", "mariadb",
+    "mongo", "mongodb", "redis", "memcached",
+    "elastic", "elasticsearch", "solr",
+    "clickhouse", "cassandra", "couchdb",
+    "phpmyadmin", "pgadmin", "adminer",
+    # ── Message queue ──
+    "mq", "rabbit", "rabbitmq", "kafka",
+    "queue", "activemq", "nats",
+    # ── Auth / identity ──
+    "auth", "auth2", "sso", "login", "signin",
+    "oauth", "oauth2", "oidc", "openid",
+    "identity", "id", "idp", "saml",
+    "ldap", "ad", "keycloak", "okta",
+    "accounts", "account", "signup", "register",
+    # ── Documentation ──
+    "docs", "doc", "documentation",
+    "help", "support", "wiki", "kb",
+    "faq", "guide", "learn", "academy",
+    "swagger", "redoc", "apidoc", "apidocs",
+    # ── Internal ──
     "internal", "intranet", "corp", "corporate",
-    "backup", "bak", "old", "legacy", "archive",
-    "ns1", "ns2", "ns3", "dns", "dns1", "dns2",
-    "mx", "mx1", "mx2", "relay",
-    "panel", "cpanel", "control", "dashboard",
-    "shop", "store", "pay", "payment", "billing", "checkout",
-    "status", "health", "ping",
+    "office", "work", "employee", "staff",
+    "hr", "finance", "legal", "it",
+    # ── Backup / legacy ──
+    "backup", "backup1", "bak", "bkp",
+    "old", "old1", "legacy", "archive",
+    "temp", "tmp", "scratch",
+    # ── E-commerce / payments ──
+    "shop", "store", "ecommerce", "marketplace",
+    "pay", "payment", "payments", "billing",
+    "checkout", "cart", "order", "orders",
+    "invoice", "invoices",
+    # ── Communication / collaboration ──
+    "chat", "im", "messaging",
+    "meet", "video", "conference",
     "jira", "confluence", "slack", "teams",
-    "s3", "storage", "files", "upload",
-    "proxy", "lb", "loadbalancer",
+    "trello", "asana", "notion",
+    "mattermost", "rocketchat", "matrix",
+    # ── Storage / files ──
+    "s3", "storage", "files", "file",
+    "upload", "uploads", "download", "downloads",
+    "share", "shared", "drive", "cloud",
+    "minio", "ceph", "nfs",
+    # ── Analytics / reporting ──
+    "analytics", "stats", "statistics",
+    "report", "reports", "reporting",
+    "bi", "metabase", "redash", "superset",
+    "matomo", "piwik",
+    # ── Security ──
+    "security", "sec", "waf",
+    "vault", "secrets", "pki", "cert", "certs",
+    "scan", "scanner",
+    # ── Misc services ──
+    "calendar", "cal", "events",
+    "maps", "map", "geo", "location",
+    "search", "find", "discover",
+    "notify", "notification", "notifications",
+    "push", "pubsub",
+    "cron", "scheduler", "jobs", "worker", "workers",
+    "webhook", "webhooks", "hook", "hooks",
+    "redirect", "link", "links", "short", "go",
+    "sms", "voice", "phone",
+    # ── Country / region variants ──
+    "en", "ru", "es", "fr", "de", "cn", "jp", "kr",
+    "us", "eu", "asia", "global",
+    # ── Numbered variants ──
+    "node1", "node2", "node3",
+    "host1", "host2", "host3",
+    "srv1", "srv2", "srv3",
+    "web1", "web2", "web3",
+    "dc1", "dc2", "dc3",
 ]
 
 
@@ -66,13 +170,14 @@ class SubdomainModule:
             self._assetfinder(domain),
             self._crtsh(domain),
             self._dns_bruteforce(domain),
+            self._dns_zone_transfer(domain),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Merge all subdomains
         all_subdomains = set()
         source_counts = {}
-        source_names = ["subfinder", "assetfinder", "crt.sh", "dns_brute"]
+        source_names = ["subfinder", "assetfinder", "crt.sh", "dns_brute", "zone_transfer"]
         for i, result in enumerate(results):
             if isinstance(result, list):
                 count = len(result)
@@ -196,6 +301,71 @@ class SubdomainModule:
         await asyncio.gather(*tasks)
 
         return found
+
+    async def _dns_zone_transfer(self, domain: str) -> list[str]:
+        """Attempt DNS zone transfer (AXFR) against all nameservers.
+
+        Zone transfer exposes ALL DNS records at once — extremely high value
+        when it works (many servers still misconfigured).
+        """
+        found = []
+        try:
+            # Get nameservers via dig
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "dig", "+short", "NS", domain,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                ),
+                timeout=10,
+            )
+            stdout, _ = await proc.communicate()
+            nameservers = [
+                ns.strip().rstrip(".")
+                for ns in stdout.decode().strip().split("\n")
+                if ns.strip()
+            ]
+
+            if not nameservers:
+                return found
+
+            for ns in nameservers[:4]:
+                try:
+                    proc = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            "dig", f"@{ns}", domain, "AXFR", "+noall", "+answer",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        ),
+                        timeout=15,
+                    )
+                    stdout, _ = await proc.communicate()
+                    output = stdout.decode()
+
+                    if not output.strip() or "Transfer failed" in output:
+                        continue
+
+                    # Parse AXFR output — extract subdomain names
+                    for line in output.strip().split("\n"):
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            record_name = parts[0].rstrip(".")
+                            record_type = parts[3]
+                            if record_type in ("A", "AAAA", "CNAME") and domain in record_name:
+                                found.append(record_name)
+
+                    if found:
+                        logger.info(
+                            f"DNS zone transfer SUCCESS on {ns} for {domain}: "
+                            f"{len(found)} records"
+                        )
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.debug(f"Zone transfer error for {domain}: {e}")
+
+        return list(set(found))
 
     def _clean_subdomains(self, subdomains: set[str], parent_domain: str) -> set[str]:
         """Clean and validate discovered subdomains."""
