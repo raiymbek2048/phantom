@@ -16,6 +16,9 @@ FIXED_RECON_PHASES = {"recon", "subdomain", "portscan", "fingerprint"}
 # Phases that must always run — cannot be skipped
 CRITICAL_PHASES = {"vuln_scan", "exploit", "evidence", "report"}
 
+# Phases that must run late (after all attack phases), in this relative order
+LATE_PHASES = ["vuln_confirm", "claude_collab", "attack_planner", "evidence", "report"]
+
 
 class PhaseOptimizer:
     """AI-driven phase ordering — decides which phases to run and in what order
@@ -140,9 +143,9 @@ class PhaseOptimizer:
 
         techs = set(t.lower() for t in (ctx.get("technologies") or []))
 
-        # No login form → skip auth_attack
+        # No login form → deprioritize (but don't skip — hidden auth endpoints may exist)
         if not ctx.get("has_login"):
-            hints.append("SKIP auth_attack — no login form detected")
+            hints.append("DEPRIORITIZE auth_attack — no obvious login form, but still run it")
 
         # No file uploads → deprioritize file upload testing
         if not ctx.get("has_upload"):
@@ -232,14 +235,16 @@ Endpoints discovered: {scan_context.get('endpoints_count', 0)}
 
 ## Rules
 - CRITICAL phases that MUST be included: vuln_scan, exploit, evidence, report
-- evidence and report MUST be the last two phases (in that order)
+- LATE phases are auto-appended at end: vuln_confirm → claude_collab → attack_planner → evidence → report
+  Do NOT include these in your output — they are added automatically
 - You may reorder all other phases to attack most promising vectors first
-- Add "SKIP:" prefix to phases that are clearly unnecessary (e.g., "SKIP:auth_attack")
-- Do NOT skip critical phases (vuln_scan, exploit, evidence, report)
+- Add "SKIP:" prefix to phases that are clearly unnecessary (e.g., "SKIP:graphql_attacks" if no GraphQL)
+- Do NOT skip: vuln_scan, exploit, auth_attack (unless explicitly no login), service_attack, endpoint
+- Be aggressive — include all attack phases by default, only skip if truly irrelevant
 
-Return a JSON array of phase names in optimal order. You may add "SKIP:" prefix to skip phases.
+Return a JSON array of phase names in optimal order (excluding late phases). You may add "SKIP:" prefix to skip phases.
 Respond with ONLY a JSON array, nothing else.
-Example: ["attack_routing", "endpoint", "vuln_scan", "SKIP:auth_attack", "exploit", "evidence", "report"]"""
+Example: ["attack_routing", "endpoint", "vuln_scan", "exploit", "auth_attack", "SKIP:graphql_attacks"]"""
 
         result = await llm.analyze(prompt, temperature=0.2, max_tokens=1024)
 
@@ -253,8 +258,11 @@ Example: ["attack_routing", "endpoint", "vuln_scan", "SKIP:auth_attack", "exploi
         return available_phases
 
     def _validate_phase_order(self, phases: list[str], available: list[str]) -> list[str]:
-        """Ensure result is valid — all critical phases present, no hallucinated phases."""
+        """Ensure result is valid — all critical phases present, no hallucinated phases,
+        and late phases (vuln_confirm, claude_collab, attack_planner, evidence, report)
+        are always at the end in correct order."""
         available_set = set(available)
+        late_set = set(LATE_PHASES)
 
         # Filter out SKIP: prefixed and unknown phases
         result = []
@@ -267,27 +275,23 @@ Example: ["attack_routing", "endpoint", "vuln_scan", "SKIP:auth_attack", "exploi
                 if name not in CRITICAL_PHASES:
                     skipped.add(name)
                 continue
+            # Late phases handled separately — don't add them in the main body
+            if p in late_set:
+                seen.add(p)
+                continue
             if p in available_set and p not in seen:
                 result.append(p)
                 seen.add(p)
 
-        # Add back any missing phases at the end (before evidence/report)
-        # Ensure evidence and report are always last in that order
-        has_evidence = "evidence" in seen
-        has_report = "report" in seen
-
-        # Remove evidence/report from result — we'll re-add them at the end
-        result = [p for p in result if p not in ("evidence", "report")]
-
-        # Add missing phases (except skipped, evidence, report)
+        # Add missing non-late, non-skipped phases
         for p in available:
-            if p not in seen and p not in skipped and p not in ("evidence", "report"):
+            if p not in seen and p not in skipped and p not in late_set:
                 result.append(p)
+                seen.add(p)
 
-        # Always append evidence → report at the end
-        if "evidence" in available_set:
-            result.append("evidence")
-        if "report" in available_set:
-            result.append("report")
+        # Always append late phases at the end in fixed order
+        for p in LATE_PHASES:
+            if p in available_set and p not in skipped:
+                result.append(p)
 
         return result

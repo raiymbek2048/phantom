@@ -9,7 +9,7 @@ import json
 import logging
 from datetime import datetime
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 
 logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -327,7 +327,16 @@ class ScanPipeline:
             data=data,
         )
         db.add(log_entry)
-        await db.flush()
+        try:
+            await db.flush()
+        except Exception as flush_err:
+            # Session may be corrupted — rollback and retry once
+            try:
+                await db.rollback()
+                db.add(ScanLog(scan_id=self.scan_id, phase=phase, level=level, message=message, data=data))
+                await db.flush()
+            except Exception:
+                logger.error(f"Log write failed for scan {self.scan_id}: {flush_err}")
 
         # Broadcast log via Redis pub/sub
         await self._publish({
@@ -739,10 +748,28 @@ class ScanPipeline:
                         logger.debug(f"Scan feedback analysis failed (non-fatal): {e}")
 
             except Exception as e:
-                scan.status = ScanStatus.FAILED
-                scan.completed_at = datetime.utcnow()
-                await self.log(db, "error", f"Scan failed: {str(e)}", "error")
-                await db.commit()
+                # Ensure session is clean before writing failure status
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                try:
+                    scan.status = ScanStatus.FAILED
+                    scan.completed_at = datetime.utcnow()
+                    await self.log(db, "error", f"Scan failed: {str(e)}", "error")
+                    await db.commit()
+                except Exception as commit_err:
+                    logger.error(f"Failed to persist scan failure status: {commit_err}")
+                    # Last resort: raw SQL to mark scan as failed
+                    try:
+                        await db.rollback()
+                        await db.execute(
+                            text("UPDATE scans SET status = 'FAILED', completed_at = NOW() WHERE id = :sid"),
+                            {"sid": self.scan_id}
+                        )
+                        await db.commit()
+                    except Exception:
+                        logger.critical(f"Scan {self.scan_id} stuck as RUNNING — manual intervention needed")
                 raise
 
     # --- Multi-Round Attack Strategies ---
@@ -1287,12 +1314,29 @@ Respond in JSON:
             if phase_index >= 0:
                 await self._save_checkpoint(db, scan, phase_name, phase_index)
         except Exception as e:
-            await self.log(db, phase_name, f"Phase {phase_name} error: {str(e)}", "error")
-            await db.commit()
+            # Rollback corrupted session before attempting any further writes
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            try:
+                await self.log(db, phase_name, f"Phase {phase_name} error: {str(e)}", "error")
+                await db.commit()
+            except Exception:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                logger.error(f"Phase {phase_name} error (could not log to DB): {e}")
             # Save checkpoint even on failure so we skip this phase on resume
-            # (it already errored, retrying likely won't help)
             if phase_index >= 0:
-                await self._save_checkpoint(db, scan, phase_name, phase_index)
+                try:
+                    await self._save_checkpoint(db, scan, phase_name, phase_index)
+                except Exception:
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
             # Don't fail entire scan on single phase failure
             # AI will adapt strategy
 

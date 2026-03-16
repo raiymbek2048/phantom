@@ -217,24 +217,25 @@ Think step by step. Call tools to test your hypotheses. Keep going until you've 
 REFLECTOR_PROMPT = "You must use the provided tools. Call http_request, fuzz, extract_page, search_exploits, or done."
 
 # Execution monitor prompt — injected when loop is detected
-MONITOR_PROMPT = """⚠️ EXECUTION MONITOR: I've detected you may be stuck in a loop.
+MONITOR_PROMPT = """⚠️ EXECUTION MONITOR: Possible repetition detected.
 
 Actions so far: {action_count}
 Most repeated: {repeated}
 Unique URLs tested: {unique_urls}
 
-RECOMMENDATIONS:
-1. STOP testing the same endpoints with similar payloads
-2. Try a COMPLETELY DIFFERENT attack vector:
-   - If you were testing XSS, try IDOR or auth bypass instead
-   - If you were testing APIs, try file/path traversal
-   - If you were testing injection, try business logic flaws
-   - Try HTTP verb tampering (PUT/DELETE on GET endpoints)
-   - Try parameter pollution (?param=a&param=b)
-   - Try race conditions (simultaneous requests)
-3. If you've exhausted all vectors, use the done tool
+This is a nudge to diversify, NOT a stop signal. You still have budget.
 
-What NEW attack vector will you try?"""
+SUGGESTIONS — pick a DIFFERENT endpoint or attack vector:
+1. Switch to an UNTESTED endpoint from the target's endpoint list
+2. Try a completely different vulnerability class:
+   - XSS → IDOR / auth bypass / business logic
+   - SQLi → path traversal / SSRF / SSTI
+   - API testing → file upload / race condition / HTTP verb tampering
+   - Parameter pollution (?param=a&param=b), mass assignment, JWT manipulation
+3. Test admin/internal paths you haven't touched yet
+4. If you genuinely believe all vectors are exhausted, use the done tool
+
+Pick a new target endpoint + attack vector and go."""
 
 
 class AttackPlanner:
@@ -442,7 +443,7 @@ class AttackPlanner:
                     if monitor_msg:
                         self._monitor_triggers += 1
                         logger.info(f"Execution Monitor triggered ({self._monitor_triggers})")
-                        if self._monitor_triggers >= 3:
+                        if self._monitor_triggers >= 5:
                             logger.warning("Attack Planner: too many loop detections, stopping")
                             break
                         result_content.append({
@@ -808,12 +809,12 @@ What do you want to test first?"""
     def _check_for_loops(self) -> str | None:
         """Check if the planner is stuck in a loop."""
         total_actions = sum(self._tool_counter.values())
-        if total_actions < 8:
+        if total_actions < 15:
             return None
 
-        # Check for repeated URLs (same URL hit 4+ times)
+        # Check for repeated URLs (same URL hit 8+ times)
         most_common_url = self._url_counter.most_common(1)
-        if most_common_url and most_common_url[0][1] >= 4:
+        if most_common_url and most_common_url[0][1] >= 8:
             repeated_url = most_common_url[0][0]
             unique_urls = len(self._url_counter)
             return MONITOR_PROMPT.format(
@@ -822,9 +823,9 @@ What do you want to test first?"""
                 unique_urls=unique_urls,
             )
 
-        # Check for repeated tool pattern (same tool 6+ times in a row)
-        recent_tools = [a.get("tool", "?") for a in self._action_log[-6:]]
-        if len(recent_tools) >= 6 and len(set(recent_tools)) == 1:
+        # Check for repeated tool pattern (same tool 10+ times in a row)
+        recent_tools = [a.get("tool", "?") for a in self._action_log[-10:]]
+        if len(recent_tools) >= 10 and len(set(recent_tools)) == 1:
             return MONITOR_PROMPT.format(
                 action_count=total_actions,
                 repeated=f"tool '{recent_tools[0]}' used {len(recent_tools)}x in a row",
