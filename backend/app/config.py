@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # AI - Claude (primary)
     anthropic_api_key: str = ""
-    claude_model: str = "claude-opus-4-6"
+    claude_model: str = "claude-haiku-4-5-20251001"
 
     # AI - Fallback LLMs (used when Claude unavailable)
     deepseek_api_key: str = ""
