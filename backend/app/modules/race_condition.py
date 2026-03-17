@@ -13,7 +13,9 @@ Techniques:
 - Multi-step: GET state → concurrent mutations → verify state drift
 """
 import asyncio
+import json
 import logging
+import re
 import ssl
 import time
 from collections import Counter
@@ -158,11 +160,15 @@ class RaceConditionModule:
         headers = self._build_request_headers()
 
         # Baseline — skip dead endpoints
+        baseline_body = None
+        baseline_length = 0
         try:
             async with make_client(extra_headers=headers) as client:
                 baseline = await client.request(method, url, timeout=10)
                 if baseline.status_code in (404, 405, 502, 503):
                     return []
+                baseline_body = baseline.text
+                baseline_length = len(baseline.content)
         except Exception:
             return []
 
@@ -170,12 +176,66 @@ class RaceConditionModule:
         async with self.rate_limit:
             r = await self._burst_test(url, method, 15, target)
             if r:
-                findings.append(r)
+                r = await self._verify_state_mutation(
+                    url, headers, baseline_body, baseline_length, r, method)
+                if r:
+                    findings.append(r)
         async with self.rate_limit:
             r = await self._last_byte_sync_test(url, method, 10, target)
             if r:
-                findings.append(r)
+                r = await self._verify_state_mutation(
+                    url, headers, baseline_body, baseline_length, r, method)
+                if r:
+                    findings.append(r)
         return findings
+
+    async def _verify_state_mutation(self, url: str, headers: dict,
+                                     baseline_body: str | None,
+                                     baseline_length: int,
+                                     finding: dict, method: str) -> dict | None:
+        """Post-burst: GET the endpoint to check if state actually mutated."""
+        if baseline_body is None:
+            return finding
+
+        try:
+            async with make_client(extra_headers=headers) as client:
+                followup = await client.get(url, timeout=10)
+                followup_body = followup.text
+                followup_length = len(followup.content)
+        except Exception:
+            # Can't verify — keep finding as-is
+            return finding
+
+        state_mutated = False
+        if followup_body != baseline_body:
+            state_mutated = True
+        elif abs(followup_length - baseline_length) > 10:
+            state_mutated = True
+
+        if state_mutated:
+            finding["description"] += (
+                f"\n\nState mutation CONFIRMED: follow-up GET response differs from "
+                f"pre-burst baseline (baseline length={baseline_length}, "
+                f"post-burst length={followup_length}).")
+            finding["proof"] += (
+                f"\nState mutation verified: baseline body length={baseline_length}, "
+                f"post-burst body length={followup_length}")
+            # POST/PUT with state mutation → HIGH minimum
+            if method in ("POST", "PUT", "PATCH") and finding.get("severity") == "medium":
+                finding["severity"] = "high"
+        else:
+            # No state mutation — downgrade
+            if method in ("POST", "PUT", "PATCH"):
+                # Mixed statuses but no state change → medium at best
+                finding["severity"] = "medium"
+                finding["description"] += (
+                    "\n\nNote: No state mutation detected — follow-up GET matched "
+                    "pre-burst baseline. Server may handle concurrency correctly.")
+            else:
+                # GET or other safe methods without state change — skip entirely
+                return None
+
+        return finding
 
     async def _burst_test(self, url: str, method: str, concurrency: int,
                           target: dict) -> dict | None:
@@ -309,14 +369,23 @@ class RaceConditionModule:
             if ratio > 4:
                 has_timing_variance = True
 
-        # 4. Different bodies among successful responses
+        # 4. Different bodies / values among successful responses
         bodies = [r.get("body_preview", "") for r in valid]
         success_bodies = [b for r, b in zip(valid, bodies) if 200 <= r["status"] < 300]
         if len(success_bodies) >= 2:
             unique = set(success_bodies)
             if len(unique) > 1:
-                indicators.append(f"Different response bodies among {len(success_bodies)} "
-                                  f"successful requests ({len(unique)} variants)")
+                # Deep check: look for different dynamic values (IDs, balances, etc.)
+                unique_values = self._extract_unique_values(success_bodies)
+                if unique_values:
+                    indicators.append(
+                        f"Different dynamic values across {len(success_bodies)} "
+                        f"successful responses: {', '.join(unique_values[:5])}")
+                else:
+                    indicators.append(
+                        f"Different response bodies among {len(success_bodies)} "
+                        f"successful requests ({len(unique)} variants)")
+            # All identical bodies — not a race condition signal (no indicator added)
 
         # Timing variance only counts if there is at least one other indicator
         if has_timing_variance and indicators:
@@ -327,6 +396,12 @@ class RaceConditionModule:
         if len(indicators) < 2:
             return None
 
+        # Severity logic:
+        # - POST/PUT with 3+ indicators → HIGH (state mutation verified later)
+        # - POST/PUT with 2 indicators → MEDIUM
+        # - GET endpoints → skip entirely
+        if method == "GET":
+            return None
         severity = target.get("severity", "medium")
         if len(indicators) >= 3 and severity == "medium":
             severity = "high"
@@ -348,6 +423,64 @@ class RaceConditionModule:
             "payload": f"{label}: {len(valid)} concurrent {method} requests",
             "proof": f"Status distribution: {dict(statuses)}\n" + "\n".join(indicators),
         }
+
+    @staticmethod
+    def _extract_unique_values(bodies: list[str]) -> list[str]:
+        """Extract unique dynamic values (IDs, balances, tokens) from response bodies.
+
+        If responses contain different IDs/numbers/tokens, it's strong evidence
+        of a real race condition (e.g., multiple orders created, different balances).
+        Returns a list of descriptions of differing fields.
+        """
+        unique_fields: list[str] = []
+
+        # Try JSON parsing first
+        parsed = []
+        for b in bodies:
+            try:
+                parsed.append(json.loads(b))
+            except (json.JSONDecodeError, TypeError):
+                parsed.append(None)
+
+        if all(isinstance(p, dict) for p in parsed) and len(parsed) >= 2:
+            # Compare JSON keys for value differences
+            all_keys = set()
+            for p in parsed:
+                all_keys.update(p.keys())
+            for key in all_keys:
+                vals = set()
+                for p in parsed:
+                    v = p.get(key)
+                    if v is not None:
+                        vals.add(str(v))
+                if len(vals) > 1:
+                    key_lower = key.lower()
+                    # Prioritize meaningful fields
+                    if any(kw in key_lower for kw in (
+                        "id", "order", "balance", "amount", "total", "credit",
+                        "token", "number", "count", "quantity", "ref", "transaction",
+                    )):
+                        unique_fields.append(f"{key}: {len(vals)} distinct values")
+            return unique_fields
+
+        # Fallback: regex-based extraction for non-JSON responses
+        # Look for numeric IDs, UUIDs, tokens that differ across responses
+        id_pattern = re.compile(
+            r'(?:id|order|ref|token|number|transaction)["\s:=]+["\']?([a-zA-Z0-9_-]{4,})',
+            re.IGNORECASE)
+        for label, pattern in [("dynamic IDs/tokens", id_pattern)]:
+            all_matches: list[set[str]] = []
+            for b in bodies:
+                all_matches.append(set(pattern.findall(b)))
+            # If different responses yield different matched values
+            if len(all_matches) >= 2:
+                union = set().union(*all_matches)
+                if len(union) > 1:
+                    # Check not all responses have the same set
+                    if any(m != all_matches[0] for m in all_matches[1:]):
+                        unique_fields.append(f"{label}: {len(union)} distinct across responses")
+
+        return unique_fields
 
     # ─── Multi-step Race Tests ───────────────────────────────────────────
 

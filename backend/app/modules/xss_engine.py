@@ -322,13 +322,21 @@ class XSSEngine:
         forced_context: str | None,
     ) -> list[dict]:
         findings: list[dict] = []
+        from urllib.parse import unquote
 
         # Step 1 — Send unique probe to detect reflection & context
         probe_resp = await self._send_payload(client, url, param, self._probe, method)
-        if probe_resp is None or self._probe not in probe_resp.text:
-            return findings  # Not reflected at all
+        if probe_resp is None:
+            return findings
+        probe_body = probe_resp.text
+        # Check for reflection in both raw and URL-decoded response
+        if self._probe not in probe_body:
+            probe_body_decoded = unquote(probe_body)
+            if self._probe not in probe_body_decoded:
+                return findings  # Not reflected at all
+            probe_body = probe_body_decoded  # Use decoded body for context detection
 
-        response_body = probe_resp.text
+        response_body = probe_body
         resp_headers = dict(probe_resp.headers)
 
         # Step 2 — Detect all contexts where the probe appears
@@ -499,15 +507,28 @@ class XSSEngine:
     # ------------------------------------------------------------------
     def _is_xss_successful(self, payload: str, body: str, context: str) -> bool:
         """Check if *payload* appears UNESCAPED and in an executable position."""
-        if payload not in body:
+        # Check both exact payload and URL-decoded body for reflection
+        from urllib.parse import unquote
+        body_decoded = unquote(body)
+
+        payload_found = payload in body or payload in body_decoded
+        if not payload_found:
+            # Also check case-insensitive for event handler payloads
+            if payload.lower() in body.lower():
+                payload_found = True
+
+        if not payload_found:
             return False
+
+        # Use the body variant where the payload was found
+        check_body = body if payload in body else body_decoded
 
         # Check that it's not HTML-entity-escaped
         escaped_payload = html_mod.escape(payload)
-        if escaped_payload != payload and escaped_payload in body:
+        if escaped_payload != payload and escaped_payload in check_body:
             # The escaped version exists — check if the raw also exists independently
             # Remove escaped occurrences and see if raw still appears
-            cleaned = body.replace(escaped_payload, "")
+            cleaned = check_body.replace(escaped_payload, "")
             if payload not in cleaned:
                 return False
 
@@ -515,16 +536,16 @@ class XSSEngine:
         for char, encoded in _URL_ESCAPE_MAP.items():
             if char in payload:
                 url_escaped = payload.replace(char, encoded)
-                if url_escaped in body and payload not in body.replace(url_escaped, "PLACEHOLDER"):
+                if url_escaped in check_body and payload not in check_body.replace(url_escaped, "PLACEHOLDER"):
                     return False
 
         # Context-specific verification
         if context in (CTX_ATTR_DOUBLE, CTX_ATTR_SINGLE):
-            return self._verify_attr_breakout(payload, body, context)
+            return self._verify_attr_breakout(payload, check_body, context)
         if context in (CTX_JS_STRING_DQ, CTX_JS_STRING_SQ, CTX_JS_TEMPLATE):
-            return self._verify_js_breakout(payload, body)
+            return self._verify_js_breakout(payload, check_body)
         if context == CTX_COMMENT:
-            return self._verify_comment_breakout(payload, body)
+            return self._verify_comment_breakout(payload, check_body)
 
         # For HTML body / URL / CSS / polyglot — presence of unescaped payload is enough
         # but verify key characters are not individually escaped
@@ -532,9 +553,7 @@ class XSSEngine:
         if context in (CTX_HTML_BODY, "polyglot"):
             for char in critical_chars:
                 if char in payload:
-                    html_esc = _HTML_ESCAPE_MAP.get(char, "")
-                    # Crude check: if only the escaped form appears near payload location
-                    idx = body.find(payload)
+                    idx = check_body.find(payload)
                     if idx == -1:
                         return False
                     # payload is literally present, so chars are not escaped
@@ -624,9 +643,16 @@ class XSSEngine:
     # ------------------------------------------------------------------
     def _extract_evidence(self, payload: str, body: str, window: int = 120) -> str:
         """Extract a snippet of the response around the reflected payload."""
+        from urllib.parse import unquote
         idx = body.find(payload)
         if idx == -1:
-            return "(payload reflected but exact position unclear)"
+            # Try URL-decoded body
+            body_decoded = unquote(body)
+            idx = body_decoded.find(payload)
+            if idx != -1:
+                body = body_decoded
+            else:
+                return "(payload reflected but exact position unclear)"
         start = max(0, idx - window // 2)
         end = min(len(body), idx + len(payload) + window // 2)
         snippet = body[start:end]

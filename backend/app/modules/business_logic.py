@@ -288,10 +288,35 @@ class BusinessLogicTester:
 
         return targets
 
+    @staticmethod
+    def _extract_numbers(text: str) -> list[float]:
+        """Extract all numeric values from response text (prices, totals, etc.)."""
+        # Match integers, decimals, and negative numbers; ignore version-like
+        # patterns (e.g. "1.14.2") by requiring at most one dot.
+        raw = re.findall(r'-?\d+(?:\.\d+)?', text)
+        numbers = []
+        for val in raw:
+            try:
+                numbers.append(float(val))
+            except ValueError:
+                continue
+        return numbers
+
     async def _test_price_endpoint(self, client: httpx.AsyncClient,
                                    target: dict) -> list[dict]:
         findings = []
         url = self._resolve_url(target["url"])
+
+        # --- METHOD VALIDATION ---
+        # Only test price manipulation on endpoints that accept state-changing
+        # methods. Sending POST with price params to GET-only pages is noise.
+        target_method = target.get("method", "GET").upper()
+        if target_method not in ("POST", "PUT", "PATCH"):
+            logger.debug(
+                f"Price test: skipping {url} — method {target_method} is not "
+                f"state-changing"
+            )
+            return findings
 
         # Identify numeric fields
         numeric_fields = []
@@ -317,6 +342,9 @@ class BusinessLogicTester:
             ("-99999999", "large negative number", "high"),
         ]
 
+        # Choose the right HTTP method for sending manipulated requests
+        send_method = target_method  # POST, PUT, or PATCH
+
         for field in numeric_fields[:3]:
             # --- BASELINE REQUEST: send normal value first ---
             baseline_body = {field: "1"}
@@ -327,26 +355,38 @@ class BusinessLogicTester:
 
             try:
                 async with self.semaphore:
-                    baseline_resp = await client.post(url, json=baseline_body)
+                    baseline_resp = await client.request(
+                        send_method, url, json=baseline_body
+                    )
                 baseline_status = baseline_resp.status_code
                 baseline_text = baseline_resp.text[:2000]
                 baseline_ct = (baseline_resp.headers.get("content-type") or "").lower()
             except Exception:
                 continue
 
-            # If baseline returns HTML with no transactional evidence, skip
-            # this endpoint entirely — it's not a real commerce endpoint
+            # --- CONTENT-TYPE GATE ---
+            # HTML responses must contain transactional evidence: form
+            # actions, input fields, or embedded JSON. Pure informational
+            # HTML pages are not commerce endpoints.
             if "text/html" in baseline_ct:
                 baseline_lower = baseline_text.lower()
                 has_transactional = any(
                     ind in baseline_lower for ind in TRANSACTIONAL_INDICATORS
                 )
-                if not has_transactional:
+                has_form = (
+                    "<form" in baseline_lower
+                    or "<input" in baseline_lower
+                    or "application/json" in baseline_lower
+                )
+                if not has_transactional and not has_form:
                     logger.debug(
                         f"Price test: skipping {url} — HTML response with no "
-                        f"transactional indicators"
+                        f"transactional indicators, forms, or embedded JSON"
                     )
                     continue
+
+            # Extract baseline numbers for differential comparison
+            baseline_numbers = self._extract_numbers(baseline_text)
 
             for test_val, desc, severity in test_values:
                 async with self.semaphore:
@@ -358,20 +398,27 @@ class BusinessLogicTester:
                             if fname != field:
                                 body.setdefault(fname, "1")
 
-                        resp = await client.post(url, json=body)
+                        resp = await client.request(
+                            send_method, url, json=body
+                        )
 
                         if resp.status_code in (200, 201, 202):
                             resp_text = resp.text[:2000]
                             resp_ct = (resp.headers.get("content-type") or "").lower()
 
-                            # Skip if response is HTML with no transactional content
+                            # Content-type gate for manipulated response too
                             if "text/html" in resp_ct:
                                 resp_lower = resp_text.lower()
                                 has_transactional = any(
                                     ind in resp_lower
                                     for ind in TRANSACTIONAL_INDICATORS
                                 )
-                                if not has_transactional:
+                                has_form = (
+                                    "<form" in resp_lower
+                                    or "<input" in resp_lower
+                                    or "application/json" in resp_lower
+                                )
+                                if not has_transactional and not has_form:
                                     continue
 
                             # Check for signs the server accepted the value
@@ -384,20 +431,48 @@ class BusinessLogicTester:
                             if not accepted:
                                 continue
 
-                            # --- BASELINE COMPARISON ---
-                            # Responses must differ meaningfully: different
-                            # status code OR body differs by >10%
+                            # --- DIFFERENTIAL RESPONSE ANALYSIS ---
                             status_differs = resp.status_code != baseline_status
+
+                            # If response bodies are identical, the parameter
+                            # is being IGNORED — not a vulnerability
+                            if resp_text == baseline_text and not status_differs:
+                                continue
+
+                            # Extract numbers from manipulated response and
+                            # compare against baseline
+                            manip_numbers = self._extract_numbers(resp_text)
+                            numbers_changed = (
+                                sorted(manip_numbers) != sorted(baseline_numbers)
+                            )
+
+                            # Body size diff as secondary signal
                             body_diff_ratio = (
                                 abs(len(resp_text) - len(baseline_text))
                                 / max(len(baseline_text), 1)
                             )
-                            responses_differ = status_differs or body_diff_ratio > 0.10
 
-                            if not responses_differ:
-                                # Server returned the same response for normal
-                                # and manipulated values — likely ignoring the
-                                # parameter entirely, not a real vuln
+                            # Check if any number went negative (strong signal)
+                            has_negative_number = any(
+                                n < 0 for n in manip_numbers
+                            )
+
+                            # Responses must differ meaningfully:
+                            # (a) different status codes, OR
+                            # (b) numbers changed AND transactional keywords present
+                            resp_lower = resp_text.lower()
+                            has_transactional_kw = any(
+                                ind in resp_lower
+                                for ind in TRANSACTIONAL_INDICATORS
+                            )
+
+                            meaningful_diff = (
+                                status_differs
+                                or (numbers_changed and has_transactional_kw)
+                                or has_negative_number
+                            )
+
+                            if not meaningful_diff:
                                 continue
 
                             # Check if the manipulated value appears in response
@@ -410,12 +485,18 @@ class BusinessLogicTester:
                             )
                             if value_reflected or is_financial:
                                 confidence = 0.85 if value_reflected else 0.6
+                                # Boost confidence when numbers actually changed
+                                if numbers_changed and has_transactional_kw:
+                                    confidence = min(confidence + 0.1, 0.95)
+                                if has_negative_number:
+                                    confidence = min(confidence + 0.1, 0.95)
+
                                 findings.append(self._make_finding(
                                     title=f"Price Manipulation: {desc} accepted "
                                           f"for '{field}'",
                                     severity=severity,
                                     url=url,
-                                    method="POST",
+                                    method=send_method,
                                     parameter=field,
                                     description=(
                                         f"The endpoint accepted {desc} ({test_val}) "
@@ -424,7 +505,10 @@ class BusinessLogicTester:
                                         f"Response status: {resp.status_code}. "
                                         f"Baseline comparison: status "
                                         f"{baseline_status}, body size diff "
-                                        f"{body_diff_ratio:.0%}."
+                                        f"{body_diff_ratio:.0%}, "
+                                        f"numbers changed: {numbers_changed}, "
+                                        f"negative in response: "
+                                        f"{has_negative_number}."
                                     ),
                                     impact=(
                                         "Attackers could manipulate prices, "
@@ -441,12 +525,16 @@ class BusinessLogicTester:
                                     ),
                                     payload_used=json.dumps(body),
                                     confidence=confidence,
-                                    request_data={"body": body, "method": "POST"},
+                                    request_data={
+                                        "body": body, "method": send_method,
+                                    },
                                     response_data={
                                         "status": resp.status_code,
                                         "snippet": resp_text[:500],
                                         "baseline_status": baseline_status,
                                         "body_diff_ratio": round(body_diff_ratio, 3),
+                                        "numbers_changed": numbers_changed,
+                                        "has_negative": has_negative_number,
                                     },
                                 ))
                                 break  # One finding per field is enough

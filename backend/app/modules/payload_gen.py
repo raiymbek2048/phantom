@@ -506,6 +506,7 @@ class PayloadGenerator:
                 _DISCOVERY_PROBES = {
                     "xss": [
                         "<script>alert(1)</script>",
+                        "<img src=x onerror=alert(1)>",
                         '"onmouseover="alert(1)',
                         "{{7*7}}",
                     ],
@@ -515,14 +516,23 @@ class PayloadGenerator:
                         "1 AND 1=1",
                     ],
                 }
+                # Common param names to try when endpoint has no known params
+                _DISCOVERY_PARAMS = [
+                    "q", "search", "query", "s", "keyword", "id", "name",
+                    "input", "text", "value", "message", "comment", "data",
+                ]
                 probes = _DISCOVERY_PROBES.get(vuln_type, [])
-                for ep in probe_candidates[:10]:
+                for ep in probe_candidates[:15]:
+                    ep_params = ep.get("params", [])
+                    # If endpoint has no params, inject common ones
+                    if not ep_params:
+                        ep_params = _DISCOVERY_PARAMS[:6]
                     for probe in probes:
                         payloads.append({
                             "vuln_type": vuln_type,
                             "payload": probe,
                             "target_url": ep.get("url"),
-                            "params": ep.get("params", []),
+                            "params": ep_params,
                             "method": "GET",
                             "discovery_probe": True,
                         })
@@ -851,6 +861,24 @@ class PayloadGenerator:
         if vuln_type == "xss" and any(url.split("?")[0].endswith(ext) for ext in self._XSS_EXTENSIONS):
             return True
 
+        # For XSS: modern web apps often have clean URLs that still accept params
+        # Include pages with path segments that suggest dynamic content
+        if vuln_type == "xss":
+            _XSS_PATH_KEYWORDS = [
+                "/blog", "/post", "/article", "/news", "/product", "/item",
+                "/shop", "/store", "/catalog", "/view", "/detail", "/show",
+                "/page", "/category", "/tag", "/user", "/profile", "/account",
+                "/feedback", "/review", "/forum", "/thread", "/topic",
+                "/help", "/faq", "/support", "/about", "/pricing",
+            ]
+            if any(kw in url for kw in _XSS_PATH_KEYWORDS):
+                return True
+            # Any page with at least 2 path segments (not just /) is worth testing
+            path = url.split("?")[0].rstrip("/")
+            segments = [s for s in path.split("/") if s and not s.startswith("http")]
+            if len(segments) >= 2:
+                return True
+
         return False
 
     def _get_endpoints_for_vuln(self, vuln_type: str, endpoints: list[dict]) -> list[dict]:
@@ -878,6 +906,35 @@ class PayloadGenerator:
                         if self._is_injectable_page(e, vuln_type):
                             matched_urls.add(e.get("url", ""))
                             matched.append(e)
+
+            # Tertiary (XSS only): ALL page endpoints — modern SPAs reflect via
+            # query params even without file extensions. Add common injectable params
+            # so _test_payload has injection points.
+            if vuln_type == "xss":
+                _STATIC_EXTS = (
+                    ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                    ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".pdf",
+                    ".zip", ".gz", ".tar", ".mp4", ".mp3",
+                )
+                _XSS_INJECT_PARAMS = ["q", "search", "query", "s", "id", "name"]
+                for e in endpoints:
+                    url = e.get("url", "")
+                    if url in matched_urls:
+                        continue
+                    ep_type = e.get("type", "")
+                    if ep_type in ("static", "sensitive"):
+                        continue
+                    if any(url.lower().split("?")[0].endswith(ext) for ext in _STATIC_EXTS):
+                        continue
+                    # Skip login/logout
+                    if any(kw in url.lower() for kw in ("login", "logout", "signin", "signup")):
+                        continue
+                    matched_urls.add(url)
+                    # Add common params so _test_payload has injection points
+                    enriched = dict(e)
+                    if not enriched.get("params"):
+                        enriched["params"] = _XSS_INJECT_PARAMS
+                    matched.append(enriched)
 
             # Prioritize: forms first, then parameterized, then others
             matched.sort(key=lambda e: (0 if e.get("type") == "form" else 1))

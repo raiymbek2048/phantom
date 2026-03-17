@@ -200,9 +200,23 @@ class VulnerabilityScanner:
         """Lightweight probe of parameterized URLs for reflection (XSS) and SQL errors.
 
         Not a full exploit — just signals to flag endpoints for deeper testing.
-        Tests at most 30 endpoints with 1 payload each.
+        Tests parameterized endpoints AND discovers params on page endpoints.
         """
         findings = []
+
+        # Common injectable parameter names for probing pages without known params
+        _COMMON_PARAMS = [
+            "q", "search", "query", "s", "keyword", "term", "id", "name",
+            "input", "text", "value", "comment", "message", "title", "content",
+            "data", "redirect", "url", "next", "return", "ref", "page", "lang",
+            "sort", "order", "filter", "category", "type", "action",
+        ]
+
+        _STATIC_EXTS = (
+            ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+            ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".pdf",
+            ".zip", ".gz", ".tar", ".mp4", ".mp3",
+        )
 
         # Collect endpoints that have query parameters
         param_endpoints = []
@@ -213,8 +227,23 @@ class VulnerabilityScanner:
             if params and parsed.scheme in ("http", "https"):
                 param_endpoints.append((url, parsed, params))
 
-        if not param_endpoints:
-            return findings
+        # Collect page endpoints WITHOUT params for discovery probing
+        page_endpoints = []
+        seen_urls = {t[0] for t in param_endpoints}
+        for ep in endpoints:
+            url = ep.get("url", "") if isinstance(ep, dict) else str(ep)
+            if url in seen_urls:
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            if any(url.lower().split("?")[0].endswith(ext) for ext in _STATIC_EXTS):
+                continue
+            ep_type = ep.get("type", "") if isinstance(ep, dict) else ""
+            if ep_type in ("static", "sensitive"):
+                continue
+            page_endpoints.append((url, parsed))
+            seen_urls.add(url)
 
         marker = f"ph4nt0m{secrets.token_hex(4)}"
 
@@ -294,14 +323,88 @@ class VulnerabilityScanner:
 
                     return results
 
+            async def _discover_params(url: str, parsed):
+                """Probe a page endpoint with common param names to find reflection."""
+                async with sem:
+                    results = []
+                    xss_payload = f'{marker}<"\'>'
+                    for param in _COMMON_PARAMS:
+                        try:
+                            probe_url = f"{url}{'&' if '?' in url else '?'}{param}={marker}%3C%22%27%3E"
+                            resp = await client.get(probe_url, timeout=8)
+                            body = resp.text
+                            if resp.status_code != 200:
+                                continue
+                            if marker in body:
+                                # Found reflection — check if HTML chars are unescaped
+                                reflects_html = f'{marker}<' in body or f'{marker}"' in body or f"{marker}'" in body
+                                if reflects_html:
+                                    results.append({
+                                        "source": "param_probe",
+                                        "name": f"Reflected XSS candidate: {param} on {parsed.path}",
+                                        "severity": "medium",
+                                        "url": f"{url}?{param}=test",
+                                        "type": "xss",
+                                        "parameter": param,
+                                        "details": "Discovered reflecting param via common-name probing",
+                                    })
+                                    break  # Found one reflecting param, enough for signaling
+                                else:
+                                    # Reflected but encoded — still useful signal for deeper testing
+                                    results.append({
+                                        "source": "param_probe",
+                                        "name": f"Reflected param (encoded): {param} on {parsed.path}",
+                                        "severity": "low",
+                                        "url": f"{url}?{param}=test",
+                                        "type": "xss",
+                                        "parameter": param,
+                                        "details": "Param reflected with encoding — test context-aware payloads",
+                                    })
+                                    break
+                        except Exception:
+                            continue
+
+                    # Also try SQL error on the first discovered param
+                    if results:
+                        disc_param = results[0]["parameter"]
+                        try:
+                            sqli_url = f"{url}?{disc_param}=1%27%22"
+                            resp = await client.get(sqli_url, timeout=8)
+                            body_lower = resp.text.lower()
+                            for err in sql_errors:
+                                if err in body_lower:
+                                    results.append({
+                                        "source": "param_probe",
+                                        "name": f"SQL error triggered: {disc_param} on {parsed.path}",
+                                        "severity": "high",
+                                        "url": f"{url}?{disc_param}=test",
+                                        "type": "sqli",
+                                        "parameter": disc_param,
+                                        "details": f"SQL error pattern: {err}",
+                                    })
+                                    break
+                        except Exception:
+                            pass
+                    return results
+
+            # Phase 1: Probe existing parameterized endpoints
             tasks = [
                 _probe_one(url, parsed, params)
                 for url, parsed, params in param_endpoints[:30]
             ]
+            # Phase 2: Discover params on page endpoints
+            tasks.extend([
+                _discover_params(url, parsed)
+                for url, parsed in page_endpoints[:40]
+            ])
+
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, list):
                     findings.extend(r)
 
-        logger.info(f"Quick param probe: {len(param_endpoints[:30])} endpoints tested, {len(findings)} signals found")
+        logger.info(
+            f"Quick param probe: {len(param_endpoints[:30])} param endpoints + "
+            f"{len(page_endpoints[:40])} page endpoints probed, {len(findings)} signals found"
+        )
         return findings
