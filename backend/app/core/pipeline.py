@@ -299,6 +299,7 @@ class ScanPipeline:
         conditions = [
             Vulnerability.target_id == vuln.target_id,
             Vulnerability.vuln_type == vuln.vuln_type,
+            Vulnerability.scan_id == vuln.scan_id,
         ]
         # Match on normalized URL path
         if norm_url:
@@ -306,13 +307,13 @@ class ScanPipeline:
             url_path = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
             conditions.append(Vulnerability.url.like(f"{url_path}%"))
 
-        # First check: same URL path + same type (regardless of parameter)
+        # Dedup within same scan: same URL path + same type
         # This catches duplicate findings like 8 XSS on same endpoint with different payloads
         existing = await db.execute(
             select(Vulnerability.id).where(and_(*conditions)).limit(1)
         )
         if existing.scalar_one_or_none():
-            return None  # Duplicate — skip
+            return None  # Duplicate within this scan — skip
 
         # Business logic conceptual dedup: same normalized title = same finding
         # even on different URLs (e.g. "Price Manipulation" on /order vs /checkout)

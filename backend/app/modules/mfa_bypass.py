@@ -231,11 +231,17 @@ class MFABypassModule:
         found = []
         # Check if auth_attack found working credentials
         scan_results = context.get("scan_results", {})
+        if not isinstance(scan_results, dict):
+            scan_results = {}
         auth_results = scan_results.get("auth_attack", [])
+        if not isinstance(auth_results, list):
+            auth_results = [auth_results] if isinstance(auth_results, dict) else []
 
         working_creds = None
-        for r in auth_results if isinstance(auth_results, list) else []:
-            if isinstance(r, dict) and "Default credentials work" in r.get("title", ""):
+        for r in auth_results:
+            if not isinstance(r, dict):
+                continue
+            if "Default credentials work" in r.get("title", ""):
                 payload = r.get("payload", "")
                 if "=" in payload:
                     parts = payload.split("&")

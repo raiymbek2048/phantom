@@ -347,7 +347,9 @@ class IDOREngine:
         """
         base_url = context.get("base_url", f"https://{context.get('domain', '')}")
         auth_cookie = context.get("auth_cookie")
-        harvested_ids: dict[str, list[str]] = context.get("harvested_ids") or {}
+        harvested_ids: dict[str, list[str]] = self._normalize_harvested_ids(
+            context.get("harvested_ids") or {}
+        )
 
         headers = self._build_headers(auth_cookie)
         classified = self.classify_endpoints(endpoints, base_url)
@@ -1507,6 +1509,33 @@ class IDOREngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_harvested_ids(raw: dict) -> dict[str, list[str]]:
+        """Normalize IDHarvester.to_dict() format into {category: [str, ...]}.
+
+        IDHarvester.to_dict() returns keys like "numeric", "uuid", "slug",
+        "email", "by_endpoint".  The "by_endpoint" value is a dict of dicts,
+        not a list, so slicing it (``ids[:10]``) raises a TypeError.
+        This method flattens everything into lists of strings.
+        """
+        normalized: dict[str, list[str]] = {}
+        for key, value in raw.items():
+            if isinstance(value, list):
+                # "numeric", "uuid", "slug", "email" — already lists
+                normalized[key] = [str(v) for v in value]
+            elif isinstance(value, dict):
+                # "by_endpoint" — extract the "ids" lists from each endpoint
+                for _ep_key, ep_val in value.items():
+                    if isinstance(ep_val, dict) and "ids" in ep_val:
+                        ids = [str(v) for v in ep_val["ids"]]
+                        normalized.setdefault(key, [])
+                        normalized[key].extend(ids)
+                    elif isinstance(ep_val, list):
+                        normalized.setdefault(key, [])
+                        normalized[key].extend(str(v) for v in ep_val)
+            # Skip anything else (unexpected types)
+        return normalized
 
     @staticmethod
     def _build_headers(auth_cookie: str | None) -> dict:
