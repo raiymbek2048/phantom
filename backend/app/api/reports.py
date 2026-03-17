@@ -425,9 +425,17 @@ def _lookup_cwe(vuln_type_str: str) -> tuple:
     vt = vuln_type_str.lower()
     if vt in VULN_TYPE_CWE:
         return VULN_TYPE_CWE[vt]
+    # Try prefix match: xss_stored -> xss, sqli_blind -> sqli
     short = vt.split("_")[0]
     if short in VULN_TYPE_CWE:
         return VULN_TYPE_CWE[short]
+    # Try joining first two parts: cors_misconfiguration
+    if "_" in vt:
+        parts = vt.split("_")
+        for i in range(len(parts), 0, -1):
+            candidate = "_".join(parts[:i])
+            if candidate in VULN_TYPE_CWE:
+                return VULN_TYPE_CWE[candidate]
     return ("N/A", "N/A")
 
 
@@ -440,67 +448,142 @@ def _lookup_cvss(severity_str: str, vuln_type_str: str = "") -> dict:
 
 
 def _generate_repro_steps(vuln, vuln_type: str, payload: str) -> list[str]:
-    """Generate step-by-step reproduction instructions."""
+    """Generate step-by-step reproduction instructions with exact details."""
     url = vuln.url or "TARGET_URL"
     method = vuln.method or "GET"
     param = vuln.parameter or ""
     steps = []
 
-    if vuln_type == "xss":
-        steps.append(f"Open {url} in a browser or send a {method} request")
-        if param:
-            steps.append(f"Set the parameter '{param}' to the XSS payload: {payload}" if payload else f"Inject a script payload into the '{param}' parameter")
-        steps.append("Observe that the payload is reflected in the response without encoding")
-        steps.append("Verify script execution in the browser DOM/console")
-    elif vuln_type == "sqli":
-        steps.append(f"Send a {method} request to {url}")
-        if param:
-            steps.append(f"Inject SQL payload into '{param}': {payload}" if payload else f"Inject a single quote (') into '{param}'")
-        steps.append("Observe SQL error message or modified response behavior")
-        steps.append("Compare response with a normal request to confirm injection")
+    if vuln_type in ("xss", "xss_reflected", "xss_stored", "xss_dom"):
+        steps.append(f"Open a browser or HTTP client and send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to the XSS payload: {payload}")
+        elif param:
+            steps.append(f"Inject a script payload (e.g., <script>alert(document.domain)</script>) into the '{param}' parameter")
+        elif payload:
+            steps.append(f"Inject the payload: {payload}")
+        steps.append("Submit the request and observe that the payload is reflected in the response HTML without encoding")
+        steps.append("Open browser DevTools (F12) > Console tab and verify JavaScript execution")
+    elif vuln_type in ("sqli", "sqli_blind"):
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to the SQL payload: {payload}")
+        elif param:
+            steps.append(f"Inject a single quote (') into the '{param}' parameter")
+        steps.append("Observe SQL error messages, time-based delays, or different response behavior compared to a normal request")
+        steps.append("Compare the response with param=1 (normal) vs param=1' (injected) to confirm behavioral difference")
     elif vuln_type == "idor":
-        steps.append(f"Authenticate as User A and access {url}")
-        steps.append("Note the object ID in the request")
-        steps.append("Change the ID to another user's resource ID")
-        steps.append("Observe that User B's data is returned without authorization check")
+        steps.append(f"Authenticate as User A and send a {method} request to: {url}")
+        steps.append("Note the object ID/reference in the URL or request body")
+        steps.append("Change the ID to another user's resource (e.g., increment by 1, or use a known different user's ID)")
+        steps.append("Observe that User B's data is returned — the server performs no authorization check on the resource owner")
     elif vuln_type == "ssrf":
-        steps.append(f"Send a {method} request to {url}")
-        steps.append(f"Supply an internal URL as the payload: {payload}" if payload else "Supply an internal/cloud metadata URL as the parameter value")
-        steps.append("Observe that the server fetches the internal resource and returns its contents")
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to: {payload}")
+        else:
+            steps.append("Supply an internal URL (e.g., http://169.254.169.254/latest/meta-data/) as the URL parameter value")
+        steps.append("Observe that the server fetches the internal resource and returns its contents in the response")
+        steps.append("Verify internal/cloud metadata data in the response body")
     elif vuln_type == "auth_bypass":
-        steps.append(f"Send a {method} request to {url} without authentication credentials")
+        steps.append(f"Send a {method} request to: {url} WITHOUT authentication credentials (no Cookie, no Authorization header)")
         if payload:
             steps.append(f"Apply the bypass technique: {payload}")
         steps.append("Observe that the protected resource is accessible without valid authentication")
+        steps.append("Compare response with and without authentication — both return the same sensitive data")
+    elif vuln_type in ("lfi", "path_traversal"):
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to: {payload}")
+        else:
+            steps.append("Inject a path traversal payload (e.g., ../../../../etc/passwd) into the file/path parameter")
+        steps.append("Observe the contents of the local file (e.g., /etc/passwd) in the response")
+        steps.append("Verify that the response contains system file contents (root:x:0:0:...)")
+    elif vuln_type == "ssti":
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to the template expression: {payload}")
+        else:
+            steps.append("Inject a template expression (e.g., {{7*7}}) into the vulnerable parameter")
+        steps.append("Observe that the expression is evaluated server-side (e.g., '49' appears in the response)")
+        steps.append("Escalate to code execution payload to confirm full SSTI (e.g., __import__('os').popen('id').read())")
+    elif vuln_type in ("cmd_injection", "rce"):
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to: {payload}")
+        else:
+            steps.append("Inject an OS command (e.g., ;id or |whoami) into the vulnerable parameter")
+        steps.append("Observe command output (e.g., uid=, username) in the response body")
+        steps.append("Inject a unique marker command (e.g., echo UNIQUE_STRING) and verify it appears in the response")
+    elif vuln_type == "csrf":
+        steps.append(f"As an authenticated user, note your session cookie")
+        steps.append(f"Create an HTML page with a form that auto-submits a {method} request to: {url}")
+        steps.append("Host the malicious page on attacker.com and visit it while logged into the target")
+        steps.append("Observe that the state-changing action is performed without any CSRF token validation")
     elif vuln_type in ("misconfiguration", "info_disclosure"):
-        steps.append(f"Send a {method} request to {url}")
+        steps.append(f"Send a {method} request to: {url}")
         steps.append("Examine the response headers and body")
-        steps.append("Note the misconfigured/exposed information in the response")
+        steps.append("Note the exposed sensitive information (internal paths, API keys, stack traces, server versions, etc.)")
+        steps.append("Verify the information can be leveraged for further attacks")
+    elif vuln_type == "cors":
+        steps.append(f"Send a {method} request to: {url} with header: Origin: https://attacker.com")
+        steps.append("Observe the response contains: Access-Control-Allow-Origin: https://attacker.com")
+        steps.append("Verify Access-Control-Allow-Credentials: true is also present")
+        steps.append("This allows attacker.com to read authenticated responses cross-origin")
+    elif vuln_type == "open_redirect":
+        steps.append(f"Send a {method} request to: {url}")
+        if param and payload:
+            steps.append(f"Set the '{param}' parameter to: {payload}")
+        else:
+            steps.append("Set the redirect/url/next parameter to an attacker-controlled domain (e.g., https://evil.com)")
+        steps.append("Observe a 3xx redirect to the attacker-controlled URL")
+        steps.append("This can be used for phishing or OAuth token theft")
+    elif vuln_type == "file_upload":
+        steps.append(f"Navigate to the file upload form at: {url}")
+        steps.append("Upload a file with a dangerous extension (e.g., shell.php, shell.jsp) containing a webshell or reverse shell")
+        steps.append("Note the uploaded file location from the response")
+        steps.append("Access the uploaded file URL and verify code execution")
     else:
-        steps.append(f"Send a {method} request to {url}")
+        steps.append(f"Send a {method} request to: {url}")
         if payload:
             steps.append(f"Use the following payload: {payload}")
         if param:
-            steps.append(f"Target parameter: {param}")
+            steps.append(f"Target the '{param}' parameter")
         steps.append("Observe the vulnerability in the server response")
 
-    steps.append("Use the cURL command below to reproduce programmatically")
+    steps.append("Use the cURL command in the Proof of Concept section to reproduce programmatically")
     return steps
 
 
 def _get_default_remediation(vuln_type: str) -> str:
-    """Get default remediation advice."""
+    """Get default remediation advice with specific technical fixes."""
     remediations = {
-        "xss": "Implement output encoding (HTML entity, JS, URL encoding as appropriate). Deploy Content Security Policy (CSP) headers. Use framework auto-escaping. Validate and sanitize all user input server-side.",
-        "sqli": "Use parameterized queries (prepared statements) for all database operations. Never concatenate user input into SQL. Apply least privilege to database accounts. Use an ORM with parameterized queries.",
-        "ssrf": "Implement URL allowlists for outbound requests. Validate and sanitize all URL inputs. Block requests to internal IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x). Disable unnecessary URL schemes.",
-        "idor": "Implement authorization checks on every object access. Verify the authenticated user has permission to access the requested resource. Use indirect references (UUIDs) instead of sequential IDs.",
-        "auth_bypass": "Implement proper authentication verification on every protected endpoint. Use established authentication frameworks. Enforce MFA. Validate tokens server-side on every request.",
-        "info_disclosure": "Remove sensitive data from responses. Use DTOs to control output fields. Disable debug mode and verbose errors in production. Remove server version headers.",
-        "misconfiguration": "Review and harden server configuration per CIS benchmarks. Implement security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options). Remove default credentials and unnecessary features.",
-        "cmd_injection": "Never pass user input to system commands. Use language-native APIs instead of shell commands. If unavoidable, use strict allowlist validation and parameterized command execution.",
-        "path_traversal": "Validate file paths against an allowlist. Use chroot or sandboxed file access. Resolve canonical paths and verify they stay within the intended directory.",
-        "cors": "Configure Access-Control-Allow-Origin to specific trusted domains only. Never reflect arbitrary origins. Do not combine wildcard origins with credentials.",
+        "xss": "Implement output encoding (HTML entity, JS, URL encoding as appropriate). Deploy a strict Content Security Policy (CSP) header. Use framework auto-escaping (React JSX, Django templates, Go html/template). Validate and sanitize all user input server-side.",
+        "sqli": "Use parameterized queries (prepared statements) for all database operations. Example: `cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))`. Never concatenate user input into SQL. Apply least privilege to database accounts.",
+        "ssrf": "Implement URL allowlists for outbound requests. Validate and sanitize all URL inputs. Block requests to internal IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.169.254). Disable file://, gopher://, dict:// schemes.",
+        "idor": "Implement authorization checks on every object access. Verify the authenticated user has permission to access the requested resource. Use indirect references (UUIDs) instead of sequential IDs. Example: `if resource.owner_id != current_user.id: return 403`.",
+        "auth_bypass": "Implement proper authentication verification on every protected endpoint. Use established authentication frameworks. Enforce MFA. Validate tokens server-side on every request. Add authentication middleware to all protected routes.",
+        "info_disclosure": "Remove sensitive data from responses. Use DTOs to control output fields. Disable debug mode and verbose errors in production. Remove server version headers (Server, X-Powered-By). Sanitize error responses.",
+        "misconfiguration": "Review and harden server configuration per CIS benchmarks. Implement security headers: Content-Security-Policy, Strict-Transport-Security, X-Frame-Options: DENY, X-Content-Type-Options: nosniff. Remove default credentials.",
+        "cmd_injection": "Never pass user input to system commands. Use language-native APIs instead of shell commands. If unavoidable, use strict allowlist validation. Example: `subprocess.run(['command', arg], shell=False)` instead of `os.system(f'command {user_input}')`.",
+        "rce": "Eliminate code execution paths from user input. Use sandboxed execution environments. Apply the principle of least privilege to application processes. Disable dangerous functions (eval, exec, system).",
+        "path_traversal": "Validate file paths against an allowlist. Use chroot or sandboxed file access. Resolve canonical paths and verify they stay within the intended directory. Example: `realpath = os.path.realpath(path); assert realpath.startswith(ALLOWED_DIR)`.",
+        "cors": "Configure Access-Control-Allow-Origin to specific trusted domains only. Never reflect arbitrary origins. Do not combine wildcard origins with Access-Control-Allow-Credentials: true.",
+        "lfi": "Validate file paths against a strict allowlist. Never pass user input directly to file system operations. Disable PHP wrappers (allow_url_include=Off). Use a file ID mapping instead of direct paths.",
+        "ssti": "Never pass user input directly into template strings. Use sandboxed template rendering. Prefer logic-less templates (Mustache, Handlebars). Apply strict input validation. Example: use `render_template('page.html', name=user_input)` instead of `render_template_string(user_input)`.",
+        "csrf": "Implement anti-CSRF tokens for all state-changing operations. Set `SameSite=Strict` or `SameSite=Lax` on session cookies. Verify Origin/Referer headers. Use framework-provided CSRF middleware.",
+        "xxe": "Disable external entity processing in XML parsers. Example (Python): `parser = etree.XMLParser(resolve_entities=False, no_network=True)`. Use JSON instead of XML where possible.",
+        "deserialization": "Avoid deserializing untrusted data. Use safe serialization formats (JSON). Implement integrity checks (HMAC) on serialized objects. Use allowlist-based deserialization filters.",
+        "open_redirect": "Validate redirect URLs against an allowlist of trusted domains. Use relative paths instead of full URLs. Never use user input directly in Location headers. Example: `if not is_safe_url(redirect_url): redirect_url = '/'`.",
+        "file_upload": "Validate file type using magic bytes (not just extension). Store uploads outside the webroot. Use a CDN or separate domain for serving uploads. Scan for malware. Randomize filenames.",
+        "subdomain_takeover": "Remove dangling DNS records pointing to deprovisioned services. Monitor DNS records regularly. Implement subdomain inventory management.",
+        "race_condition": "Use database-level locking (SELECT FOR UPDATE) or atomic operations. Implement idempotency keys. Use Redis distributed locks for critical sections.",
+        "mass_assignment": "Use allowlists to define which fields can be set by user input. Never pass raw request data to model updates. Example: `user.update(name=data['name'])` instead of `user.update(**data)`.",
+        "request_smuggling": "Normalize HTTP parsing between frontend and backend. Reject ambiguous requests with both Content-Length and Transfer-Encoding. Use HTTP/2 end-to-end.",
+        "cache_poisoning": "Include all inputs that affect response content in the cache key. Validate Host and X-Forwarded-Host headers. Use Vary headers appropriately.",
+        "account_enumeration": "Return identical responses for valid and invalid usernames. Use generic error messages ('Invalid credentials'). Implement rate limiting and CAPTCHA.",
+        "mfa_bypass": "Implement MFA checks server-side before granting session access. Rate-limit MFA attempts. Invalidate MFA sessions on suspicious activity. Do not expose MFA state in client-side code.",
+        "business_logic": "Implement server-side validation for all business rules. Do not rely on client-side controls. Add monitoring for anomalous transactions. Enforce rate limits on sensitive operations.",
     }
     return remediations.get(vuln_type, "Review and fix the identified vulnerability following OWASP guidelines for this vulnerability type. Implement input validation, output encoding, and proper access controls.")
 

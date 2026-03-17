@@ -15,7 +15,7 @@ from app.ai.llm_engine import LLMEngine, LLMError
 from app.models.vulnerability import Vulnerability
 from app.models.knowledge import KnowledgePattern
 from app.models.target import Target
-from app.modules.hackerone_report import VULN_TYPE_TO_CWE
+from app.modules.hackerone_report import VULN_TYPE_TO_CWE, VULN_TYPE_CVSS, _cvss_rating, _get_owasp_reference
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,12 @@ class H1ReportGenerator:
         """Use Claude to generate a professional H1 report."""
         vuln_type = vuln.vuln_type.value
         cwe_info = VULN_TYPE_TO_CWE.get(vuln_type, {"cwe": "CWE-0", "name": vuln_type})
+        cvss_type = VULN_TYPE_CVSS.get(vuln_type)
+        cvss_score = vuln.cvss_score or (cvss_type["score"] if cvss_type else None)
+        cvss_vector = cvss_type["vector"] if cvss_type else "N/A"
+        cvss_rating_str = _cvss_rating(cvss_score) if cvss_score else "Unknown"
+        cwe_num = cwe_info["cwe"].split("-")[1] if "-" in cwe_info["cwe"] else "0"
+        owasp_ref = _get_owasp_reference(vuln_type)
 
         # RAG: Query knowledge base for similar high-bounty reports
         rag_context = ""
@@ -113,8 +119,8 @@ class H1ReportGenerator:
 
 VULNERABILITY DATA:
 - Type: {cwe_info['name']} ({cwe_info['cwe']})
-- Severity: {vuln.severity.value}
-- CVSS: {vuln.cvss_score or 'not calculated'}
+- Severity: {vuln.severity.value} (CVSS: {cvss_score or 'N/A'}, {cvss_rating_str})
+- CVSS Vector: {cvss_vector}
 - URL: {vuln.url}
 - Method: {vuln.method or 'GET'}
 - Parameter: {vuln.parameter or 'N/A'}
@@ -132,23 +138,29 @@ RESPONSE SNIPPET:
 
 Generate a JSON with these fields:
 {{
-    "title": "Clear, specific title (e.g., 'Stored XSS in comment field on /blog/post allows session hijacking')",
-    "summary": "2-3 sentence summary explaining the vulnerability and its business impact",
-    "severity_justification": "Why this severity rating is appropriate",
-    "steps_to_reproduce": ["Step 1...", "Step 2...", "Step 3...", "Step 4..."],
-    "impact": "Detailed impact statement — what can an attacker actually achieve? Be specific.",
-    "poc_description": "Narrative description of the proof of concept",
-    "curl_command": "curl command to reproduce (if applicable)",
-    "remediation": "Specific technical remediation advice",
-    "references": ["relevant URLs, CVEs, or OWASP references"],
-    "additional_notes": "Any extra context that strengthens the report"
+    "title": "Clear, specific title (e.g., 'Stored XSS in comment field on /blog/post via `message` parameter allows session hijacking')",
+    "summary": "2-3 sentence summary: what the vuln is, where it is (exact URL + param), and what an attacker achieves",
+    "severity_justification": "Why this severity ({vuln.severity.value}) and CVSS ({cvss_score}) is appropriate — reference confidentiality/integrity/availability impact",
+    "steps_to_reproduce": [
+        "Step 1: exact URL to visit or request to send (include full URL with parameters)",
+        "Step 2: exact payload to inject, which parameter, which field",
+        "Step 3: what to observe in response (status code, specific string in body, behavior change)",
+        "Step 4: how to verify exploitation succeeded (check DOM, check DB, check logs)"
+    ],
+    "impact": "Detailed impact: what EXACTLY can an attacker do? (e.g., 'steal admin session cookie and access /admin/users to exfiltrate all user records including emails and password hashes'). Be concrete, not theoretical.",
+    "poc_description": "Narrative of the PoC: what was sent, what was received, what it proves. Reference specific HTTP status codes, response strings, or behavioral changes.",
+    "curl_command": "Complete, working curl command with all headers and payload. Example: curl -s -X POST 'https://target/endpoint' -H 'Content-Type: application/json' -d '{{\"param\":\"payload\"}}'",
+    "remediation": "Specific technical fix with code example where applicable (e.g., 'Use parameterized queries: cursor.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))')",
+    "references": ["https://cwe.mitre.org/data/definitions/{cwe_num}.html", "relevant OWASP link", "relevant CVEs if any"],
+    "additional_notes": "Any extra context: WAF bypass technique used, chain potential, similar vulns on other endpoints"
 }}
 
-IMPORTANT:
-- Be specific, not generic. Reference the actual URL, parameter, and payload.
-- The impact must describe real-world consequences, not just theoretical risk.
-- Steps to reproduce must be clear enough for a triager to follow.
-- Don't be verbose — quality over quantity.
+CRITICAL REQUIREMENTS:
+- Be SPECIFIC: reference the actual URL, parameter, and payload — never use generic placeholders.
+- Steps to reproduce must be copy-pasteable by a triager who knows nothing about the target.
+- The curl_command must be complete and working (include auth headers if the vuln requires auth).
+- Impact must describe real-world consequences with concrete examples (data types exposed, actions possible).
+- Remediation must include at least one code example or specific configuration change.
 {rag_context}
 Respond with ONLY the JSON."""
 
@@ -180,7 +192,12 @@ Respond with ONLY the JSON."""
         steps = report_data.get("steps_to_reproduce", [])
         steps_md = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
         refs = report_data.get("references", [])
-        refs_md = "\n".join(f"- {r}" for r in refs) if refs else ""
+        # Always include CWE and OWASP references
+        default_refs = [f"https://cwe.mitre.org/data/definitions/{cwe_num}.html"]
+        if owasp_ref:
+            default_refs.append(owasp_ref)
+        all_refs = list(dict.fromkeys(refs + default_refs))  # dedupe preserving order
+        refs_md = "\n".join(f"- {r}" for r in all_refs) if all_refs else ""
         curl = report_data.get("curl_command", "")
         additional = report_data.get("additional_notes", "")
 
@@ -188,11 +205,18 @@ Respond with ONLY the JSON."""
 
 {report_data.get('summary', vuln.description or '')}
 
-## Vulnerability Type
+## Vulnerability Details
 
-- **Type**: {cwe_info['name']}
-- **CWE**: {cwe_info['cwe']}
-- **Severity**: {vuln.severity.value.capitalize()}{f' (CVSS {vuln.cvss_score})' if vuln.cvss_score else ''}
+| Field | Value |
+|-------|-------|
+| **Type** | {cwe_info['name']} |
+| **CWE** | [{cwe_info['cwe']}](https://cwe.mitre.org/data/definitions/{cwe_num}.html) |
+| **Severity** | {vuln.severity.value.capitalize()} |
+| **CVSS Score** | {cvss_score or 'N/A'} ({cvss_rating_str}) |
+| **CVSS Vector** | `{cvss_vector}` |
+| **URL** | `{vuln.url}` |
+| **Parameter** | `{vuln.parameter or 'N/A'}` |
+| **Method** | {vuln.method or 'GET'} |
 
 ### Severity Justification
 
@@ -202,7 +226,7 @@ Respond with ONLY the JSON."""
 
 {steps_md}
 
-{f"**cURL command:**{chr(10)}```bash{chr(10)}{curl}{chr(10)}```" if curl else ""}
+{f"### cURL Command{chr(10)}{chr(10)}```bash{chr(10)}{curl}{chr(10)}```" if curl else ""}
 
 ## Impact
 
@@ -214,11 +238,14 @@ Respond with ONLY the JSON."""
 
 {self._format_poc_data(vuln)}
 
-## Suggested Remediation
+## Remediation
 
 {report_data.get('remediation', vuln.remediation or '')}
 
-{f"## References{chr(10)}{chr(10)}{refs_md}" if refs_md else ""}
+## References
+
+{refs_md}
+- [CVSS 3.1 Calculator](https://www.first.org/cvss/calculator/3.1#{cvss_vector.replace('CVSS:3.1/', '')})
 
 {f"## Additional Notes{chr(10)}{chr(10)}{additional}" if additional else ""}
 
@@ -230,6 +257,9 @@ Respond with ONLY the JSON."""
             "title": title,
             "severity": vuln.severity.value,
             "cwe": cwe_info["cwe"],
+            "cvss_score": cvss_score,
+            "cvss_vector": cvss_vector,
+            "cvss_rating": cvss_rating_str,
             "markdown": markdown.strip(),
             "sections": report_data,
         }
@@ -337,17 +367,21 @@ Respond with ONLY the JSON."""
     async def _score_quality(self, vuln: Vulnerability, report: dict) -> dict:
         """Score the quality of evidence and report completeness."""
         score = 0
+        max_score = 120
         issues = []
+        strengths = []
 
-        # Has payload
+        # Has payload (15 pts)
         if vuln.payload_used:
             score += 15
+            strengths.append("Working payload included")
         else:
             issues.append("No payload — report lacks concrete PoC")
 
-        # Has request/response data
+        # Has request/response data (15+15+10 pts)
         if vuln.request_data:
             score += 15
+            strengths.append("HTTP request data captured")
         else:
             issues.append("No HTTP request data — harder to reproduce")
 
@@ -359,61 +393,85 @@ Respond with ONLY the JSON."""
                 body = vuln.response_data.get("body", "")
             if vuln.payload_used and vuln.payload_used in body:
                 score += 10  # Payload reflected in response
+                strengths.append("Payload reflected in response — strong evidence")
         else:
             issues.append("No HTTP response data — no proof of exploitation")
 
-        # Has AI validation
+        # Has AI validation (10 pts)
         if vuln.ai_confidence and vuln.ai_confidence > 0.7:
             score += 10
+            strengths.append(f"High AI confidence ({vuln.ai_confidence:.0%})")
         elif vuln.ai_confidence and vuln.ai_confidence > 0.5:
             score += 5
         else:
             issues.append("Low AI confidence — consider manual verification")
 
-        # CVSS calculated
+        # CVSS calculated (10 pts)
         if vuln.cvss_score:
             score += 10
         else:
-            issues.append("No CVSS score — add for credibility")
+            # Auto-estimate from type
+            cvss_type = VULN_TYPE_CVSS.get(vuln.vuln_type.value)
+            if cvss_type:
+                score += 5  # We can auto-fill it
+            else:
+                issues.append("No CVSS score — add for credibility")
 
-        # Severity justification
+        # Severity (5 pts)
         if vuln.severity.value in ("critical", "high"):
-            score += 5  # Higher bounty potential
+            score += 5
+            strengths.append(f"{vuln.severity.value.capitalize()} severity — high bounty potential")
         elif vuln.severity.value == "info":
             issues.append("Info severity — unlikely to get bounty")
 
-        # Has description
+        # Has description (10 pts)
         if vuln.description and len(vuln.description) > 50:
             score += 10
         else:
             issues.append("Weak description — add more detail")
 
-        # Impact statement
+        # Impact statement (10 pts)
         if vuln.impact and len(vuln.impact) > 30:
             score += 10
         else:
             issues.append("No impact statement — critical for bounty")
 
+        # Confirmed status (5 pts)
+        if vuln.title and "[CONFIRMED]" in vuln.title:
+            score += 5
+            strengths.append("Vulnerability confirmed with exploitation proof")
+
+        # Has CWE mapping (5 pts)
+        vuln_type = vuln.vuln_type.value
+        if VULN_TYPE_TO_CWE.get(vuln_type):
+            score += 5
+        else:
+            issues.append(f"No CWE mapping for {vuln_type} — add for classification")
+
+        # Normalize to 100
+        normalized = min(int(score * 100 / max_score), 100)
+
         # Determine grade
-        if score >= 80:
+        if normalized >= 80:
             grade = "A"
-            verdict = "Ready to submit"
-        elif score >= 60:
+            verdict = "Ready to submit — strong report with solid evidence"
+        elif normalized >= 60:
             grade = "B"
             verdict = "Good — fix minor issues before submitting"
-        elif score >= 40:
+        elif normalized >= 40:
             grade = "C"
-            verdict = "Needs improvement — strengthen evidence"
+            verdict = "Needs improvement — strengthen evidence and add PoC steps"
         else:
             grade = "D"
-            verdict = "Not ready — needs significant work"
+            verdict = "Not ready — needs significant work before submission"
 
         return {
-            "score": score,
+            "score": normalized,
             "max_score": 100,
             "grade": grade,
             "verdict": verdict,
             "issues": issues,
+            "strengths": strengths,
         }
 
     async def generate_batch(self, vuln_ids: list[str]) -> list[dict]:
