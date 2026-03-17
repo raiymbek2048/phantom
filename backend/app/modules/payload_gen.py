@@ -8,7 +8,7 @@ import json
 import logging
 import random
 import re
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlparse, parse_qs
 
 from app.ai.llm_engine import LLMEngine
 
@@ -949,12 +949,32 @@ class PayloadGenerator:
                 "open", "read", "get", "source", "import", "resource", "val",
                 "image", "img", "icon", "logo", "avatar", "preview", "thumbnail",
                 "webhook", "api", "endpoint", "service", "server", "forward",
+                # Additional params that commonly accept server-fetched values
+                "category", "dir", "path", "page", "href", "navigate",
             ]
-            return [
+            matched = [
                 e for e in endpoints
                 if any(p in str(e.get("params", [])).lower() for p in _SSRF_PARAMS)
                 or e.get("type") == "injectable"
             ]
+            # Also include any endpoint whose param VALUE looks like a URL/path
+            matched_urls = {e.get("url") for e in matched}
+            for e in endpoints:
+                if e.get("url") in matched_urls:
+                    continue
+                ep_url = e.get("url", "")
+                parsed = urlparse(ep_url)
+                if parsed.query:
+                    qparams = parse_qs(parsed.query)
+                    for val_list in qparams.values():
+                        val = val_list[0] if val_list else ""
+                        if val.startswith(("http://", "https://", "//")) or (
+                            val.startswith("/") and len(val) > 1
+                        ):
+                            matched.append(e)
+                            matched_urls.add(ep_url)
+                            break
+            return matched
         elif vuln_type == "open_redirect":
             _REDIRECT_PARAMS = [
                 "url", "redirect", "redirect_url", "redirect_uri", "return",

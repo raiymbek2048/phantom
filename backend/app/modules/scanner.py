@@ -387,6 +387,37 @@ class VulnerabilityScanner:
                             pass
                     return results
 
+            async def _ssrf_probe(url: str, parsed, params: dict):
+                """Quick SSRF canary: inject metadata URL into each param."""
+                async with sem:
+                    results = []
+                    ssrf_canary = "http://169.254.169.254/latest/meta-data/"
+                    aws_indicators = ["ami-id", "instance-id", "instance-type",
+                                      "local-hostname", "iam", "placement"]
+                    for param_name in params:
+                        try:
+                            new_params = dict(params)
+                            new_params[param_name] = [ssrf_canary]
+                            probe_url = urlunparse(parsed._replace(
+                                query=urlencode(new_params, doseq=True)
+                            ))
+                            resp = await client.get(probe_url, timeout=8)
+                            if resp.status_code == 200 and any(
+                                ind in resp.text for ind in aws_indicators
+                            ):
+                                results.append({
+                                    "source": "param_probe",
+                                    "name": f"SSRF candidate: {param_name} on {parsed.path}",
+                                    "severity": "high",
+                                    "url": url,
+                                    "type": "ssrf",
+                                    "parameter": param_name,
+                                    "details": "AWS metadata indicators in response to injected metadata URL",
+                                })
+                        except Exception:
+                            continue
+                    return results
+
             # Phase 1: Probe existing parameterized endpoints
             tasks = [
                 _probe_one(url, parsed, params)
@@ -396,6 +427,11 @@ class VulnerabilityScanner:
             tasks.extend([
                 _discover_params(url, parsed)
                 for url, parsed in page_endpoints[:40]
+            ])
+            # Phase 3: SSRF canary on ALL parameterized endpoints
+            tasks.extend([
+                _ssrf_probe(url, parsed, params)
+                for url, parsed, params in param_endpoints[:30]
             ])
 
             results = await asyncio.gather(*tasks, return_exceptions=True)

