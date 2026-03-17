@@ -343,7 +343,7 @@ class AuthAttackModule:
 
                 # Detect successful login
                 if self._is_login_success(result, baseline):
-                    findings.append({
+                    finding = {
                         "title": f"Default credentials work: {username}:{password}",
                         "url": action_url,
                         "severity": "critical",
@@ -357,7 +357,27 @@ class AuthAttackModule:
                                       "Implement account lockout after failed attempts.",
                         "request_data": result.get("request_data"),
                         "response_data": result.get("response_data"),
-                    })
+                        # Structured credential data for downstream session propagation
+                        "valid_credentials": {
+                            "username": username,
+                            "password": password,
+                            "login_url": action_url,
+                            "login_type": "form",
+                            "form": form,
+                        },
+                    }
+                    # Extract session cookies from response headers
+                    resp_data = result.get("response_data", {})
+                    resp_headers = resp_data.get("headers", {})
+                    session_cookies = {}
+                    for hdr_name, hdr_val in resp_headers.items():
+                        if hdr_name.lower() == "set-cookie" and hdr_val:
+                            parts = hdr_val.split(";")[0].split("=", 1)
+                            if len(parts) == 2:
+                                session_cookies[parts[0].strip()] = parts[1].strip()
+                    if session_cookies:
+                        finding["session_cookies"] = session_cookies
+                    findings.append(finding)
                     successful += 1
                     if successful >= 3:
                         break  # Don't need more than 3 successful creds
@@ -673,6 +693,15 @@ class AuthAttackModule:
                                                     "headers": dict(list(resp_headers_api.items())[:15]),
                                                     "body_preview": resp.text[:2000],
                                                 },
+                                                # Structured credential + token data
+                                                "valid_credentials": {
+                                                    "username": username,
+                                                    "password": password,
+                                                    "login_url": api_url,
+                                                    "login_type": "api",
+                                                    "token": token,
+                                                },
+                                                "auth_token": token,
                                             })
                                             # Found valid creds — skip other field variants
                                             break

