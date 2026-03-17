@@ -14,7 +14,11 @@ logger = logging.getLogger(__name__)
 FIXED_RECON_PHASES = {"recon", "subdomain", "portscan", "fingerprint"}
 
 # Phases that must always run — cannot be skipped
-CRITICAL_PHASES = {"vuln_scan", "exploit", "evidence", "report"}
+CRITICAL_PHASES = {
+    "vuln_scan", "exploit", "evidence", "report",
+    "account_enumeration", "cache_poisoning", "sensitive_files",
+    "auth_attack", "business_logic",
+}
 
 # Phases that must run late (after all attack phases), in this relative order
 LATE_PHASES = ["vuln_confirm", "claude_collab", "attack_planner", "evidence", "report"]
@@ -239,7 +243,7 @@ Endpoints discovered: {scan_context.get('endpoints_count', 0)}
   Do NOT include these in your output — they are added automatically
 - You may reorder all other phases to attack most promising vectors first
 - Add "SKIP:" prefix to phases that are clearly unnecessary (e.g., "SKIP:graphql_attacks" if no GraphQL)
-- Do NOT skip: vuln_scan, exploit, auth_attack (unless explicitly no login), service_attack, endpoint
+- Do NOT skip: vuln_scan, exploit, auth_attack, service_attack, endpoint, account_enumeration, cache_poisoning, sensitive_files, business_logic
 - Be aggressive — include all attack phases by default, only skip if truly irrelevant
 
 Return a JSON array of phase names in optimal order (excluding late phases). You may add "SKIP:" prefix to skip phases.

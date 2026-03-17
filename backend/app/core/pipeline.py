@@ -259,7 +259,76 @@ class ScanPipeline:
         if not url:
             return ""
         parsed = urlparse(url)
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/").lower()
+        # Normalize default ports: strip :80 for http, :443 for https
+        netloc = parsed.netloc
+        if parsed.scheme == "http" and netloc.endswith(":80"):
+            netloc = netloc[:-3]
+        elif parsed.scheme == "https" and netloc.endswith(":443"):
+            netloc = netloc[:-4]
+        return f"{parsed.scheme}://{netloc}{parsed.path}".rstrip("/").lower()
+
+    @staticmethod
+    def _normalize_url_aggressive(url: str) -> str:
+        """Aggressive URL normalization for auth_bypass / idor dedup.
+
+        - Strips query params and fragments
+        - Normalizes default ports
+        - Strips trailing numbers from path segments (admin.jsp70 → admin.jsp)
+        - Collapses duplicate consecutive path segments (/login.aspx/login.aspx → /login.aspx)
+        """
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        if parsed.scheme == "http" and netloc.endswith(":80"):
+            netloc = netloc[:-3]
+        elif parsed.scheme == "https" and netloc.endswith(":443"):
+            netloc = netloc[:-4]
+
+        path = parsed.path or "/"
+        # Strip trailing numbers from path segments:
+        # admin.jsp70 → admin.jsp, page47 → page (but keep purely numeric segments like /api/v2)
+        # Also strip trailing "Informational", "Error", etc. junk appended to extensions
+        segments = path.split("/")
+        cleaned = []
+        for seg in segments:
+            if not seg:
+                cleaned.append(seg)
+                continue
+            # Strip trailing digits from segments that have a non-digit prefix
+            # e.g. admin.jsp70 → admin.jsp, login5 → login, but 123 stays 123
+            cleaned_seg = re.sub(r'^(.+?[a-zA-Z._-])\d+$', r'\1', seg)
+            # Strip trailing known junk words (case-insensitive)
+            cleaned_seg = re.sub(r'(\.(?:jsp|asp|aspx|php|html?))[A-Z][a-zA-Z]*$', r'\1', cleaned_seg)
+            cleaned.append(cleaned_seg)
+        path = "/".join(cleaned)
+
+        # Collapse duplicate consecutive path segments: /login.aspx/login.aspx → /login.aspx
+        parts = [p for p in path.split("/") if p]
+        deduped_parts = []
+        for p in parts:
+            if not deduped_parts or deduped_parts[-1].lower() != p.lower():
+                deduped_parts.append(p)
+        path = "/" + "/".join(deduped_parts) if deduped_parts else "/"
+
+        return f"{parsed.scheme}://{netloc}{path}".rstrip("/").lower()
+
+    @staticmethod
+    def _get_url_dir_prefix(url: str) -> str:
+        """Get the directory prefix of a URL path for per-prefix counting.
+
+        /admin/admin.jsp → /admin/
+        /api/v2/users/1 → /api/v2/users/
+        """
+        if not url:
+            return "/"
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        # Get directory part (everything up to and including last /)
+        last_slash = path.rfind("/")
+        if last_slash > 0:
+            return path[:last_slash + 1].lower()
+        return "/".lower()
 
     @staticmethod
     def _normalize_biz_logic_title(title: str) -> str:
@@ -294,17 +363,34 @@ class ScanPipeline:
         Dedup key: (target_id, vuln_type, normalized_url, parameter).
         Returns the vuln if saved, None if duplicate.
         """
-        norm_url = self._normalize_url(vuln.url or "")
+        # --- Aggressive dedup for auth_bypass and idor ---
+        _aggressive_types = {VulnType.AUTH_BYPASS, VulnType.IDOR}
+        is_aggressive = vuln.vuln_type in _aggressive_types
+
+        if is_aggressive:
+            norm_url = self._normalize_url_aggressive(vuln.url or "")
+        else:
+            norm_url = self._normalize_url(vuln.url or "")
 
         conditions = [
             Vulnerability.target_id == vuln.target_id,
             Vulnerability.vuln_type == vuln.vuln_type,
             Vulnerability.scan_id == vuln.scan_id,
         ]
-        # Match on normalized URL path
-        if norm_url:
+
+        if is_aggressive and norm_url:
+            # For auth_bypass/idor: match on aggressively normalized URL
+            # This collapses admin.jsp70 / admin.jsp47 / admin.jspInformational into one
+            conditions.append(Vulnerability.url.like(f"{norm_url}%"))
+        elif norm_url:
+            # Standard: match on URL path prefix
             parsed = urlparse(vuln.url or "")
-            url_path = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            netloc = parsed.netloc
+            if parsed.scheme == "http" and netloc.endswith(":80"):
+                netloc = netloc[:-3]
+            elif parsed.scheme == "https" and netloc.endswith(":443"):
+                netloc = netloc[:-4]
+            url_path = f"{parsed.scheme}://{netloc}{parsed.path}".rstrip("/")
             conditions.append(Vulnerability.url.like(f"{url_path}%"))
 
         # Dedup within same scan: same URL path + same type
@@ -314,6 +400,27 @@ class ScanPipeline:
         )
         if existing.scalar_one_or_none():
             return None  # Duplicate within this scan — skip
+
+        # --- Per-type count limits for auth_bypass and idor ---
+        if is_aggressive:
+            dir_prefix = self._get_url_dir_prefix(vuln.url or "")
+            # Count how many vulns of this type already exist under same dir prefix
+            prefix_count_q = await db.execute(
+                select(Vulnerability.url).where(and_(
+                    Vulnerability.target_id == vuln.target_id,
+                    Vulnerability.vuln_type == vuln.vuln_type,
+                    Vulnerability.scan_id == vuln.scan_id,
+                ))
+            )
+            existing_urls = prefix_count_q.scalars().all()
+            same_prefix_count = sum(
+                1 for u in existing_urls
+                if self._get_url_dir_prefix(u or "").rstrip("/") == dir_prefix.rstrip("/")
+            )
+            # Max 3 auth_bypass per directory prefix, max 2 idor per base URL
+            max_per_prefix = 3 if vuln.vuln_type == VulnType.AUTH_BYPASS else 2
+            if same_prefix_count >= max_per_prefix:
+                return None  # Too many findings of this type under same path prefix
 
         # Business logic conceptual dedup: same normalized title = same finding
         # even on different URLs (e.g. "Price Manipulation" on /order vs /checkout)
