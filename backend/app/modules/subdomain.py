@@ -156,6 +156,73 @@ COMMON_SUBDOMAINS = [
 ]
 
 
+TAKEOVER_FINGERPRINTS = {
+    "github_pages": {
+        "cnames": [".github.io"],
+        "indicators": ["There isn't a GitHub Pages site here"],
+    },
+    "heroku": {
+        "cnames": [".herokuapp.com", ".herokussl.com", ".herokudns.com"],
+        "indicators": ["No such app"],
+    },
+    "aws_s3": {
+        "cnames": [".s3.amazonaws.com", ".s3-website"],
+        "indicators": ["NoSuchBucket", "The specified bucket does not exist"],
+    },
+    "shopify": {
+        "cnames": [".myshopify.com"],
+        "indicators": ["Sorry, this shop is currently unavailable"],
+    },
+    "tumblr": {
+        "cnames": [".tumblr.com"],
+        "indicators": ["There's nothing here", "Whatever you were looking for doesn't currently exist"],
+    },
+    "wordpress": {
+        "cnames": [".wordpress.com"],
+        "indicators": ["Do you want to register"],
+    },
+    "ghost": {
+        "cnames": [".ghost.io"],
+        "indicators": ["The thing you were looking for is no longer here"],
+    },
+    "surge": {
+        "cnames": [".surge.sh"],
+        "indicators": ["project not found"],
+    },
+    "fastly": {
+        "cnames": [".fastly.net", ".fastlylb.net"],
+        "indicators": ["Fastly error: unknown domain"],
+    },
+    "pantheon": {
+        "cnames": [".pantheonsite.io"],
+        "indicators": ["The gods are wise"],
+    },
+    "zendesk": {
+        "cnames": [".zendesk.com"],
+        "indicators": ["Help Center Closed"],
+    },
+    "unbounce": {
+        "cnames": [".unbounce.com", ".unbouncepages.com"],
+        "indicators": ["The requested URL was not found"],
+    },
+    "flyio": {
+        "cnames": [".fly.dev"],
+        "indicators": ["404 Not Found"],
+    },
+    "azure": {
+        "cnames": [".azurewebsites.net", ".cloudapp.net", ".azure-api.net",
+                    ".azurefd.net", ".blob.core.windows.net", ".trafficmanager.net"],
+        "indicators": ["404 Web Site not found"],
+    },
+    "netlify": {
+        "cnames": [".netlify.app", ".netlify.com"],
+        "indicators": ["Not Found - Request ID"],
+    },
+}
+
+MAX_TAKEOVER_CHECK = 50
+
+
 class SubdomainModule:
     async def run(self, domain: str) -> list[str]:
         """Discover subdomains using multiple tools, then verify which are alive."""
@@ -202,6 +269,9 @@ class SubdomainModule:
 
         # Step 5: Verify alive hosts with httpx
         alive = await self._check_alive(list(cleaned))
+
+        # Step 6: Check for subdomain takeover on discovered subdomains
+        self.takeover_findings = await self._check_takeover(alive)
 
         logger.info(f"Subdomain results for {domain}: {len(cleaned)} discovered, {len(alive)} alive")
         return sorted(alive)
@@ -483,3 +553,124 @@ class SubdomainModule:
 
         await asyncio.gather(*[check(sub) for sub in subdomains])
         return alive
+
+    async def _check_takeover(self, subdomains: list[str]) -> list[dict]:
+        """Check discovered subdomains for potential subdomain takeover.
+
+        For each subdomain:
+        1. Resolve DNS CNAME record
+        2. If CNAME points to a known service domain, fetch the page
+        3. Check response body against service-specific fingerprints
+        4. If fingerprint matches, it's a potential subdomain takeover (CRITICAL)
+        """
+        if not subdomains:
+            return []
+
+        to_check = subdomains[:MAX_TAKEOVER_CHECK]
+        logger.info(f"Subdomain takeover: checking {len(to_check)} subdomains")
+
+        findings = []
+        sem = asyncio.Semaphore(10)
+
+        async def check_one(subdomain: str) -> dict | None:
+            async with sem:
+                return await self._check_single_takeover(subdomain)
+
+        results = await asyncio.gather(
+            *[check_one(sub) for sub in to_check],
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, dict):
+                findings.append(result)
+            elif isinstance(result, Exception):
+                logger.debug(f"Takeover check error: {result}")
+
+        if findings:
+            logger.warning(f"Subdomain takeover: found {len(findings)} potential takeovers!")
+        return findings
+
+    async def _check_single_takeover(self, subdomain: str) -> dict | None:
+        """Check a single subdomain for takeover via CNAME fingerprinting."""
+        try:
+            # Step 1: Resolve CNAME via dig
+            proc = await asyncio.create_subprocess_exec(
+                "dig", "+short", "CNAME", subdomain,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            cname = stdout.decode().strip().rstrip(".")
+
+            if not cname:
+                return None
+
+            cname_lower = cname.lower()
+
+            # Step 2: Match CNAME against known service domains
+            matched_service = None
+            matched_config = None
+            for service, config in TAKEOVER_FINGERPRINTS.items():
+                if any(cname_lower.endswith(cn) or cn.lstrip(".") in cname_lower
+                       for cn in config["cnames"]):
+                    matched_service = service
+                    matched_config = config
+                    break
+
+            if not matched_service:
+                return None
+
+            # Step 3: Fetch the page and check for fingerprint strings
+            try:
+                async with make_client() as client:
+                    for scheme in ("https", "http"):
+                        try:
+                            resp = await client.get(
+                                f"{scheme}://{subdomain}",
+                                timeout=10,
+                                follow_redirects=True,
+                            )
+                            body = resp.text
+                            for indicator in matched_config["indicators"]:
+                                if indicator in body:
+                                    logger.warning(
+                                        f"SUBDOMAIN TAKEOVER: {subdomain} → "
+                                        f"{cname} ({matched_service}) "
+                                        f"matched: '{indicator}'"
+                                    )
+                                    return {
+                                        "title": f"Subdomain Takeover: {subdomain} → {matched_service}",
+                                        "url": f"{scheme}://{subdomain}",
+                                        "severity": "critical",
+                                        "vuln_type": "misconfiguration",
+                                        "description": (
+                                            f"Subdomain {subdomain} has a CNAME record pointing to "
+                                            f"{cname} ({matched_service}), but the service responded "
+                                            f"with a 'not found' fingerprint: \"{indicator}\". "
+                                            f"This means the service is unclaimed and an attacker "
+                                            f"can register it to serve arbitrary content on {subdomain}."
+                                        ),
+                                        "impact": (
+                                            f"An attacker can claim the {matched_service} resource and "
+                                            f"serve malicious content on {subdomain}. This enables "
+                                            f"cookie theft, phishing, CSP bypass, and session hijacking."
+                                        ),
+                                        "remediation": (
+                                            f"Remove the dangling CNAME record for {subdomain}, or "
+                                            f"reclaim the {matched_service} resource at {cname}."
+                                        ),
+                                        "subdomain": subdomain,
+                                        "cname": cname,
+                                        "service": matched_service,
+                                        "indicator": indicator,
+                                    }
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.debug(f"HTTP check failed for {subdomain}: {e}")
+
+        except Exception as e:
+            logger.debug(f"Takeover check error for {subdomain}: {e}")
+
+        return None

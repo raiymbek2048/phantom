@@ -1608,7 +1608,30 @@ Respond in JSON:
 
         self.context["subdomains"] = subdomains
 
-        # Check for subdomain takeover
+        # Check for subdomain takeover (built-in CNAME fingerprinting)
+        takeover_findings = getattr(subdomain_mod, "takeover_findings", []) or []
+        if takeover_findings:
+            for finding in takeover_findings:
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=finding["title"][:500],
+                    vuln_type=VulnType.MISCONFIGURATION,
+                    severity=Severity.CRITICAL,
+                    url=finding.get("url", "")[:2000],
+                    description=finding.get("description", ""),
+                    impact=finding.get("impact", ""),
+                    remediation=finding.get("remediation", ""),
+                    response_data={
+                        "cname": finding.get("cname"),
+                        "service": finding.get("service"),
+                        "indicator": finding.get("indicator"),
+                    },
+                )
+                await self._save_vuln_deduped(db, vuln)
+            await self.log(db, "subdomain", f"Found {len(takeover_findings)} subdomain takeovers (CNAME fingerprint)", "warning")
+
+        # Check for subdomain takeover (extended module)
         from app.modules.subdomain_takeover import SubdomainTakeoverModule
         takeover_mod = SubdomainTakeoverModule()
         takeover_results = await takeover_mod.check(self.context)
@@ -1717,6 +1740,42 @@ Respond in JSON:
             self.context["auth_cookie"] = endpoint_mod._auth_cookie
             await self.log(db, "endpoint", f"Auto-login successful, got session cookie")
         await self.log(db, "endpoint", f"Discovered {len(endpoints)} endpoints")
+
+        # --- Save JS secret findings from endpoint module as Vulnerability records ---
+        js_secret_findings = getattr(endpoint_mod, "_js_secret_findings", [])
+        if js_secret_findings:
+            sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                       "medium": Severity.MEDIUM, "low": Severity.LOW}
+            scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+            scan = scan_result.scalar_one_or_none()
+            js_saved = 0
+            # Deduplicate by (url, secret_type)
+            seen_js_secrets = set()
+            for f in js_secret_findings:
+                dedup_key = (f.get("url", ""), f.get("secret_type", ""))
+                if dedup_key in seen_js_secrets:
+                    continue
+                seen_js_secrets.add(dedup_key)
+                vuln = Vulnerability(
+                    target_id=self.context["target_id"],
+                    scan_id=self.context["scan_id"],
+                    title=f"{f.get('title', 'Secret in JavaScript')} ({f.get('secret_masked', '')})"[:500],
+                    vuln_type=VulnType.INFO_DISCLOSURE,
+                    severity=sev_map.get(f.get("severity", "high"), Severity.HIGH),
+                    url=f.get("url", "")[:2000],
+                    description=f.get("impact", ""),
+                    payload_used=f.get("payload"),
+                    remediation=f.get("remediation"),
+                    ai_confidence=0.95,
+                    request_data=f.get("request_data", {}),
+                    response_data=f.get("response_data", {}),
+                )
+                result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                if result:
+                    js_saved += 1
+            if js_saved:
+                await self.log(db, "endpoint",
+                    f"JS secret scan: found {len(js_secret_findings)} secrets ({js_saved} new vulns saved)", "warning")
 
         # --- JavaScript endpoint extraction ---
         try:

@@ -103,6 +103,7 @@ class EndpointModule:
             base_url = f"https://{domain}"
         self._base_url = base_url
         self._auth_cookie = None
+        self._js_secret_findings = []
         self._custom_headers = (context or {}).get("custom_headers", {})
 
         # Try to get auth cookie (for apps that require login like DVWA)
@@ -591,15 +592,31 @@ class EndpointModule:
                     r'(?:process\.env\.|import\.meta\.env\.|window\.__)'
                     r'([A-Z_]{3,})\s*(?:[\|&]|$)',
                 )
-                # Hardcoded AWS/GCP/Azure keys
-                cloud_key_pattern = re.compile(
-                    r'(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|'
-                    r'ya29\.[0-9A-Za-z_-]+|'
-                    r'sk_live_[0-9a-zA-Z]{24,}|'
-                    r'ghp_[0-9a-zA-Z]{36}|'
-                    r'glpat-[0-9a-zA-Z_-]{20,}|'
-                    r'xox[bpors]-[0-9a-zA-Z-]+)'
-                )
+                # Hardcoded secrets — comprehensive patterns with severity
+                cloud_key_patterns = [
+                    # CRITICAL — direct account compromise
+                    (re.compile(r'AKIA[0-9A-Z]{16}'), "AWS Access Key", "critical"),
+                    (re.compile(r'sk_live_[a-zA-Z0-9]{24,}'), "Stripe Secret Key", "critical"),
+                    (re.compile(r'rk_live_[a-zA-Z0-9]{24,}'), "Stripe Restricted Key", "critical"),
+                    (re.compile(r'-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----'), "Private Key", "critical"),
+                    (re.compile(r'(?:postgres|mysql|mongodb)://[^\s\'"]+'), "Database URL", "critical"),
+                    # HIGH — service-level access
+                    (re.compile(r'ya29\.[0-9A-Za-z_-]+'), "Google OAuth Token", "high"),
+                    (re.compile(r'ghp_[0-9a-zA-Z]{36}'), "GitHub PAT", "high"),
+                    (re.compile(r'github_pat_[0-9a-zA-Z_]{82}'), "GitHub Fine-Grained PAT", "high"),
+                    (re.compile(r'glpat-[0-9a-zA-Z_-]{20,}'), "GitLab PAT", "high"),
+                    (re.compile(r'xox[bpors]-[0-9a-zA-Z-]+'), "Slack Token", "high"),
+                    (re.compile(r'SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}'), "SendGrid API Key", "high"),
+                    (re.compile(r'SK[a-f0-9]{32}'), "Twilio API Key", "high"),
+                    (re.compile(r'AC[a-f0-9]{32}'), "Twilio Account SID", "high"),
+                    (re.compile(r'key-[a-zA-Z0-9]{32}'), "Mailgun API Key", "high"),
+                    (re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}'), "JWT Token", "high"),
+                    (re.compile(r'https://hooks\.slack\.com/services/T[A-Z0-9]{8}/B[A-Z0-9]{8}/[a-zA-Z0-9]{24}'), "Slack Webhook URL", "high"),
+                    (re.compile(r'(?:api[_-]?key|apikey|api[_-]?secret)\s*[:=]\s*[\'"][a-zA-Z0-9_-]{20,}[\'"]'), "Generic API Key", "high"),
+                    # MEDIUM — limited exposure
+                    (re.compile(r'pk_live_[a-zA-Z0-9]{24,}'), "Stripe Publishable Key", "medium"),
+                    (re.compile(r'AIza[0-9A-Za-z_-]{35}'), "Firebase/Google API Key", "medium"),
+                ]
                 # Header/cookie patterns
                 header_pattern = re.compile(
                     r'(?:headers|setRequestHeader)\s*[\[.(]\s*["\']'
@@ -681,25 +698,68 @@ class EndpointModule:
                             secret_val = m.group(1)
                             if len(secret_val) > 100:
                                 continue
+                            masked = secret_val[:8] + "***" if len(secret_val) > 8 else secret_val
                             endpoints.append({
                                 "url": js_url,
                                 "type": "sensitive",
                                 "interest": "critical",
                                 "params": [],
                                 "discovery": "js_secret",
-                                "secret_hint": secret_val[:20] + "...",
+                                "secret_hint": masked,
+                            })
+                            self._js_secret_findings.append({
+                                "title": f"Hardcoded secret/API key in JavaScript",
+                                "url": js_url,
+                                "severity": "high",
+                                "vuln_type": "info_disclosure",
+                                "secret_type": "API Key/Secret",
+                                "secret_masked": masked,
+                                "payload": f"GET {js_url} — found hardcoded secret: {masked}",
+                                "impact": (
+                                    f"A hardcoded secret or API key ({masked}) was found in client-side "
+                                    f"JavaScript file '{js_url}'. Anyone viewing page source can extract this."
+                                ),
+                                "remediation": (
+                                    "Remove secrets from client-side code. Use server-side environment "
+                                    "variables or a secrets manager. Rotate the exposed credential immediately."
+                                ),
+                                "request_data": {"method": "GET", "url": js_url},
+                                "response_data": {"secret_masked": masked},
                             })
 
-                        # Extract cloud provider keys
-                        for m in cloud_key_pattern.finditer(js_text):
-                            endpoints.append({
-                                "url": js_url,
-                                "type": "sensitive",
-                                "interest": "critical",
-                                "params": [],
-                                "discovery": "js_cloud_key",
-                                "secret_hint": m.group(0)[:20] + "...",
-                            })
+                        # Extract cloud provider keys and secrets — save as vuln findings
+                        for pattern, secret_type, sev in cloud_key_patterns:
+                            for m in pattern.finditer(js_text):
+                                matched = m.group(0)
+                                masked = matched[:8] + "***" if len(matched) > 8 else matched
+                                endpoints.append({
+                                    "url": js_url,
+                                    "type": "sensitive",
+                                    "interest": "critical",
+                                    "params": [],
+                                    "discovery": "js_cloud_key",
+                                    "secret_hint": masked,
+                                })
+                                # Also store as a proper vulnerability finding
+                                self._js_secret_findings.append({
+                                    "title": f"Exposed {secret_type} in JavaScript",
+                                    "url": js_url,
+                                    "severity": sev,
+                                    "vuln_type": "info_disclosure",
+                                    "secret_type": secret_type,
+                                    "secret_masked": masked,
+                                    "payload": f"GET {js_url} — found {secret_type}: {masked}",
+                                    "impact": (
+                                        f"A {secret_type} ({masked}) was found in client-side JavaScript file "
+                                        f"'{js_url}'. Anyone viewing page source can extract this secret."
+                                    ),
+                                    "remediation": (
+                                        "Remove secrets from client-side code. Use server-side environment "
+                                        "variables or a secrets manager. Rotate the exposed credential immediately."
+                                    ),
+                                    "request_data": {"method": "GET", "url": js_url},
+                                    "response_data": {"secret_type": secret_type, "secret_masked": masked},
+                                })
 
                         # Extract hardcoded auth headers/tokens
                         for m in header_pattern.finditer(js_text):
@@ -708,13 +768,33 @@ class EndpointModule:
                             if len(header_val) > 8 and header_val not in (
                                 "undefined", "null", "Bearer ", "token",
                             ):
+                                masked = f"{header_name}: {header_val[:8]}***"
                                 endpoints.append({
                                     "url": js_url,
                                     "type": "sensitive",
                                     "interest": "critical",
                                     "params": [],
                                     "discovery": "js_hardcoded_auth",
-                                    "secret_hint": f"{header_name}: {header_val[:20]}...",
+                                    "secret_hint": masked,
+                                })
+                                self._js_secret_findings.append({
+                                    "title": f"Hardcoded {header_name} header in JavaScript",
+                                    "url": js_url,
+                                    "severity": "high",
+                                    "vuln_type": "info_disclosure",
+                                    "secret_type": f"Hardcoded {header_name}",
+                                    "secret_masked": masked,
+                                    "payload": f"GET {js_url} — found hardcoded {header_name}: {header_val[:8]}***",
+                                    "impact": (
+                                        f"A hardcoded {header_name} header value was found in client-side "
+                                        f"JavaScript file '{js_url}'. This may allow unauthorized API access."
+                                    ),
+                                    "remediation": (
+                                        "Remove hardcoded auth headers from client-side code. "
+                                        "Implement proper token management with server-side session handling."
+                                    ),
+                                    "request_data": {"method": "GET", "url": js_url},
+                                    "response_data": {"header": header_name, "secret_masked": masked},
                                 })
 
                         # Discover webpack chunks for additional JS files

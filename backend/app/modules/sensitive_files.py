@@ -105,11 +105,44 @@ SENSITIVE_PATHS = [
     (".gitlab-ci.yml", "medium", "GitLab CI config"),
     ("Jenkinsfile", "medium", "Jenkins pipeline"),
 
-    # Package managers
+    # Package managers & auth tokens
     ("package.json", "low", "NPM package.json"),
     ("composer.json", "low", "PHP composer.json"),
     ("requirements.txt", "low", "Python requirements"),
     ("Gemfile", "low", "Ruby Gemfile"),
+    (".npmrc", "critical", "NPM auth token file"),
+    (".pypirc", "critical", "PyPI credentials file"),
+    (".yarnrc", "high", "Yarn config file"),
+
+    # Additional env/config files
+    (".env.staging", "critical", "Staging env file exposed"),
+    (".env.dev", "critical", "Dev env file exposed"),
+    (".env.test", "high", "Test env file exposed"),
+    ("secrets.json", "critical", "Secrets JSON exposed"),
+    ("secrets.yml", "critical", "Secrets YAML exposed"),
+    ("credentials.json", "critical", "Credentials file exposed"),
+    ("service-account.json", "critical", "GCP service account key"),
+
+    # Backup variants
+    ("web.config.bak", "high", "IIS web.config backup"),
+    ("web.config.old", "high", "IIS web.config old copy"),
+    ("wp-config.php.old", "critical", "WordPress config old copy"),
+    ("wp-config.php.save", "critical", "WordPress config save"),
+    ("wp-config.php.swp", "critical", "WordPress config vim swap"),
+    ("wp-config.php~", "critical", "WordPress config editor backup"),
+    (".env.bak", "critical", "Environment file backup"),
+    ("appsettings.Development.json", "high", ".NET dev config exposed"),
+    ("appsettings.Production.json", "critical", ".NET production config"),
+
+    # SSH/GPG keys
+    (".ssh/id_rsa", "critical", "SSH private key exposed"),
+    (".ssh/id_rsa.pub", "medium", "SSH public key exposed"),
+    (".ssh/authorized_keys", "high", "SSH authorized keys exposed"),
+
+    # History files
+    (".bash_history", "high", "Bash history exposed"),
+    (".mysql_history", "high", "MySQL history exposed"),
+    (".psql_history", "high", "PostgreSQL history exposed"),
 ]
 
 # Patterns that indicate a real file (not a 404 or redirect)
@@ -124,6 +157,16 @@ REAL_FILE_INDICATORS = {
     ".htpasswd": [":$", ":{SHA}"],
     "backup.sql": ["CREATE TABLE", "INSERT INTO", "DROP TABLE"],
     "dump.sql": ["CREATE TABLE", "INSERT INTO"],
+    ".npmrc": ["//registry", "_authToken", "registry="],
+    ".pypirc": ["[pypi]", "[distutils]", "password"],
+    "docker-compose.yml": ["services:", "image:", "container_name:"],
+    "secrets.json": ["{", "key", "secret", "password", "token"],
+    "credentials.json": ["{", "client_id", "client_secret", "private_key"],
+    "service-account.json": ["project_id", "private_key", "client_email"],
+    ".ssh/id_rsa": ["-----BEGIN", "PRIVATE KEY"],
+    ".bash_history": ["sudo", "ssh", "mysql", "export", "curl"],
+    "appsettings.Development.json": ["ConnectionStrings", "Logging", "AllowedHosts"],
+    "appsettings.Production.json": ["ConnectionStrings", "Logging", "AllowedHosts"],
 }
 
 
@@ -316,6 +359,22 @@ class SensitiveFilesModule:
             (r'key-[0-9a-zA-Z]{32}', "Mailgun API Key"),
             # Heroku
             (r'heroku.*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', "Heroku API Key"),
+            # Stripe restricted key
+            (r'rk_live_[a-zA-Z0-9]{24,}', "Stripe Restricted Key"),
+            # Twilio Account SID
+            (r'AC[a-f0-9]{32}', "Twilio Account SID"),
+            # NPM auth tokens
+            (r'//registry\.npmjs\.org/:_authToken=[^\s]+', "NPM Auth Token"),
+            # Slack webhook URLs
+            (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8}/B[A-Z0-9]{8}/[a-zA-Z0-9]{24}', "Slack Webhook URL"),
+            # Database URLs (without explicit credentials in the regex match)
+            (r'(?:postgres|mysql|mongodb|redis)://[^\s"\'<>]+', "Database Connection URL"),
+            # Generic secret assignments
+            (r'(?:secret[_-]?key|api[_-]?secret)\s*[=:]\s*["\']?([a-zA-Z0-9_\-/+=]{20,})', "Secret Key"),
+            # Azure connection strings
+            (r'DefaultEndpointsProtocol=https;AccountName=[^\s;]+;AccountKey=[^\s;]+', "Azure Storage Connection String"),
+            # GCP service account keys
+            (r'"type"\s*:\s*"service_account"', "GCP Service Account JSON"),
         ]
 
         for pattern, secret_type in patterns:
