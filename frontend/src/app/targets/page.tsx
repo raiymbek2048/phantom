@@ -327,13 +327,13 @@ function TargetsContent() {
                 />
               </div>
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">Scope (optional)</label>
-                <input
-                  type="text"
+                <label className="text-xs text-gray-500 mb-1 block">Scope (one per line, ! to exclude)</label>
+                <textarea
                   value={scope}
                   onChange={(e) => setScope(e.target.value)}
-                  placeholder="*.example.com"
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-red-500"
+                  placeholder={"*.example.com\napi.example.com\n!staging.example.com\n!/admin/*"}
+                  rows={3}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-red-500 font-mono"
                 />
               </div>
               <button

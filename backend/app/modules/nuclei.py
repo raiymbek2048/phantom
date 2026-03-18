@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from urllib.parse import urlparse
 
@@ -87,25 +88,68 @@ class NucleiModule:
         "subdomain-takeover": "misconfiguration",
     }
 
+    _templates_ready = False
+
+    async def _ensure_templates(self):
+        """Download nuclei templates if not already present."""
+        if NucleiModule._templates_ready:
+            return
+        templates_dir = os.path.expanduser("~/.local/nuclei-templates")
+        if os.path.isdir(templates_dir) and len(os.listdir(templates_dir)) > 10:
+            NucleiModule._templates_ready = True
+            return
+        logger.info("Nuclei templates not found, downloading...")
+        try:
+            result = await run_command(
+                ["nuclei", "-update-templates", "-ud", templates_dir],
+                timeout=300,
+            )
+            logger.info(f"Nuclei templates downloaded: {result[:200]}")
+            NucleiModule._templates_ready = True
+        except Exception as e:
+            logger.error(f"Failed to download nuclei templates: {e}")
+            # Try default location as fallback
+            try:
+                await run_command(["nuclei", "-update-templates"], timeout=300)
+                NucleiModule._templates_ready = True
+            except Exception as e2:
+                logger.error(f"Nuclei template fallback also failed: {e2}")
+
     async def run(self, context: dict) -> list[dict]:
         """Run nuclei against all discovered endpoints with auth."""
+        # Ensure templates are available
+        await self._ensure_templates()
+
         endpoints = context.get("endpoints", [])
         base_url = context.get("base_url", "")
         auth_cookie = context.get("auth_cookie")
         technologies = context.get("technologies", [])
         scan_type = context.get("scan_type", "full")
 
-        # Build URL list
+        # Build URL list — include base URL + unique endpoint URLs
         urls = set()
         if base_url:
             urls.add(base_url)
         for ep in endpoints:
             url = ep if isinstance(ep, str) else ep.get("url", "")
             if url:
+                parsed = urlparse(url)
+                # Add both full URL and base path (nuclei works better with paths)
                 urls.add(url)
+                if parsed.path and parsed.path != "/":
+                    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    urls.add(base)
+        # Always add common paths for the base domain
+        if base_url:
+            parsed_base = urlparse(base_url)
+            for path in ["/", "/api", "/admin", "/login", "/wp-admin", "/wp-login.php"]:
+                urls.add(f"{parsed_base.scheme}://{parsed_base.netloc}{path}")
 
         if not urls:
+            logger.warning("Nuclei: no URLs to scan")
             return []
+
+        logger.info(f"Nuclei: scanning {len(urls)} unique URLs")
 
         # Write URLs to temp file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -115,27 +159,37 @@ class NucleiModule:
         try:
             # Run general scan
             findings = await self._run_nuclei(targets_path, auth_cookie, context)
+            logger.info(f"Nuclei general scan: {len(findings)} findings")
 
             # Run tech-specific templates if we have fingerprint data
             tech_tags = self._get_tech_tags(technologies)
             if tech_tags:
+                logger.info(f"Nuclei tech scan: tags={tech_tags}")
                 tech_findings = await self._run_nuclei_tags(
                     targets_path, auth_cookie, context, tech_tags
                 )
                 findings.extend(tech_findings)
+                logger.info(f"Nuclei tech scan: {len(tech_findings)} findings")
 
             # Run CVE templates separately (focused scan)
             if scan_type in ("full", "deep"):
                 cve_findings = await self._run_nuclei_cves(targets_path, auth_cookie, context)
                 findings.extend(cve_findings)
+                logger.info(f"Nuclei CVE scan: {len(cve_findings)} findings")
 
             # Deduplicate
             findings = self._deduplicate(findings)
 
-            logger.info(f"Nuclei found {len(findings)} unique findings across {len(urls)} URLs")
+            logger.info(f"Nuclei TOTAL: {len(findings)} unique findings across {len(urls)} URLs")
             return findings
+        except Exception as e:
+            logger.error(f"Nuclei scan failed: {e}")
+            return []
         finally:
-            os.unlink(targets_path)
+            try:
+                os.unlink(targets_path)
+            except OSError:
+                pass
 
     def _get_tech_tags(self, technologies: list) -> list[str]:
         """Convert fingerprinted technologies to nuclei template tags."""
@@ -198,8 +252,14 @@ class NucleiModule:
         if os.path.isdir(custom_templates):
             cmd.extend(["-t", custom_templates])
 
-        output = await run_command(cmd, timeout=900)
-        return self._parse_output(output)
+        try:
+            output = await run_command(cmd, timeout=900)
+            if not output or not output.strip():
+                logger.warning("Nuclei general scan returned empty output")
+            return self._parse_output(output)
+        except Exception as e:
+            logger.error(f"Nuclei general scan error: {e}")
+            return []
 
     async def _run_nuclei_tags(self, targets_path: str, auth_cookie: str | None,
                                 context: dict, tags: list[str]) -> list[dict]:
@@ -229,8 +289,12 @@ class NucleiModule:
             else:
                 cmd.extend(["-header", f"Cookie: {auth_cookie}"])
 
-        output = await run_command(cmd, timeout=600)
-        return self._parse_output(output)
+        try:
+            output = await run_command(cmd, timeout=600)
+            return self._parse_output(output)
+        except Exception as e:
+            logger.error(f"Nuclei tech scan error: {e}")
+            return []
 
     async def _run_nuclei_cves(self, targets_path: str, auth_cookie: str | None,
                                 context: dict) -> list[dict]:
@@ -257,8 +321,12 @@ class NucleiModule:
             else:
                 cmd.extend(["-header", f"Cookie: {auth_cookie}"])
 
-        output = await run_command(cmd, timeout=600)
-        return self._parse_output(output)
+        try:
+            output = await run_command(cmd, timeout=600)
+            return self._parse_output(output)
+        except Exception as e:
+            logger.error(f"Nuclei CVE scan error: {e}")
+            return []
 
     def _parse_output(self, output: str | None) -> list[dict]:
         """Parse nuclei JSON output into findings."""
@@ -382,7 +450,3 @@ class NucleiModule:
                 return vtype
 
         return "misconfiguration"
-
-
-# Need re for CVE parsing
-import re

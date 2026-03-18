@@ -178,6 +178,7 @@ class ScanPipeline:
         self.celery_task = celery_task
         self.context = {}  # Shared data between phases
         self._idor_seen: set = set()  # Dedup proven IDOR findings
+        self._scope = None  # ScopeEnforcer, initialized in run()
         self.realtime_learner = RealtimeLearner()
         self.cross_scan_intel = CrossScanIntel()
 
@@ -363,6 +364,12 @@ class ScanPipeline:
         Dedup key: (target_id, vuln_type, normalized_url, parameter).
         Returns the vuln if saved, None if duplicate.
         """
+        # --- Scope enforcement: reject out-of-scope URLs ---
+        if hasattr(self, '_scope') and vuln.url:
+            if not self._scope.is_in_scope(vuln.url):
+                logger.debug(f"Rejected out-of-scope vuln: {vuln.url}")
+                return None
+
         # --- Aggressive dedup for auth_bypass and idor ---
         _aggressive_types = {VulnType.AUTH_BYPASS, VulnType.IDOR}
         is_aggressive = vuln.vuln_type in _aggressive_types
@@ -726,6 +733,15 @@ class ScanPipeline:
                 timeout=config.get("timeout", 10.0),
             )
 
+            # Initialize scope enforcer
+            from app.utils.scope import ScopeEnforcer
+            scope_config = target.scope or config.get("scope")
+            self._scope = ScopeEnforcer(scope_config, base_domain=target.domain)
+            self.context["scope_enforcer"] = self._scope
+            scope_summary = self._scope.get_summary()
+            if scope_config:
+                await self.log(db, "scope", f"Scope enforced: {scope_summary}")
+
             # --- Reachability pre-check ---
             try:
                 import httpx
@@ -896,6 +912,17 @@ class ScanPipeline:
                     from sqlalchemy.orm.attributes import flag_modified as _fm2
                     _fm2(scan, "data")
 
+                    # Log adaptive throttling stats
+                    try:
+                        from app.utils.http_client import get_throttle_stats
+                        stats = get_throttle_stats()
+                        if stats:
+                            blocked_domains = {d: s for d, s in stats.items() if s.get("total_blocks", 0) > 0}
+                            if blocked_domains:
+                                await self.log(db, "throttle", f"Rate limiting detected on {len(blocked_domains)} domain(s): {blocked_domains}")
+                    except Exception:
+                        pass
+
                     # Complete — count vulns from DB (context list may miss deduped saves)
                     scan.status = ScanStatus.COMPLETED
                     scan.completed_at = datetime.utcnow()
@@ -1033,6 +1060,7 @@ class ScanPipeline:
 
         phase_map = {
             "endpoint": self._phase_endpoint,
+            "browser_scan": self._phase_browser_scan,
             "app_graph": self._phase_app_graph,
             "stateful_crawl": self._phase_stateful_crawl,
             "sensitive_files": self._phase_sensitive_files,
@@ -1240,14 +1268,42 @@ class ScanPipeline:
         waf = self.context.get("waf_info")
         ports = self.context.get("ports", {})
 
+        # Query KB for insights on similar targets/technologies
+        kb_context = ""
+        try:
+            from app.core.knowledge import KnowledgeBase
+            kb = KnowledgeBase()
+            tech_names = []
+            if isinstance(techs, dict):
+                tech_names = list(techs.get("summary", {}).keys())[:5]
+            elif isinstance(techs, list):
+                tech_names = [str(t) for t in techs[:5]]
+            for tech in tech_names:
+                payloads = await kb.get_effective_payloads(tech.lower())
+                if payloads:
+                    kb_context += f"\nKB: Effective payloads for {tech}: {json.dumps(payloads[:3], default=str)[:300]}"
+            strategies = await kb.query_patterns("scan_strategy", context={"technologies": tech_names})
+            if strategies:
+                kb_context += f"\nKB strategies for this tech stack: {json.dumps(strategies[:2], default=str)[:300]}"
+        except Exception:
+            pass
+
+        # Build vuln summary for AI context
+        vuln_types_found = {}
+        for v in vulns:
+            vt = v.get("vuln_type") or v.get("type", "unknown")
+            vuln_types_found[vt] = vuln_types_found.get(vt, 0) + 1
+        vuln_summary = ", ".join(f"{k}:{v}" for k, v in sorted(vuln_types_found.items(), key=lambda x: -x[1]))
+
         prompt = f"""You are an elite penetration tester doing round {round_num} of a continuous deep scan.
 Target: {target.domain}
 Technologies: {json.dumps(techs, default=str)[:500]}
 Open ports: {json.dumps(ports, default=str)[:300]}
 WAF: {waf or 'Unknown'}
 Endpoints found: {len(endpoints)} (sample: {json.dumps(endpoints[:15], default=str)[:500]})
-Vulnerabilities found so far: {len(vulns)}
+Vulnerabilities found so far: {len(vulns)} ({vuln_summary})
 {history_text}
+{kb_context}
 
 Your job: plan the NEXT attack round. You must try something DIFFERENT from previous rounds.
 Think like a creative pentester who refuses to give up. Consider:
@@ -1280,10 +1336,13 @@ Respond in JSON:
         try:
             result = await llm.analyze_json(prompt, temperature=0.7 + min(round_num * 0.02, 0.25))
             # Validate phases
-            valid_phases = set(["endpoint", "sensitive_files", "vuln_scan", "nuclei",
-                               "ai_analysis", "payload_gen", "waf", "exploit", "vuln_confirm",
-                               "service_attack", "auth_attack", "stress_test", "claude_collab",
-                               "graphql_attacks"])
+            valid_phases = set(["endpoint", "browser_scan", "sensitive_files", "vuln_scan",
+                               "nuclei", "ai_analysis", "payload_gen", "waf", "exploit",
+                               "vuln_confirm", "service_attack", "auth_attack", "stress_test",
+                               "claude_collab", "graphql_attacks", "account_enumeration",
+                               "mfa_bypass", "business_logic", "request_smuggling",
+                               "mass_assignment", "cache_poisoning", "attack_planner",
+                               "auto_register", "app_graph", "stateful_crawl"])
             result["phases"] = [p for p in result.get("phases", []) if p in valid_phases]
             if not result["phases"]:
                 result["phases"] = ["vuln_scan", "exploit", "ai_analysis"]
@@ -1319,6 +1378,7 @@ Respond in JSON:
             ("fingerprint", 20, self._phase_fingerprint),
             ("attack_routing", 23, self._phase_attack_routing),
             ("endpoint", 28, self._phase_endpoint),
+            ("browser_scan", 29, self._phase_browser_scan),
             ("graphql_attacks", 30, self._phase_graphql_attacks),
             ("app_graph", 32, self._phase_app_graph),
             ("stateful_crawl", 34, self._phase_stateful_crawl),
@@ -1352,7 +1412,7 @@ Respond in JSON:
                     "evidence", "service_attack", "auth_attack", "stress_test",
                     "stateful_crawl", "business_logic", "auto_register",
                     "request_smuggling", "mass_assignment", "cache_poisoning",
-                    "mfa_bypass", "account_enumeration"}
+                    "mfa_bypass", "account_enumeration", "browser_scan"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
             # Recalculate progress evenly
             for i, (n, _, f) in enumerate(phases):
@@ -1606,6 +1666,12 @@ Respond in JSON:
             if added:
                 await self.log(db, "subdomain", f"SecurityTrails added {added} new subdomains")
 
+        # Scope filter subdomains
+        if hasattr(self, '_scope'):
+            before = len(subdomains)
+            subdomains = [s for s in subdomains if self._scope.is_in_scope(f"https://{s}")]
+            if before != len(subdomains):
+                await self.log(db, "subdomain", f"Scope filter: {before} → {len(subdomains)} subdomains")
         self.context["subdomains"] = subdomains
 
         # Check for subdomain takeover (built-in CNAME fingerprinting)
@@ -1735,6 +1801,12 @@ Respond in JSON:
         endpoints = await endpoint_mod.run(
             self.context["domain"], self.context["subdomains"][:10], base_url=base_url, context=self.context
         )
+        # Scope filter endpoints
+        if hasattr(self, '_scope'):
+            before = len(endpoints)
+            endpoints = self._scope.filter_urls(endpoints)
+            if before != len(endpoints):
+                await self.log(db, "endpoint", f"Scope filter: {before} → {len(endpoints)} endpoints")
         self.context["endpoints"] = endpoints
         if endpoint_mod._auth_cookie:
             self.context["auth_cookie"] = endpoint_mod._auth_cookie
@@ -3314,6 +3386,137 @@ Respond in JSON:
                 f"MFA bypass found {saved} new vulnerabilities ({len(findings) - saved} deduped)", "warning")
         else:
             await self.log(db, "mfa_bypass", "No MFA bypass vulnerabilities found")
+
+    async def _phase_browser_scan(self, db: AsyncSession):
+        """Headless Chrome: SPA crawling, DOM XSS detection, client-side JS analysis."""
+        try:
+            from app.modules.browser import BrowserModule
+        except ImportError:
+            await self.log(db, "browser_scan", "Browser module not available (playwright not installed)")
+            return
+
+        base_url = self.context.get("base_url", "")
+        if not base_url:
+            return
+
+        # Detect if target is likely SPA (React/Angular/Vue/Next)
+        technologies = self.context.get("technologies", [])
+        tech_str = str(technologies).lower()
+        is_spa = any(fw in tech_str for fw in [
+            "react", "angular", "vue", "next", "nuxt", "svelte", "ember",
+            "backbone", "single-page", "spa",
+        ])
+
+        # Also check if initial page has minimal HTML (SPA indicator)
+        endpoints = self.context.get("endpoints", [])
+        if not is_spa and len(endpoints) < 5:
+            is_spa = True  # Few static endpoints = likely SPA
+
+        sem = asyncio.Semaphore(self.context.get("rate_limit") or 3)
+        browser_mod = BrowserModule(rate_limit=sem)
+
+        try:
+            # Phase 1: SPA crawl — discover JS-rendered endpoints
+            auth_cookie = self.context.get("auth_cookie")
+            max_pages = 30 if is_spa else 15
+
+            await self.log(db, "browser_scan",
+                f"Browser crawling {'SPA' if is_spa else 'site'} ({max_pages} pages max)...")
+
+            crawl_result = await browser_mod.crawl_spa(
+                base_url, auth_cookie=auth_cookie, max_pages=max_pages
+            )
+
+            # Merge discovered links into endpoints
+            new_endpoints = 0
+            existing_urls = {
+                (ep if isinstance(ep, str) else ep.get("url", ""))
+                for ep in endpoints
+            }
+            for link in crawl_result.get("links_found", []):
+                if link not in existing_urls:
+                    endpoints.append({"url": link, "method": "GET", "source": "browser"})
+                    new_endpoints += 1
+
+            # Merge API calls
+            for api_call in crawl_result.get("api_calls", []):
+                parts = api_call.split(" ", 1)
+                if len(parts) == 2:
+                    method, url = parts
+                    if url not in existing_urls:
+                        endpoints.append({"url": url, "method": method, "source": "browser_api"})
+                        new_endpoints += 1
+
+            self.context["endpoints"] = endpoints
+            self.context["browser_js_files"] = crawl_result.get("js_files", [])
+            self.context["browser_forms"] = crawl_result.get("forms", [])
+
+            await self.log(db, "browser_scan",
+                f"Browser crawled {crawl_result.get('pages_visited', 0)} pages, "
+                f"found {new_endpoints} new endpoints, "
+                f"{len(crawl_result.get('api_calls', []))} API calls, "
+                f"{len(crawl_result.get('forms', []))} forms")
+
+            # Phase 2: DOM XSS browser-based testing
+            test_endpoints = [
+                ep if isinstance(ep, str) else ep.get("url", "")
+                for ep in endpoints[:15]
+            ]
+            dom_xss_findings = await browser_mod.check_dom_xss(
+                base_url, test_endpoints, auth_cookie=auth_cookie
+            )
+            for finding in dom_xss_findings:
+                vuln = Vulnerability(
+                    scan_id=self.scan_id,
+                    target_id=self.context["target_id"],
+                    vuln_type=VulnType.XSS_DOM,
+                    severity=Severity(finding.get("severity", "high")),
+                    title=f"[Browser] {finding['title']}",
+                    url=finding.get("url", base_url),
+                    description=finding.get("impact", ""),
+                    remediation=finding.get("remediation", ""),
+                    payload_used=finding.get("payload", ""),
+                    response_data={"injection_point": finding.get("injection_point"), "source": "browser"},
+                )
+                await self._save_vuln_deduped(db, vuln)
+
+            if dom_xss_findings:
+                await self.log(db, "browser_scan",
+                    f"Browser DOM XSS: {len(dom_xss_findings)} confirmed (executed in real browser)", "warning")
+
+            # Phase 3: Client JS analysis (dangerous patterns)
+            js_files = crawl_result.get("js_files", [])
+            if js_files:
+                js_findings = await browser_mod.analyze_client_js(base_url, js_files[:15])
+                # Only save HIGH severity JS findings (source→sink flows)
+                saved_js = 0
+                for finding in js_findings:
+                    if finding.get("severity") in ("high", "critical"):
+                        vuln = Vulnerability(
+                            scan_id=self.scan_id,
+                            target_id=self.context["target_id"],
+                            vuln_type=VulnType.INFO_DISCLOSURE,
+                            severity=Severity(finding.get("severity", "medium")),
+                            title=f"[Browser] {finding['title']}",
+                            url=finding.get("url", base_url),
+                            description=finding.get("impact", ""),
+                            remediation=finding.get("remediation", ""),
+                            response_data={"pattern": finding.get("pattern"), "context": finding.get("context")},
+                        )
+                        await self._save_vuln_deduped(db, vuln)
+                        saved_js += 1
+
+                if saved_js:
+                    await self.log(db, "browser_scan",
+                        f"Client JS analysis: {saved_js} dangerous patterns found", "warning")
+
+        except Exception as e:
+            await self.log(db, "browser_scan", f"Browser scan error: {e}", "warning")
+        finally:
+            try:
+                await browser_mod.close()
+            except Exception:
+                pass
 
     async def _phase_app_graph(self, db: AsyncSession):
         """Build application model / attack graph from discovered endpoints."""

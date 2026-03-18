@@ -409,7 +409,7 @@ def _severity_order(sev: str) -> int:
 
 PIPELINE_PHASES = [
     "Recon", "Subdomain Discovery", "Port Scan", "Fingerprint",
-    "Attack Routing", "Endpoint Discovery", "GraphQL Attacks", "Application Graph",
+    "Attack Routing", "Endpoint Discovery", "Browser Scan", "GraphQL Attacks", "Application Graph",
     "Stateful Crawling", "Auto Account Registration", "Sensitive Files",
     "Vulnerability Scan", "Nuclei Scan", "AI Analysis",
     "Payload Generation", "WAF Detection", "Exploit",
