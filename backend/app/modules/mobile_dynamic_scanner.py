@@ -137,18 +137,54 @@ setTimeout(function() {
     Java.perform(function() {
         console.log("[PHANTOM] Java SSL bypass starting...");
 
-        // 1. TrustManagerImpl (Conscrypt)
+        // 1. TrustManagerImpl.verifyChain — Android 14 signature
         try {
             var TrustManagerImpl = Java.use('com.android.org.conscrypt.TrustManagerImpl');
             TrustManagerImpl.verifyChain.overload(
-                '[Ljava.security.cert.X509Certificate;',
-                'java.lang.String', 'java.lang.String',
-                'java.lang.String', 'java.lang.String',
-                'boolean', '[B'
-            ).implementation = function(untrustedChain) {
-                console.log("[PHANTOM] TrustManagerImpl.verifyChain bypassed");
+                'java.util.List', 'java.util.List',
+                'java.lang.String', 'boolean', '[B', '[B'
+            ).implementation = function(sigAlgs, untrustedChain, authType, srv, ocsp, tls) {
+                console.log("[PHANTOM] verifyChain BYPASSED");
                 return untrustedChain;
             };
+            console.log("[PHANTOM] verifyChain hooked OK");
+        } catch(e) {
+            // Fallback: older Android versions
+            try {
+                var TMI = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+                TMI.verifyChain.overload(
+                    '[Ljava.security.cert.X509Certificate;',
+                    'java.lang.String', 'java.lang.String',
+                    'java.lang.String', 'java.lang.String',
+                    'boolean', '[B'
+                ).implementation = function(untrustedChain) {
+                    console.log("[PHANTOM] verifyChain(old) BYPASSED");
+                    return untrustedChain;
+                };
+                console.log("[PHANTOM] verifyChain(old) hooked OK");
+            } catch(e2) {}
+        }
+
+        // 1b. TrustManagerImpl.checkTrusted — both Android 14 overloads
+        try {
+            Java.use('com.android.org.conscrypt.TrustManagerImpl').checkTrusted.overload(
+                '[Ljava.security.cert.X509Certificate;', 'java.lang.String',
+                'javax.net.ssl.SSLSession', 'javax.net.ssl.SSLParameters', 'boolean'
+            ).implementation = function(chain, auth, sess, params, srv) {
+                console.log("[PHANTOM] checkTrusted BYPASSED");
+                return Java.use('java.util.Arrays').asList(chain);
+            };
+            console.log("[PHANTOM] checkTrusted(session) hooked OK");
+        } catch(e) {}
+        try {
+            Java.use('com.android.org.conscrypt.TrustManagerImpl').checkTrusted.overload(
+                '[Ljava.security.cert.X509Certificate;', '[B', '[B',
+                'java.lang.String', 'java.lang.String', 'boolean'
+            ).implementation = function(chain, ocsp, tls, host, auth, srv) {
+                console.log("[PHANTOM] checkTrusted2 BYPASSED: " + host);
+                return Java.use('java.util.Arrays').asList(chain);
+            };
+            console.log("[PHANTOM] checkTrusted(bytes) hooked OK");
         } catch(e) {}
 
         // 2. OkHttp3 CertificatePinner
@@ -388,6 +424,11 @@ class MobileDynamicScanner:
             # Step 8: Attach Frida (attach mode — Java VM is ready)
             logger.info("Step 8: Attaching Frida SSL bypass + proxy injection...")
             await self._attach_frida(package_name)
+
+            # Step 8b: Restart activity to trigger new requests with hooks active
+            logger.info("Step 8b: Restarting activity with hooks active...")
+            await self._restart_activity(package_name)
+            await asyncio.sleep(10)
 
             # Step 9: Auto-interact with the app
             logger.info(f"Step 9: Auto-interacting for {duration}s...")
@@ -666,10 +707,10 @@ class MobileDynamicScanner:
         logger.info("frida-server started on emulator")
 
     async def _attach_frida(self, package_name: str):
-        """Attach Frida to running app (attach mode, not spawn).
+        """Attach Frida CLI to running app (attach mode, not spawn).
 
-        Attach mode is critical: in spawn mode, Java VM isn't initialized
-        and Java.perform() fails with 'Java is not defined'.
+        Must use CLI frida (not Python API) — Python API doesn't set up
+        the Java bridge properly. Attach by PID after 8s delay for Java VM.
         """
         # Write Frida script
         Path(self.frida_script_file).write_text(SSL_BYPASS_SCRIPT)
@@ -678,30 +719,41 @@ class MobileDynamicScanner:
         if not os.path.exists(frida_bin):
             frida_bin = "frida"
 
+        # Get app PID
+        pid_output = await self._adb("shell", "pidof", package_name)
+        app_pid = pid_output.strip()
+        if not app_pid:
+            logger.warning(f"App {package_name} not running — skipping Frida")
+            return
+
         try:
             self.frida_proc = await asyncio.create_subprocess_exec(
                 frida_bin, "-D", "emulator-5554",
                 "-l", self.frida_script_file,
-                "-n", package_name,  # Attach by name (not -f spawn)
+                "-p", app_pid,  # Attach by PID (most reliable)
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             await asyncio.sleep(5)
 
-            # Read initial Frida output for HTTP log
+            # Read initial Frida output
             if self.frida_proc.stdout:
                 try:
                     data = await asyncio.wait_for(
-                        self.frida_proc.stdout.read(4096), timeout=2,
+                        self.frida_proc.stdout.read(8192), timeout=3,
                     )
                     output = data.decode(errors="replace")
                     logger.info(f"Frida output: {output[:500]}")
+                    if "hooked OK" in output or "HOOKS READY" in output:
+                        logger.info("Frida SSL bypass hooks installed successfully")
+                    elif "Java" in output and "not defined" in output:
+                        logger.warning("Java bridge not available — retrying...")
                 except asyncio.TimeoutError:
                     pass
 
-            logger.info(f"Frida attached to {package_name}")
+            logger.info(f"Frida attached to {package_name} (PID {app_pid})")
         except FileNotFoundError:
-            logger.warning("frida not installed — SSL bypass skipped")
+            logger.warning("frida CLI not installed — SSL bypass skipped")
 
     async def _read_frida_output(self):
         """Read Frida stdout for HTTP request logs."""
@@ -747,6 +799,36 @@ class MobileDynamicScanner:
                 "android.intent.category.LAUNCHER", "1",
             )
         await asyncio.sleep(5)
+
+    async def _restart_activity(self, package_name: str):
+        """Restart main activity without killing process.
+
+        This forces the app to re-initialize network connections
+        while Frida hooks are active (SSL bypass + proxy injection).
+        """
+        # Get main activity
+        output = await self._adb(
+            "shell", "cmd", "package", "resolve-activity",
+            "--brief", package_name,
+        )
+        activity = ""
+        for line in output.strip().split("\n"):
+            if "/" in line:
+                activity = line.strip()
+                break
+
+        if activity:
+            await self._adb(
+                "shell", "am", "start", "--activity-clear-top",
+                "-n", activity,
+            )
+        else:
+            # Fallback: just relaunch via monkey
+            await self._adb(
+                "shell", "monkey", "-p", package_name, "-c",
+                "android.intent.category.LAUNCHER", "1",
+            )
+        logger.info(f"Activity restarted: {activity or package_name}")
 
     async def _auto_interact(self, package_name: str, duration: int):
         """Automated UI interaction — swipe, tap, explore screens.
