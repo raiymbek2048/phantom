@@ -140,6 +140,7 @@ from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
 from app.modules.financial_logic import FinancialLogicModule
 from app.modules.jwt_attacks import JWTAttackModule
+from app.modules.authenticated_api_fuzzer import AuthenticatedAPIFuzzer
 from app.modules.auto_register import AutoRegister
 from app.modules.request_smuggling import RequestSmugglingModule
 from app.modules.mass_assignment import MassAssignmentModule
@@ -1148,6 +1149,7 @@ class ScanPipeline:
             "business_logic": self._phase_business_logic,
             "financial_logic": self._phase_financial_logic,
             "jwt_attacks": self._phase_jwt_attacks,
+            "auth_api_fuzz": self._phase_auth_api_fuzz,
             "graphql_attacks": self._phase_graphql_attacks,
             "request_smuggling": self._phase_request_smuggling,
             "mass_assignment": self._phase_mass_assignment,
@@ -1456,6 +1458,7 @@ Respond in JSON:
             ("graphql_attacks", 30, self._phase_graphql_attacks),
             ("app_graph", 32, self._phase_app_graph),
             ("stateful_crawl", 34, self._phase_stateful_crawl),
+            ("auth_api_fuzz", 36, self._phase_auth_api_fuzz),
             ("auto_register", 38, self._phase_auto_register),
             ("sensitive_files", 42, self._phase_sensitive_files),
             ("vuln_scan", 46, self._phase_vuln_scan),
@@ -1486,8 +1489,8 @@ Respond in JSON:
             # Skip heavy phases for quick scan
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
                     "evidence", "service_attack", "auth_attack", "stress_test",
-                    "stateful_crawl", "business_logic", "financial_logic",
-                    "auto_register",
+                    "stateful_crawl", "auth_api_fuzz", "business_logic",
+                    "financial_logic", "auto_register",
                     "request_smuggling", "mass_assignment", "cache_poisoning",
                     "mfa_bypass", "account_enumeration", "browser_scan"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
@@ -3722,6 +3725,66 @@ Respond in JSON:
                 f"{ids_count} harvested IDs")
         except Exception as e:
             await self.log(db, "stateful_crawl", f"Stateful crawl error (non-fatal): {e}", "error")
+
+    async def _phase_auth_api_fuzz(self, db: AsyncSession):
+        """Discover and test API endpoints using authenticated session."""
+        if self.context.get("stealth"):
+            await self.log(db, "auth_api_fuzz", "Skipped in stealth mode")
+            return
+
+        # Only run if we have auth credentials
+        has_auth = bool(
+            self.context.get("auth_headers") or
+            self.context.get("session_cookies") or
+            self.context.get("auth_cookie")
+        )
+        if not has_auth:
+            await self.log(db, "auth_api_fuzz", "No auth session — skipped")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = AuthenticatedAPIFuzzer(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "auth_api_fuzz")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+                vt_map = {v.value: v for v in VulnType}
+
+                saved = 0
+                for f in findings:
+                    raw_type = f.get("vuln_type", "info_disclosure")
+                    vuln_type = VULN_TYPE_ALIASES.get(raw_type, vt_map.get(raw_type, VulnType.INFO_DISCLOSURE))
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "Auth API finding")[:500],
+                        vuln_type=vuln_type,
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=f.get("url", "")[:2000],
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        ai_confidence=0.85,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "auth_api_fuzz",
+                    f"Auth API fuzzing: {saved} findings ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "auth_api_fuzz", "No auth API vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "auth_api_fuzz", f"Auth API fuzzing error (non-fatal): {e}", "error")
 
     async def _phase_auto_register(self, db: AsyncSession):
         """Auto-register a test account, obtain auth tokens for authenticated testing."""
