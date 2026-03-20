@@ -258,6 +258,8 @@ class MobileAPIExtractor:
         """Try to download APK by package name from public sources."""
         # Phase 1: Try lightweight HTTP scrapers
         http_downloaders = [
+            ("Aptoide", self._download_aptoide),
+            ("APK.cafe", self._download_apkcafe),
             ("APKPure", self._download_apkpure),
             ("Uptodown", self._download_uptodown),
         ]
@@ -304,6 +306,93 @@ class MobileAPIExtractor:
         }
 
     # ─── HTTP-based downloaders ───────────────────────────────────────
+
+    async def _download_apkcafe(self, package_name: str) -> str | None:
+        """Download APK from apk.cafe — simple structure, often works."""
+        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        # apk.cafe slug: kz.kkb.homebank → homebank
+        # Try known slug patterns
+        parts = package_name.split(".")
+        slugs = [parts[-1], "-".join(parts), package_name]
+
+        async with httpx.AsyncClient(
+            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
+        ) as client:
+            for slug in slugs:
+                try:
+                    page_url = f"https://{slug}.apk.cafe/"
+                    resp = await client.get(page_url)
+                    if resp.status_code != 200:
+                        continue
+
+                    # Find download link on page
+                    for pattern in [
+                        r'href="(https://[^"]+\.apk)"',
+                        r'href="(/download/[^"]+)"',
+                        r'data-href="(https://[^"]+\.apk[^"]*)"',
+                    ]:
+                        m = re.search(pattern, resp.text)
+                        if m:
+                            dl_url = m.group(1)
+                            if dl_url.startswith("/"):
+                                dl_url = f"https://{slug}.apk.cafe{dl_url}"
+                            dl_resp = await client.get(dl_url)
+                            if (dl_resp.status_code == 200
+                                    and len(dl_resp.content) > 100000
+                                    and dl_resp.content[:2] == b"PK"):
+                                Path(tmp_apk).write_bytes(dl_resp.content)
+                                logger.info(f"apk.cafe: {len(dl_resp.content)} bytes")
+                                return tmp_apk
+                except Exception:
+                    continue
+        return None
+
+    async def _download_aptoide(self, package_name: str) -> str | None:
+        """Download APK from Aptoide webservice API."""
+        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        async with httpx.AsyncClient(
+            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
+        ) as client:
+            # Aptoide has a public API for app info
+            api_url = f"https://ws75.aptoide.com/api/7/app/search?query={package_name}&limit=1"
+            resp = await client.get(api_url)
+            if resp.status_code != 200:
+                return None
+
+            try:
+                data = resp.json()
+                apps = data.get("datalist", {}).get("list", [])
+                if not apps:
+                    return None
+
+                # Find matching package
+                app_info = None
+                for app in apps:
+                    if app.get("package") == package_name:
+                        app_info = app
+                        break
+                if not app_info:
+                    app_info = apps[0]  # Best match
+
+                apk_url = app_info.get("file", {}).get("path")
+                if not apk_url:
+                    # Try alternate field
+                    apk_url = app_info.get("file", {}).get("path_alt")
+                if not apk_url:
+                    logger.debug(f"Aptoide: no download URL for {package_name}")
+                    return None
+
+                logger.info(f"Aptoide: downloading from {apk_url[:80]}...")
+                dl_resp = await client.get(apk_url)
+                if (dl_resp.status_code == 200
+                        and len(dl_resp.content) > 100000
+                        and dl_resp.content[:2] == b"PK"):
+                    Path(tmp_apk).write_bytes(dl_resp.content)
+                    logger.info(f"Aptoide: {len(dl_resp.content)} bytes")
+                    return tmp_apk
+            except Exception as e:
+                logger.debug(f"Aptoide parse error: {e}")
+        return None
 
     async def _download_apkpure(self, package_name: str) -> str | None:
         """Download APK from APKPure via HTTP."""
@@ -357,63 +446,50 @@ class MobileAPIExtractor:
     async def _download_uptodown(self, package_name: str) -> str | None:
         """Download APK from Uptodown."""
         tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
-        # Uptodown uses slug format: kz.homebank.mobile → kz-homebank-mobile
-        slug = package_name.replace(".", "-")
+        # Uptodown uses app name slug, not package name — try search
         async with httpx.AsyncClient(
             timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
         ) as client:
-            # Try direct page
-            page_url = f"https://{slug}.en.uptodown.com/android/download"
-            resp = await client.get(page_url)
+            # Search
+            search_resp = await client.get(
+                f"https://en.uptodown.com/android/search",
+                params={"q": package_name},
+            )
+            if search_resp.status_code != 200:
+                return None
+
+            # Find app link
+            m = re.search(
+                r'href="(https://[a-z0-9-]+\.en\.uptodown\.com/android)"',
+                search_resp.text,
+            )
+            if not m:
+                return None
+
+            app_url = m.group(1)
+            resp = await client.get(f"{app_url}/download")
             if resp.status_code != 200:
-                # Try search
-                search_resp = await client.get(
-                    f"https://en.uptodown.com/android/search",
-                    params={"q": package_name},
-                )
-                if search_resp.status_code != 200:
-                    return None
-                # Find app link
-                m = re.search(r'href="(https://[^"]+\.en\.uptodown\.com/android)"',
-                              search_resp.text)
-                if not m:
-                    return None
-                resp = await client.get(f"{m.group(1)}/download")
-                if resp.status_code != 200:
-                    return None
+                return None
 
             # Find download data-url
             for pattern in [
                 r'data-url="(https://[^"]+\.apk[^"]*)"',
                 r'id="detail-download-button"[^>]*data-url="([^"]+)"',
                 r'"downloadUrl"\s*:\s*"(https://[^"]+)"',
+                r'class="button download"[^>]*href="([^"]+)"',
             ]:
                 m = re.search(pattern, resp.text)
                 if m:
-                    dl_resp = await client.get(m.group(1))
-                    if dl_resp.status_code == 200 and len(dl_resp.content) > 100000:
-                        if dl_resp.content[:2] == b"PK":
-                            Path(tmp_apk).write_bytes(dl_resp.content)
-                            logger.info(f"Uptodown: {len(dl_resp.content)} bytes")
-                            return tmp_apk
-
-            # Uptodown post-click download
-            post_match = re.search(
-                r'class="button download"[^>]*href="([^"]+)"', resp.text
-            )
-            if post_match:
-                url2 = post_match.group(1)
-                if not url2.startswith("http"):
-                    url2 = f"https://{slug}.en.uptodown.com{url2}"
-                resp2 = await client.get(url2)
-                if resp2.status_code == 200:
-                    # Page with final download link
-                    final = re.search(r'href="(https://[^"]+\.apk[^"]*)"', resp2.text)
-                    if final:
-                        resp3 = await client.get(final.group(1))
-                        if resp3.status_code == 200 and resp3.content[:2] == b"PK":
-                            Path(tmp_apk).write_bytes(resp3.content)
-                            return tmp_apk
+                    dl_url = m.group(1)
+                    if dl_url.startswith("/"):
+                        dl_url = f"{app_url}{dl_url}"
+                    dl_resp = await client.get(dl_url)
+                    if (dl_resp.status_code == 200
+                            and len(dl_resp.content) > 100000
+                            and dl_resp.content[:2] == b"PK"):
+                        Path(tmp_apk).write_bytes(dl_resp.content)
+                        logger.info(f"Uptodown: {len(dl_resp.content)} bytes")
+                        return tmp_apk
         return None
 
     # ─── Browser-based downloaders (playwright) ──────────────────────
