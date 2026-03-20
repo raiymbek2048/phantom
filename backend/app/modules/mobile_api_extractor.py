@@ -46,7 +46,11 @@ API_PATH_PATTERN = re.compile(
 # Secret patterns
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("AWS Secret Key", re.compile(r'["\']([a-zA-Z0-9/+=]{40})["\']')),
+    # AWS secret must be near aws/secret/key context, not any random base64
+    ("AWS Secret Key", re.compile(
+        r'(?:aws|secret|s3)[_\s"\']*(?:key|access|secret)[^=]{0,10}[=:]\s*["\']([a-zA-Z0-9/+=]{40})["\']',
+        re.IGNORECASE,
+    )),
     ("Google API Key", re.compile(r'AIza[0-9A-Za-z_-]{35}')),
     ("Firebase URL", re.compile(r'https://[a-z0-9-]+\.firebaseio\.com')),
     ("Firebase API Key", re.compile(r'["\']AIza[0-9A-Za-z_-]{35}["\']')),
@@ -56,7 +60,12 @@ SECRET_PATTERNS = [
     ("Bearer Token", re.compile(r'["\']Bearer\s+([a-zA-Z0-9_\-/.+=]{20,})["\']')),
     ("JWT Token", re.compile(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')),
     ("OAuth Client Secret", re.compile(r'client[_-]?secret\s*[=:]\s*["\']([a-zA-Z0-9_\-/.+=]{8,})["\']', re.IGNORECASE)),
-    ("Hardcoded Password", re.compile(r'(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{4,})["\']', re.IGNORECASE)),
+    # Hardcoded password: must be assignment, not method call like .isPassword()
+    ("Hardcoded Password", re.compile(
+        r'(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{4,64})["\']'
+        r'(?!\s*\))',  # exclude .isPassword() pattern
+        re.IGNORECASE,
+    )),
     ("Encryption Key", re.compile(r'(?:encrypt|aes|des|secret)[_-]?key\s*[=:]\s*["\']([a-zA-Z0-9_\-/.+=]{8,})["\']', re.IGNORECASE)),
     ("Database URL", re.compile(r'(?:mysql|postgres|mongodb|redis)://[^\s"\']+', re.IGNORECASE)),
     ("Stripe Key", re.compile(r'[sp]k_(?:live|test)_[a-zA-Z0-9]{20,}')),
@@ -65,6 +74,13 @@ SECRET_PATTERNS = [
     ("Twilio SID", re.compile(r'AC[a-f0-9]{32}')),
     ("GitHub Token", re.compile(r'gh[ps]_[a-zA-Z0-9]{36}')),
 ]
+
+# False positive values to skip
+_FP_VALUES = {
+    "true", "false", "null", "undefined", "password", "none", "empty",
+    "test", "example", "placeholder", "changeme", "TODO", "FIXME",
+    "N/A", "n/a", "default", "string", "object", "boolean",
+}
 
 # OAuth / Auth config patterns
 OAUTH_PATTERNS = [
@@ -791,8 +807,22 @@ class MobileAPIExtractor:
                 if len(value) < 6:
                     continue
                 # Skip common false positives
-                if value in ("true", "false", "null", "undefined", "password"):
+                if value.lower().strip() in _FP_VALUES:
                     continue
+                # Skip Java method patterns (isPassword(), getPassword(), etc.)
+                ctx_start = max(0, match.start() - 30)
+                ctx = content[ctx_start:match.start()]
+                if re.search(r'\.\s*(?:is|get|set|has|check)\s*$', ctx, re.IGNORECASE):
+                    continue
+                # Skip pure base64 that decodes to ASCII text (not a real secret)
+                if secret_type == "AWS Secret Key":
+                    try:
+                        import base64
+                        decoded = base64.b64decode(value).decode("utf-8", errors="strict")
+                        if decoded.isascii() and " " in decoded:
+                            continue  # English text, not a key
+                    except Exception:
+                        pass
                 result["secrets"].append({
                     "type": secret_type,
                     "value": value[:100],  # Truncate long values
