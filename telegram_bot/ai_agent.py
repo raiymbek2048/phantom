@@ -5,9 +5,11 @@ executes them, and responds naturally.
 """
 import json
 import logging
+import time
 import traceback
 
 import httpx
+import redis as redis_lib
 
 logger = logging.getLogger("phantom_agent")
 
@@ -198,14 +200,19 @@ TOOLS = [
 ]
 
 
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+
+
 class PhantomAgent:
     """AI agent that uses Claude to reason and PHANTOM API to act."""
 
-    def __init__(self, phantom_api, claude_api_url: str, claude_api_key: str, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, phantom_api, claude_api_url: str, claude_api_key: str, model: str = "claude-haiku-4-5-20251001", redis_url: str = "redis://redis:6379/0"):
         self.api = phantom_api
         self.claude_url = claude_api_url
         self.claude_key = claude_api_key
         self.model = model
+        self.redis_url = redis_url
         # Per-user conversation history (chat_id -> messages)
         self._conversations: dict[int, list] = {}
         self._max_history = 20  # messages per user
@@ -246,30 +253,93 @@ class PhantomAgent:
                 raise Exception(f"Claude API error: {resp.status_code}")
             return resp.json()
 
-    async def _call_claude_oauth(self, chat_id: int, oauth_token: str) -> dict:
-        """Call Claude API with OAuth Bearer token."""
-        messages = self._get_history(chat_id)
-        async with httpx.AsyncClient(timeout=120) as c:
-            resp = await c.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Authorization": f"Bearer {oauth_token}",
-                    "anthropic-version": "2023-06-01",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "content-type": "application/json",
+    def _refresh_oauth_token(self) -> str | None:
+        """Refresh OAuth token using refresh_token from Redis. Returns new access token or None."""
+        try:
+            r = redis_lib.from_url(self.redis_url)
+            refresh_token = r.get("phantom:settings:claude_refresh_token")
+            if not refresh_token:
+                logger.error("No refresh token in Redis")
+                return None
+            refresh_token = refresh_token.decode() if isinstance(refresh_token, bytes) else refresh_token
+            if not refresh_token.startswith("sk-ant-ort"):
+                logger.error("Invalid refresh token format")
+                return None
+
+            resp = httpx.post(
+                OAUTH_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": OAUTH_CLIENT_ID,
                 },
-                json={
-                    "model": self.model,
-                    "max_tokens": 4096,
-                    "system": SYSTEM_PROMPT,
-                    "tools": TOOLS,
-                    "messages": messages,
-                },
+                timeout=15.0,
             )
             if resp.status_code != 200:
+                logger.error(f"OAuth refresh failed: {resp.status_code} {resp.text[:200]}")
+                return None
+
+            data = resp.json()
+            new_access = data.get("access_token")
+            new_refresh = data.get("refresh_token")
+            expires_in = data.get("expires_in", 28800)
+
+            if not new_access:
+                return None
+
+            # Store in Redis
+            r.set("phantom:settings:claude_oauth_token", new_access)
+            if new_refresh:
+                r.set("phantom:settings:claude_refresh_token", new_refresh)
+            r.set("phantom:settings:claude_token_expires_at", str(int(time.time()) + expires_in))
+            r.close()
+
+            logger.info(f"OAuth token refreshed: {new_access[:20]}... expires in {expires_in}s")
+            return new_access
+
+        except Exception as e:
+            logger.error(f"OAuth refresh error: {e}")
+            return None
+
+    async def _call_claude_oauth(self, chat_id: int, oauth_token: str) -> dict:
+        """Call Claude API with OAuth Bearer token. Auto-refreshes on 401."""
+        messages = self._get_history(chat_id)
+        payload = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": SYSTEM_PROMPT,
+            "tools": TOOLS,
+            "messages": messages,
+        }
+
+        for attempt in range(2):  # try once, refresh, retry
+            async with httpx.AsyncClient(timeout=120) as c:
+                resp = await c.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "Authorization": f"Bearer {oauth_token}",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "oauth-2025-04-20",
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+
+                if resp.status_code == 401 and attempt == 0:
+                    logger.warning("OAuth 401 — refreshing token...")
+                    new_token = self._refresh_oauth_token()
+                    if new_token:
+                        oauth_token = new_token
+                        continue  # retry with new token
+                    else:
+                        logger.error("Token refresh failed")
+
                 logger.error(f"Claude OAuth API error: {resp.status_code} {resp.text[:500]}")
                 raise Exception(f"Claude API error: {resp.status_code}")
-            return resp.json()
+
+        raise Exception("Claude API: max retries exhausted")
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         """Execute a PHANTOM tool and return result as string."""

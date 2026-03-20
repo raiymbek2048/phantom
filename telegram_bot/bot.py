@@ -213,7 +213,7 @@ async def post_init(app: Application):
     """Initialize agent and notifier."""
     global agent
 
-    agent = PhantomAgent(api, "https://api.anthropic.com", "", CLAUDE_MODEL)
+    agent = PhantomAgent(api, "https://api.anthropic.com", "", CLAUDE_MODEL, redis_url=REDIS_URL)
     logger.info(f"AI Agent initialized, model: {CLAUDE_MODEL}")
 
     # Test key availability
