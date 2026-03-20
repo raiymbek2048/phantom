@@ -360,7 +360,7 @@ class PhantomAgent:
                 if resp.status_code == 200:
                     return resp.json()
 
-                if resp.status_code == 401 and attempt == 0:
+                if resp.status_code in (401, 403) and attempt == 0:
                     logger.warning("OAuth 401 — refreshing token...")
                     new_token = self._refresh_oauth_token()
                     if new_token:
