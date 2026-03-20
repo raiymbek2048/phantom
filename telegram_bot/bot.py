@@ -103,11 +103,11 @@ async def _monitor_scan_loop(bot, chat_id: int, scan_id: str, interval: int):
                 await bot.send_message(chat_id, f"⚠️ Не могу получить статус скана: {e}")
                 break
 
-            status = scan.get("status", "?")
+            status = scan.get("status", "?").upper()
             phase = scan.get("current_phase", "?")
-            progress = scan.get("progress", 0)
-            vulns = scan.get("vulns_found", 0)
-            target = scan.get("target_name", scan.get("target_domain", "?"))
+            progress = scan.get("progress_percent", scan.get("progress", 0)) or 0
+            vulns = scan.get("vulns_found", 0) or 0
+            target = scan.get("target_name", scan.get("target_domain", scan.get("domain", "?")))
 
             new_vulns_text = f" (+{vulns - prev_vulns} new)" if vulns > prev_vulns else ""
             changed = "🔄" if (phase != prev_phase or vulns != prev_vulns) else "⏳"
