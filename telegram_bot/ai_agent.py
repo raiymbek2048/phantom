@@ -225,21 +225,42 @@ class PhantomAgent:
         self.claude_key = claude_api_key
         self.model = model
         self.redis_url = redis_url
-        # Per-user conversation history (chat_id -> messages)
-        self._conversations: dict[int, list] = {}
         self._max_history = 20  # messages per user
+        self._redis: redis_lib.Redis | None = None
+
+    def _get_redis(self) -> redis_lib.Redis:
+        if not self._redis:
+            self._redis = redis_lib.from_url(self.redis_url)
+        return self._redis
+
+    def _history_key(self, chat_id: int) -> str:
+        return f"phantom:telegram:history:{chat_id}"
 
     def _get_history(self, chat_id: int) -> list:
-        if chat_id not in self._conversations:
-            self._conversations[chat_id] = []
-        return self._conversations[chat_id]
+        try:
+            r = self._get_redis()
+            data = r.get(self._history_key(chat_id))
+            if data:
+                return json.loads(data.decode() if isinstance(data, bytes) else data)
+        except Exception as e:
+            logger.error(f"Redis history read error: {e}")
+        return []
+
+    def _save_history(self, chat_id: int, messages: list):
+        try:
+            r = self._get_redis()
+            # Trim old messages
+            if len(messages) > self._max_history * 2:
+                messages = messages[-self._max_history:]
+            r.set(self._history_key(chat_id), json.dumps(messages, default=str, ensure_ascii=False))
+            r.expire(self._history_key(chat_id), 86400)  # 24h TTL
+        except Exception as e:
+            logger.error(f"Redis history write error: {e}")
 
     def _add_message(self, chat_id: int, role: str, content):
         hist = self._get_history(chat_id)
         hist.append({"role": role, "content": content})
-        # Trim old messages
-        if len(hist) > self._max_history * 2:
-            self._conversations[chat_id] = hist[-self._max_history:]
+        self._save_history(chat_id, hist)
 
     async def _call_claude(self, chat_id: int) -> dict:
         """Call Claude API with conversation history and tools."""
