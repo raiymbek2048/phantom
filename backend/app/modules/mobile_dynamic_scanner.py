@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # host.docker.internal resolves to host machine (set via extra_hosts in docker-compose)
 SSH_HOST = os.environ.get("DYNAMIC_SCAN_HOST", "host.docker.internal")
 SSH_USER = os.environ.get("DYNAMIC_SCAN_USER", "trade")
-SSH_KEY = os.environ.get("DYNAMIC_SCAN_KEY", "/app/.ssh/id_ed25519")
+SSH_KEY = os.environ.get("DYNAMIC_SCAN_KEY", "/root/.ssh/id_ed25519")
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
 
 # Paths on the HOST machine
@@ -587,7 +587,7 @@ class MobileDynamicScanner:
 
     async def _adb(self, *args) -> str:
         """Run adb command on host via SSH."""
-        cmd = f"{ADB} {' '.join(args)}"
+        cmd = f"{ADB} {' '.join(args)} 2>&1"
         return await self._ssh(cmd, timeout=30)
 
     async def _shell(self, cmd: str) -> str:
@@ -665,10 +665,41 @@ class MobileDynamicScanner:
         return output.strip()
 
     async def _install_apk(self, apk_path: str):
-        """Install APK on emulator (APK is already on host)."""
-        output = await self._adb("install", "-r", "-g", apk_path)
-        if "Success" not in output:
-            logger.warning(f"APK install issue: {output[:300]}")
+        """Install APK on emulator (APK is already on host).
+
+        Handles both regular APKs and XAPK/split APK bundles.
+        """
+        # Check if it's an XAPK bundle (zip containing multiple .apk files)
+        check = await self._ssh(f"unzip -l {apk_path} '*.apk' 2>/dev/null | grep -c '\\.apk$'")
+        apk_count = check.strip()
+
+        if apk_count.isdigit() and int(apk_count) > 1:
+            # XAPK bundle — extract and install-multiple
+            extract_dir = f"/tmp/phantom_xapk_{int(time.time())}"
+            await self._ssh(f"mkdir -p {extract_dir} && unzip -o {apk_path} '*.apk' -d {extract_dir}")
+
+            # List extracted APKs
+            apk_list = await self._ssh(f"ls {extract_dir}/*.apk")
+            apk_files = [f.strip() for f in apk_list.strip().split("\n") if f.strip().endswith(".apk")]
+
+            if apk_files:
+                files_arg = " ".join(apk_files)
+                output = await self._ssh(
+                    f"{ADB} install-multiple -r -g {files_arg}",
+                    timeout=60,
+                )
+                if "Success" not in output:
+                    logger.warning(f"Split APK install issue: {output[:300]}")
+                else:
+                    logger.info(f"Split APK installed: {len(apk_files)} parts")
+
+            # Cleanup extracted files
+            await self._ssh(f"rm -rf {extract_dir}")
+        else:
+            # Regular APK
+            output = await self._adb("install", "-r", "-g", apk_path)
+            if "Success" not in output:
+                logger.warning(f"APK install issue: {output[:300]}")
 
     # ─── mitmproxy ───────────────────────────────────────────────────
 
