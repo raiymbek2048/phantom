@@ -227,6 +227,18 @@ TOOLS = [
             "required": ["file_path"],
         },
     },
+    {
+        "name": "analyze_apk",
+        "description": "Analyze an Android APK package — decompiles and extracts API endpoints, hardcoded secrets, OAuth config, certificate pinning info, and Android security issues. Pass package name (e.g. 'kz.homebank.mobile') or URL to APK file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "package_name": {"type": "string", "description": "Android package name (e.g. kz.homebank.mobile, kz.halykbank.superapp)"},
+                "apk_url": {"type": "string", "description": "Direct URL to APK file (alternative to package name)"},
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -448,6 +460,17 @@ class PhantomAgent:
             elif name == "send_file":
                 # This is handled specially in the bot — return the path
                 return json.dumps({"_send_file": args.get("file_path"), "caption": args.get("caption", "")})
+            elif name == "analyze_apk":
+                pkg = args.get("package_name", "")
+                url = args.get("apk_url", "")
+                if url:
+                    result = await self.api._request("POST", "/api/mobile/analyze-apk-url",
+                                                     data={"url": url})
+                elif pkg:
+                    result = await self.api._request("POST", "/api/mobile/analyze-package",
+                                                     data={"package_name": pkg})
+                else:
+                    result = {"error": "Provide package_name or apk_url"}
             else:
                 result = {"error": f"Unknown tool: {name}"}
 

@@ -28,7 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf-2.0-0 \
     libffi-dev \
     libcairo2 \
+    default-jre-headless \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install jadx (APK decompiler)
+RUN curl -sL https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip -o /tmp/jadx.zip && \
+    unzip -q /tmp/jadx.zip -d /opt/jadx && \
+    chmod +x /opt/jadx/bin/jadx && \
+    ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx && \
+    rm /tmp/jadx.zip
+
+# Install apktool
+RUN curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -o /usr/local/bin/apktool && \
+    curl -sL https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.10.0.jar -o /usr/local/bin/apktool.jar && \
+    chmod +x /usr/local/bin/apktool
 
 # Copy Go tools from builder
 COPY --from=go-builder /go/bin/subfinder /usr/local/bin/

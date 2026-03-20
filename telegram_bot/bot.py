@@ -313,6 +313,91 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_message(update, ctx)
 
 
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle file uploads — APK files sent to bot for analysis."""
+    if not _is_allowed(update):
+        return
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    filename = doc.file_name or ""
+
+    if filename.lower().endswith(".apk"):
+        await update.message.reply_text(
+            f"📱 Получил APK: <b>{filename}</b> ({doc.file_size // 1024}KB)\n"
+            f"Отправляю на анализ...",
+            parse_mode="HTML",
+        )
+        # Download file
+        try:
+            tg_file = await doc.get_file()
+            import tempfile
+            tmp_path = tempfile.mktemp(suffix=".apk")
+            await tg_file.download_to_drive(tmp_path)
+
+            # Send to PHANTOM API
+            import httpx
+            async with httpx.AsyncClient(timeout=300) as client:
+                with open(tmp_path, "rb") as f:
+                    resp = await client.post(
+                        f"{PHANTOM_URL}/api/mobile/analyze-apk",
+                        files={"file": (filename, f, "application/octet-stream")},
+                    )
+
+            import os
+            os.unlink(tmp_path)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                # Format results
+                text = f"📱 <b>APK Analysis: {data.get('package_name', filename)}</b>\n\n"
+                text += f"📦 Package: <code>{data.get('package_name', '?')}</code>\n"
+                text += f"🔗 API endpoints: <b>{len(data.get('api_endpoints', []))}</b>\n"
+                text += f"🔑 Secrets found: <b>{len(data.get('secrets', []))}</b>\n"
+                text += f"⚠️ Issues: <b>{len(data.get('android_issues', []))}</b>\n"
+                text += f"🌐 Base URLs: <b>{len(data.get('base_urls', []))}</b>\n"
+
+                if data.get("base_urls"):
+                    text += f"\n<b>Discovered base URLs:</b>\n"
+                    for url in data["base_urls"][:10]:
+                        text += f"• <code>{url}</code>\n"
+
+                if data.get("secrets"):
+                    text += f"\n<b>🔑 Secrets:</b>\n"
+                    for s in data["secrets"][:5]:
+                        text += f"• {s['type']}: <code>{s['value'][:30]}...</code>\n"
+
+                if data.get("findings_count", 0) > 0:
+                    text += f"\n🔴 <b>{data['findings_count']} security findings</b>"
+
+                await update.message.reply_text(text, parse_mode="HTML")
+
+                # If user also sent caption text, forward to AI
+                if update.message.caption:
+                    update.message.text = (
+                        f"Я загрузил APK {filename}. Результат анализа: "
+                        f"{len(data.get('api_endpoints', []))} API endpoints, "
+                        f"{len(data.get('secrets', []))} секретов, "
+                        f"{len(data.get('android_issues', []))} проблем. "
+                        f"{update.message.caption}"
+                    )
+                    await handle_message(update, ctx)
+            else:
+                await update.message.reply_text(f"❌ Ошибка анализа: {resp.text[:500]}")
+
+        except Exception as e:
+            logger.error(f"APK analysis error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка: {str(e)[:500]}")
+    else:
+        # Not an APK — tell user
+        await update.message.reply_text(
+            "📎 Я принимаю только APK файлы для анализа.\n"
+            "Отправь .apk файл или напиши: <i>проанализируй apk kz.homebank.mobile</i>",
+            parse_mode="HTML",
+        )
+
+
 async def post_init(app: Application):
     """Initialize agent and notifier."""
     global agent
@@ -372,6 +457,9 @@ def main():
 
     # ALL text goes through AI agent
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # APK file uploads
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     logger.info(f"Starting bot, PHANTOM: {PHANTOM_URL}, Model: {CLAUDE_MODEL}")
     app.run_polling(drop_pending_updates=True)

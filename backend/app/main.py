@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.models.database import engine, Base
-from app.api import targets, scans, vulnerabilities, reports, auth, websocket, schedules, training, dashboard, scan_templates, audit, notifications, hackerone, programs, submissions, autopilot, validate_report
+from app.api import targets, scans, vulnerabilities, reports, auth, websocket, schedules, training, dashboard, scan_templates, audit, notifications, hackerone, programs, submissions, autopilot, validate_report, mobile
 
 
 async def _ensure_pg_enums(conn):
@@ -99,6 +99,7 @@ app.include_router(programs.router, prefix="/api/programs", tags=["programs"])
 app.include_router(submissions.router, prefix="/api/submissions", tags=["submissions"])
 app.include_router(autopilot.router, prefix="/api/autopilot", tags=["autopilot"])
 app.include_router(validate_report.router, prefix="/api/validate", tags=["validate"])
+app.include_router(mobile.router, prefix="/api/mobile", tags=["mobile"])
 app.include_router(websocket.router, prefix="/ws", tags=["websocket"])
 
 
