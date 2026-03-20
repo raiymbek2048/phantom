@@ -256,175 +256,324 @@ class MobileAPIExtractor:
 
     async def extract_from_package(self, package_name: str) -> dict:
         """Try to download APK by package name from public sources."""
-        downloaders = [
-            self._download_apkcombo,
-            self._download_apkpure,
-            self._download_apkmonk,
+        # Phase 1: Try lightweight HTTP scrapers
+        http_downloaders = [
+            ("APKPure", self._download_apkpure),
+            ("Uptodown", self._download_uptodown),
         ]
-
-        for downloader in downloaders:
+        for name, downloader in http_downloaders:
             try:
                 apk_path = await downloader(package_name)
                 if apk_path and os.path.isfile(apk_path):
                     try:
                         result = await self.extract_from_apk(apk_path)
                         if "error" not in result:
+                            logger.info(f"APK downloaded via {name}")
                             return result
                     finally:
                         if os.path.exists(apk_path):
                             os.unlink(apk_path)
             except Exception as e:
-                logger.debug(f"APK downloader {downloader.__name__} failed: {e}")
-                continue
+                logger.debug(f"{name} failed for {package_name}: {e}")
 
-        return {"error": f"Could not download APK for package: {package_name}. Try uploading the APK file directly."}
+        # Phase 2: Use headless browser (handles JS/Cloudflare)
+        browser_sources = [
+            ("APKPure (browser)", self._browser_download_apkpure),
+            ("APKMirror (browser)", self._browser_download_apkmirror),
+        ]
+        for name, downloader in browser_sources:
+            try:
+                apk_path = await downloader(package_name)
+                if apk_path and os.path.isfile(apk_path):
+                    try:
+                        result = await self.extract_from_apk(apk_path)
+                        if "error" not in result:
+                            logger.info(f"APK downloaded via {name}")
+                            return result
+                    finally:
+                        if os.path.exists(apk_path):
+                            os.unlink(apk_path)
+            except Exception as e:
+                logger.debug(f"{name} failed for {package_name}: {e}")
 
-    async def _download_apkcombo(self, package_name: str) -> str | None:
-        """Download APK from APKCombo."""
-        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
-        async with httpx.AsyncClient(
-            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
-        ) as client:
-            # Step 1: Get the app page
-            page_url = f"https://apkcombo.com/apk/{package_name}/"
-            resp = await client.get(page_url)
-            if resp.status_code != 200:
-                logger.debug(f"APKCombo page {resp.status_code} for {package_name}")
-                return None
-
-            html = resp.text
-
-            # Step 2: Find download page link
-            # APKCombo has /download/... links
-            dl_page_match = re.search(
-                rf'href="(https://apkcombo\.com/[^"]*/{package_name}/download/[^"]*)"',
-                html,
+        return {
+            "error": (
+                f"Could not download APK for package: {package_name}. "
+                "All sources blocked. Upload the APK file directly to the bot."
             )
-            if not dl_page_match:
-                # Try alternate pattern
-                dl_page_match = re.search(
-                    r'href="(/[^"]+/download/[^"]*apk[^"]*)"', html,
-                )
-            if not dl_page_match:
-                logger.debug(f"APKCombo: no download link found for {package_name}")
-                return None
+        }
 
-            dl_page_url = dl_page_match.group(1)
-            if dl_page_url.startswith("/"):
-                dl_page_url = f"https://apkcombo.com{dl_page_url}"
-
-            # Step 3: Get download page
-            resp2 = await client.get(dl_page_url)
-            if resp2.status_code != 200:
-                return None
-
-            # Find actual APK download URL
-            apk_match = re.search(
-                r'href="(https://[^"]+\.apk[^"]*)"', resp2.text,
-            )
-            if not apk_match:
-                # Try data-url or other attrs
-                apk_match = re.search(
-                    r'data-url="(https://[^"]+\.apk[^"]*)"', resp2.text,
-                )
-            if not apk_match:
-                logger.debug("APKCombo: no APK URL on download page")
-                return None
-
-            # Step 4: Download APK
-            apk_url = apk_match.group(1)
-            logger.info(f"APKCombo: downloading {apk_url[:100]}...")
-            resp3 = await client.get(apk_url)
-            if resp3.status_code == 200 and len(resp3.content) > 50000:
-                Path(tmp_apk).write_bytes(resp3.content)
-                logger.info(f"APKCombo: downloaded {len(resp3.content)} bytes")
-                return tmp_apk
-
-        return None
+    # ─── HTTP-based downloaders ───────────────────────────────────────
 
     async def _download_apkpure(self, package_name: str) -> str | None:
-        """Download APK from APKPure."""
+        """Download APK from APKPure via HTTP."""
         tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
         async with httpx.AsyncClient(
             timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
         ) as client:
-            # APKPure page
-            page_url = f"https://apkpure.com/search?q={package_name}"
-            resp = await client.get(page_url)
+            # Direct download endpoint
+            dl_url = f"https://d.apkpure.com/b/APK/{package_name}?version=latest"
+            resp = await client.get(dl_url, headers={
+                **BROWSER_HEADERS,
+                "Referer": f"https://apkpure.com/app/{package_name}",
+            })
+            if resp.status_code == 200 and len(resp.content) > 100000:
+                if resp.content[:2] == b"PK":
+                    Path(tmp_apk).write_bytes(resp.content)
+                    logger.info(f"APKPure direct: {len(resp.content)} bytes")
+                    return tmp_apk
+
+            # Search + navigate
+            resp = await client.get(f"https://apkpure.com/search?q={package_name}")
             if resp.status_code != 200:
                 return None
 
-            # Find app link in search results
             app_match = re.search(
                 rf'href="(/[^"]+/{package_name})"', resp.text,
             )
             if not app_match:
-                logger.debug(f"APKPure: package not found in search for {package_name}")
                 return None
 
-            app_path = app_match.group(1)
-            # Go to download page
-            dl_url = f"https://apkpure.com{app_path}/download"
-            resp2 = await client.get(dl_url)
-            if resp2.status_code != 200:
-                return None
-
-            # Find direct download link
-            apk_match = re.search(
-                r'href="(https://[^"]+\.apk[^"]*)"', resp2.text,
+            dl_page = await client.get(
+                f"https://apkpure.com{app_match.group(1)}/download"
             )
-            if not apk_match:
-                # Try download button data attribute
-                apk_match = re.search(
-                    r'data-dt-url="(https://[^"]+)"', resp2.text,
-                )
-            if not apk_match:
-                logger.debug("APKPure: no download URL found")
+            if dl_page.status_code != 200:
                 return None
 
-            apk_url = apk_match.group(1)
-            logger.info(f"APKPure: downloading {apk_url[:100]}...")
-            resp3 = await client.get(apk_url)
-            if resp3.status_code == 200 and len(resp3.content) > 50000:
-                Path(tmp_apk).write_bytes(resp3.content)
-                logger.info(f"APKPure: downloaded {len(resp3.content)} bytes")
-                return tmp_apk
-
+            for pattern in [
+                r'href="(https://[^"]+\.apk[^"]*)"',
+                r'data-dt-url="(https://[^"]+)"',
+                r'"download_link"\s*:\s*"(https://[^"]+)"',
+            ]:
+                m = re.search(pattern, dl_page.text)
+                if m:
+                    resp3 = await client.get(m.group(1))
+                    if resp3.status_code == 200 and len(resp3.content) > 100000:
+                        if resp3.content[:2] == b"PK":
+                            Path(tmp_apk).write_bytes(resp3.content)
+                            return tmp_apk
         return None
 
-    async def _download_apkmonk(self, package_name: str) -> str | None:
-        """Download APK from APKMonk."""
+    async def _download_uptodown(self, package_name: str) -> str | None:
+        """Download APK from Uptodown."""
         tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        # Uptodown uses slug format: kz.homebank.mobile → kz-homebank-mobile
+        slug = package_name.replace(".", "-")
         async with httpx.AsyncClient(
             timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
         ) as client:
-            # APKMonk direct download
-            dl_url = f"https://www.apkmonk.com/download-app/{package_name}/1_apkmonk.com.apk"
-            resp = await client.get(dl_url)
-            if resp.status_code == 200 and len(resp.content) > 50000:
-                # Verify it's actually an APK (PK header)
-                if resp.content[:2] == b'PK':
-                    Path(tmp_apk).write_bytes(resp.content)
-                    logger.info(f"APKMonk: downloaded {len(resp.content)} bytes")
-                    return tmp_apk
+            # Try direct page
+            page_url = f"https://{slug}.en.uptodown.com/android/download"
+            resp = await client.get(page_url)
+            if resp.status_code != 200:
+                # Try search
+                search_resp = await client.get(
+                    f"https://en.uptodown.com/android/search",
+                    params={"q": package_name},
+                )
+                if search_resp.status_code != 200:
+                    return None
+                # Find app link
+                m = re.search(r'href="(https://[^"]+\.en\.uptodown\.com/android)"',
+                              search_resp.text)
+                if not m:
+                    return None
+                resp = await client.get(f"{m.group(1)}/download")
+                if resp.status_code != 200:
+                    return None
 
-            # Try alternate page
-            page_url = f"https://www.apkmonk.com/app/{package_name}/"
-            resp2 = await client.get(page_url)
-            if resp2.status_code != 200:
-                return None
+            # Find download data-url
+            for pattern in [
+                r'data-url="(https://[^"]+\.apk[^"]*)"',
+                r'id="detail-download-button"[^>]*data-url="([^"]+)"',
+                r'"downloadUrl"\s*:\s*"(https://[^"]+)"',
+            ]:
+                m = re.search(pattern, resp.text)
+                if m:
+                    dl_resp = await client.get(m.group(1))
+                    if dl_resp.status_code == 200 and len(dl_resp.content) > 100000:
+                        if dl_resp.content[:2] == b"PK":
+                            Path(tmp_apk).write_bytes(dl_resp.content)
+                            logger.info(f"Uptodown: {len(dl_resp.content)} bytes")
+                            return tmp_apk
 
-            apk_match = re.search(
-                r'href="(https?://[^"]+\.apk[^"]*)"', resp2.text,
+            # Uptodown post-click download
+            post_match = re.search(
+                r'class="button download"[^>]*href="([^"]+)"', resp.text
             )
-            if not apk_match:
-                return None
+            if post_match:
+                url2 = post_match.group(1)
+                if not url2.startswith("http"):
+                    url2 = f"https://{slug}.en.uptodown.com{url2}"
+                resp2 = await client.get(url2)
+                if resp2.status_code == 200:
+                    # Page with final download link
+                    final = re.search(r'href="(https://[^"]+\.apk[^"]*)"', resp2.text)
+                    if final:
+                        resp3 = await client.get(final.group(1))
+                        if resp3.status_code == 200 and resp3.content[:2] == b"PK":
+                            Path(tmp_apk).write_bytes(resp3.content)
+                            return tmp_apk
+        return None
 
-            resp3 = await client.get(apk_match.group(1))
-            if resp3.status_code == 200 and len(resp3.content) > 50000:
-                if resp3.content[:2] == b'PK':
-                    Path(tmp_apk).write_bytes(resp3.content)
-                    return tmp_apk
+    # ─── Browser-based downloaders (playwright) ──────────────────────
+
+    async def _browser_download_apkpure(self, package_name: str) -> str | None:
+        """Use headless Chromium to download from APKPure."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.debug("playwright not available")
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="phantom_apkdl_")
+        tmp_apk = os.path.join(tmp_dir, "app.apk")
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                context = await browser.new_context(
+                    user_agent=BROWSER_HEADERS["User-Agent"],
+                    accept_downloads=True,
+                )
+                page = await context.new_page()
+
+                # Search for the app
+                logger.info(f"Browser: searching APKPure for {package_name}")
+                await page.goto(
+                    f"https://apkpure.com/search?q={package_name}",
+                    timeout=30000,
+                )
+                await page.wait_for_load_state("domcontentloaded")
+
+                # Click on the matching result
+                app_link = page.locator(f'a[href*="/{package_name}"]').first
+                if not await app_link.is_visible():
+                    logger.debug("APKPure browser: app not found in search")
+                    await browser.close()
+                    return None
+
+                await app_link.click()
+                await page.wait_for_load_state("domcontentloaded")
+
+                # Find and click download button
+                dl_btn = page.locator(
+                    'a.da, a[href*="/download"], .download-start-btn'
+                ).first
+                if await dl_btn.is_visible():
+                    # Start download
+                    async with page.expect_download(timeout=120000) as dl_info:
+                        await dl_btn.click()
+                    download = await dl_info.value
+                    await download.save_as(tmp_apk)
+                    logger.info(f"APKPure browser: downloaded to {tmp_apk}")
+
+                    if os.path.isfile(tmp_apk) and os.path.getsize(tmp_apk) > 100000:
+                        # Verify PK header
+                        with open(tmp_apk, "rb") as f:
+                            if f.read(2) == b"PK":
+                                await browser.close()
+                                return tmp_apk
+
+                await browser.close()
+        except Exception as e:
+            logger.debug(f"APKPure browser error: {e}")
+        finally:
+            # Clean up tmp_dir only if download failed
+            if not os.path.isfile(tmp_apk):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return None
+
+    async def _browser_download_apkmirror(self, package_name: str) -> str | None:
+        """Use headless Chromium to download from APKMirror."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="phantom_apkdl_")
+        tmp_apk = os.path.join(tmp_dir, "app.apk")
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                context = await browser.new_context(
+                    user_agent=BROWSER_HEADERS["User-Agent"],
+                    accept_downloads=True,
+                )
+                page = await context.new_page()
+
+                logger.info(f"Browser: searching APKMirror for {package_name}")
+                await page.goto(
+                    f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={package_name}",
+                    timeout=30000,
+                )
+                await page.wait_for_load_state("domcontentloaded")
+
+                # Click first result
+                first_result = page.locator(
+                    '.appRowTitle a.fontBlack'
+                ).first
+                if not await first_result.is_visible():
+                    await browser.close()
+                    return None
+
+                await first_result.click()
+                await page.wait_for_load_state("domcontentloaded")
+
+                # Find APK variant (not bundle)
+                apk_row = page.locator(
+                    '.table-row a[href*="download"]'
+                ).first
+                # Try to find any download link
+                if not await apk_row.is_visible():
+                    apk_row = page.locator('a[href*="-release/"]').first
+
+                if await apk_row.is_visible():
+                    await apk_row.click()
+                    await page.wait_for_load_state("domcontentloaded")
+
+                    # Click "Download APK" button
+                    dl_btn = page.locator(
+                        'a.downloadButton, a[href*="download.php"], '
+                        'a:has-text("Download APK")'
+                    ).first
+                    if await dl_btn.is_visible():
+                        await dl_btn.click()
+                        await page.wait_for_load_state("domcontentloaded")
+
+                        # Final download click
+                        final_btn = page.locator(
+                            'a[data-google-vignette], a[href*="download"]'
+                        ).first
+                        if await final_btn.is_visible():
+                            async with page.expect_download(
+                                timeout=120000
+                            ) as dl_info:
+                                await final_btn.click()
+                            download = await dl_info.value
+                            await download.save_as(tmp_apk)
+
+                            if (os.path.isfile(tmp_apk)
+                                    and os.path.getsize(tmp_apk) > 100000):
+                                with open(tmp_apk, "rb") as f:
+                                    if f.read(2) == b"PK":
+                                        await browser.close()
+                                        return tmp_apk
+
+                await browser.close()
+        except Exception as e:
+            logger.debug(f"APKMirror browser error: {e}")
+        finally:
+            if not os.path.isfile(tmp_apk):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return None
 
