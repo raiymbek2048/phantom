@@ -35,6 +35,14 @@ expiration bypass, kid injection (path traversal/SQLi), weak secret brute force.
 Auth API Fuzzer: обнаружение скрытых API после логина, тест access control,
 sensitive data exposure, parameter injection, API versioning.
 
+Мобильный анализ (APK):
+• Статический (analyze_apk): декомпиляция, извлечение endpoints, секретов, OAuth конфигов
+• Динамический (dynamic_scan_apk): запуск в эмуляторе Android + Frida SSL bypass + mitmproxy перехват трафика
+  - Поддержка Flutter (libflutter.so bypass) и Java (OkHttp, Conscrypt, SSLContext)
+  - Авто-инъекция прокси через Frida хук OkHttpClient.Builder
+  - Захват реальных API эндпоинтов, токенов, заголовков
+  - Занимает 2-5 минут
+
 Правила:
 - Будь кратким, но информативным. Telegram — не место для эссе.
 - Используй эмодзи умеренно для наглядности.
@@ -229,7 +237,7 @@ TOOLS = [
     },
     {
         "name": "analyze_apk",
-        "description": "Analyze an Android APK package — decompiles and extracts API endpoints, hardcoded secrets, OAuth config, certificate pinning info, and Android security issues. Pass package name (e.g. 'kz.homebank.mobile') or URL to APK file.",
+        "description": "Static APK analysis — decompiles and extracts API endpoints, hardcoded secrets, OAuth config, certificate pinning info, and Android security issues. Pass package name (e.g. 'kz.homebank.mobile') or URL to APK file.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -238,6 +246,23 @@ TOOLS = [
             },
             "required": [],
         },
+    },
+    {
+        "name": "dynamic_scan_apk",
+        "description": "Dynamic APK analysis — runs app in Android emulator with Frida SSL bypass + mitmproxy traffic interception. Captures real API endpoints, tokens, headers from live traffic. Takes 2-5 minutes. Use when static analysis isn't enough (e.g. need real API traffic, auth tokens, runtime behavior).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "package_name": {"type": "string", "description": "Android package name (e.g. kz.kkb.homebank)"},
+                "duration": {"type": "integer", "description": "How long to run the app in seconds (default 120)"},
+            },
+            "required": ["package_name"],
+        },
+    },
+    {
+        "name": "dynamic_scan_status",
+        "description": "Check status of running dynamic APK scan. Returns status (idle/running/completed/failed) and results when done.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
@@ -471,6 +496,15 @@ class PhantomAgent:
                                                      data={"package_name": pkg})
                 else:
                     result = {"error": "Provide package_name or apk_url"}
+            elif name == "dynamic_scan_apk":
+                pkg = args.get("package_name", "")
+                dur = args.get("duration", 120)
+                result = await self.api._request(
+                    "POST", "/api/mobile/dynamic-scan",
+                    data={"package_name": pkg, "duration": str(dur)},
+                )
+            elif name == "dynamic_scan_status":
+                result = await self.api._request("GET", "/api/mobile/dynamic-status")
             else:
                 result = {"error": f"Unknown tool: {name}"}
 

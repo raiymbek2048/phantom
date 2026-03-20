@@ -270,6 +270,38 @@ class MobileAPIExtractor:
             if tmp_apk.exists():
                 tmp_apk.unlink()
 
+    async def download_apk(self, package_name: str) -> str | None:
+        """Download APK by package name. Returns path to APK file or None."""
+        http_downloaders = [
+            ("Aptoide", self._download_aptoide),
+            ("APK.cafe", self._download_apkcafe),
+            ("APKPure", self._download_apkpure),
+            ("Uptodown", self._download_uptodown),
+        ]
+        for name, downloader in http_downloaders:
+            try:
+                apk_path = await downloader(package_name)
+                if apk_path and os.path.isfile(apk_path):
+                    logger.info(f"APK downloaded via {name}: {apk_path}")
+                    return apk_path
+            except Exception as e:
+                logger.debug(f"{name} failed for {package_name}: {e}")
+
+        browser_sources = [
+            ("APKPure (browser)", self._browser_download_apkpure),
+            ("APKMirror (browser)", self._browser_download_apkmirror),
+        ]
+        for name, downloader in browser_sources:
+            try:
+                apk_path = await downloader(package_name)
+                if apk_path and os.path.isfile(apk_path):
+                    logger.info(f"APK downloaded via {name}: {apk_path}")
+                    return apk_path
+            except Exception as e:
+                logger.debug(f"{name} failed for {package_name}: {e}")
+
+        return None
+
     async def extract_from_package(self, package_name: str) -> dict:
         """Try to download APK by package name from public sources."""
         # Phase 1: Try lightweight HTTP scrapers
