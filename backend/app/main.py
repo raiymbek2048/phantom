@@ -28,7 +28,8 @@ async def _ensure_pg_enums(conn):
             except Exception:
                 pass
 
-    # Add new columns to existing tables
+    # Add new columns — use lock_timeout to avoid blocking on busy tables
+    await conn.execute(text("SET lock_timeout = '3s'"))
     new_columns = [
         ("targets", "tags", "JSONB"),
         ("schedules", "cron_expression", "VARCHAR(100)"),
@@ -44,6 +45,7 @@ async def _ensure_pg_enums(conn):
             ))
         except Exception:
             pass
+    await conn.execute(text("SET lock_timeout = '0'"))
 
 
 @asynccontextmanager
