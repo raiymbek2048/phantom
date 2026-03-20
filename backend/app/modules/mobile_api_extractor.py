@@ -118,11 +118,11 @@ SKIP_DOMAINS = {
     "crashlytics.com", "firebase.google.com",
 }
 
-# APK download sources
-APK_SOURCES = [
-    "https://d.apkpure.com/b/APK/{}",
-    "https://apk.support/download-app/{}",
-]
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class MobileAPIExtractor:
@@ -256,17 +256,177 @@ class MobileAPIExtractor:
 
     async def extract_from_package(self, package_name: str) -> dict:
         """Try to download APK by package name from public sources."""
-        for source_template in APK_SOURCES:
-            url = source_template.format(package_name)
+        downloaders = [
+            self._download_apkcombo,
+            self._download_apkpure,
+            self._download_apkmonk,
+        ]
+
+        for downloader in downloaders:
             try:
-                result = await self.extract_from_url(url)
-                if "error" not in result:
-                    return result
+                apk_path = await downloader(package_name)
+                if apk_path and os.path.isfile(apk_path):
+                    try:
+                        result = await self.extract_from_apk(apk_path)
+                        if "error" not in result:
+                            return result
+                    finally:
+                        if os.path.exists(apk_path):
+                            os.unlink(apk_path)
             except Exception as e:
-                logger.debug(f"APK source failed for {package_name}: {e}")
+                logger.debug(f"APK downloader {downloader.__name__} failed: {e}")
                 continue
 
-        return {"error": f"Could not download APK for package: {package_name}"}
+        return {"error": f"Could not download APK for package: {package_name}. Try uploading the APK file directly."}
+
+    async def _download_apkcombo(self, package_name: str) -> str | None:
+        """Download APK from APKCombo."""
+        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        async with httpx.AsyncClient(
+            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
+        ) as client:
+            # Step 1: Get the app page
+            page_url = f"https://apkcombo.com/apk/{package_name}/"
+            resp = await client.get(page_url)
+            if resp.status_code != 200:
+                logger.debug(f"APKCombo page {resp.status_code} for {package_name}")
+                return None
+
+            html = resp.text
+
+            # Step 2: Find download page link
+            # APKCombo has /download/... links
+            dl_page_match = re.search(
+                rf'href="(https://apkcombo\.com/[^"]*/{package_name}/download/[^"]*)"',
+                html,
+            )
+            if not dl_page_match:
+                # Try alternate pattern
+                dl_page_match = re.search(
+                    r'href="(/[^"]+/download/[^"]*apk[^"]*)"', html,
+                )
+            if not dl_page_match:
+                logger.debug(f"APKCombo: no download link found for {package_name}")
+                return None
+
+            dl_page_url = dl_page_match.group(1)
+            if dl_page_url.startswith("/"):
+                dl_page_url = f"https://apkcombo.com{dl_page_url}"
+
+            # Step 3: Get download page
+            resp2 = await client.get(dl_page_url)
+            if resp2.status_code != 200:
+                return None
+
+            # Find actual APK download URL
+            apk_match = re.search(
+                r'href="(https://[^"]+\.apk[^"]*)"', resp2.text,
+            )
+            if not apk_match:
+                # Try data-url or other attrs
+                apk_match = re.search(
+                    r'data-url="(https://[^"]+\.apk[^"]*)"', resp2.text,
+                )
+            if not apk_match:
+                logger.debug("APKCombo: no APK URL on download page")
+                return None
+
+            # Step 4: Download APK
+            apk_url = apk_match.group(1)
+            logger.info(f"APKCombo: downloading {apk_url[:100]}...")
+            resp3 = await client.get(apk_url)
+            if resp3.status_code == 200 and len(resp3.content) > 50000:
+                Path(tmp_apk).write_bytes(resp3.content)
+                logger.info(f"APKCombo: downloaded {len(resp3.content)} bytes")
+                return tmp_apk
+
+        return None
+
+    async def _download_apkpure(self, package_name: str) -> str | None:
+        """Download APK from APKPure."""
+        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        async with httpx.AsyncClient(
+            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
+        ) as client:
+            # APKPure page
+            page_url = f"https://apkpure.com/search?q={package_name}"
+            resp = await client.get(page_url)
+            if resp.status_code != 200:
+                return None
+
+            # Find app link in search results
+            app_match = re.search(
+                rf'href="(/[^"]+/{package_name})"', resp.text,
+            )
+            if not app_match:
+                logger.debug(f"APKPure: package not found in search for {package_name}")
+                return None
+
+            app_path = app_match.group(1)
+            # Go to download page
+            dl_url = f"https://apkpure.com{app_path}/download"
+            resp2 = await client.get(dl_url)
+            if resp2.status_code != 200:
+                return None
+
+            # Find direct download link
+            apk_match = re.search(
+                r'href="(https://[^"]+\.apk[^"]*)"', resp2.text,
+            )
+            if not apk_match:
+                # Try download button data attribute
+                apk_match = re.search(
+                    r'data-dt-url="(https://[^"]+)"', resp2.text,
+                )
+            if not apk_match:
+                logger.debug("APKPure: no download URL found")
+                return None
+
+            apk_url = apk_match.group(1)
+            logger.info(f"APKPure: downloading {apk_url[:100]}...")
+            resp3 = await client.get(apk_url)
+            if resp3.status_code == 200 and len(resp3.content) > 50000:
+                Path(tmp_apk).write_bytes(resp3.content)
+                logger.info(f"APKPure: downloaded {len(resp3.content)} bytes")
+                return tmp_apk
+
+        return None
+
+    async def _download_apkmonk(self, package_name: str) -> str | None:
+        """Download APK from APKMonk."""
+        tmp_apk = tempfile.mktemp(suffix=".apk", prefix="phantom_")
+        async with httpx.AsyncClient(
+            timeout=120, follow_redirects=True, headers=BROWSER_HEADERS
+        ) as client:
+            # APKMonk direct download
+            dl_url = f"https://www.apkmonk.com/download-app/{package_name}/1_apkmonk.com.apk"
+            resp = await client.get(dl_url)
+            if resp.status_code == 200 and len(resp.content) > 50000:
+                # Verify it's actually an APK (PK header)
+                if resp.content[:2] == b'PK':
+                    Path(tmp_apk).write_bytes(resp.content)
+                    logger.info(f"APKMonk: downloaded {len(resp.content)} bytes")
+                    return tmp_apk
+
+            # Try alternate page
+            page_url = f"https://www.apkmonk.com/app/{package_name}/"
+            resp2 = await client.get(page_url)
+            if resp2.status_code != 200:
+                return None
+
+            apk_match = re.search(
+                r'href="(https?://[^"]+\.apk[^"]*)"', resp2.text,
+            )
+            if not apk_match:
+                return None
+
+            resp3 = await client.get(apk_match.group(1))
+            if resp3.status_code == 200 and len(resp3.content) > 50000:
+                if resp3.content[:2] == b'PK':
+                    Path(tmp_apk).write_bytes(resp3.content)
+                    return tmp_apk
+
+        return None
 
     # ─── Decompilation ───────────────────────────────────────────────────
 
