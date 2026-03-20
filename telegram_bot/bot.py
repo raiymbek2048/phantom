@@ -34,7 +34,7 @@ ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
 # Claude config — bot gets key from PHANTOM's Redis (same as backend)
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 api = PhantomAPI(PHANTOM_URL, PHANTOM_USER, PHANTOM_PASS)
 agent: PhantomAgent | None = None
