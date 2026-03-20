@@ -109,21 +109,20 @@ async def _monitor_scan_loop(bot, chat_id: int, scan_id: str, interval: int):
             vulns = scan.get("vulns_found", 0)
             target = scan.get("target_name", scan.get("target_domain", "?"))
 
-            # Send update only if something changed
-            if phase != prev_phase or vulns != prev_vulns:
-                new_vulns_text = f" (+{vulns - prev_vulns} new)" if vulns > prev_vulns else ""
-                text = (
-                    f"📡 <b>Scan Update</b>\n"
-                    f"Target: {target}\n"
-                    f"Phase: <code>{phase}</code> | Progress: {progress}%\n"
-                    f"Vulns: {vulns}{new_vulns_text}"
-                )
-                try:
-                    await bot.send_message(chat_id, text, parse_mode="HTML")
-                except Exception:
-                    pass
-                prev_phase = phase
-                prev_vulns = vulns
+            new_vulns_text = f" (+{vulns - prev_vulns} new)" if vulns > prev_vulns else ""
+            changed = "🔄" if (phase != prev_phase or vulns != prev_vulns) else "⏳"
+            text = (
+                f"{changed} <b>Scan Update</b>\n"
+                f"Target: {target}\n"
+                f"Phase: <code>{phase}</code> | Progress: {progress}%\n"
+                f"Vulns: {vulns}{new_vulns_text}"
+            )
+            try:
+                await bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception:
+                pass
+            prev_phase = phase
+            prev_vulns = vulns
 
             if status in ("COMPLETED", "FAILED", "STOPPED"):
                 # Final summary
