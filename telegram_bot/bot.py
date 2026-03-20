@@ -245,6 +245,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     active_chat_ids.add(update.effective_chat.id)
+    logger.info(f"Message from user_id={update.effective_user.id} "
+                f"username={update.effective_user.username} "
+                f"chat_id={update.effective_chat.id}: {update.message.text[:50]}")
     user_text = update.message.text.strip()
     if not user_text:
         return
