@@ -18,6 +18,7 @@ from telegram.ext import (
 from phantom_api import PhantomAPI
 from ai_agent import PhantomAgent
 from notifier import ScanNotifier
+from auth_bridge import AuthBridge
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 api = PhantomAPI(PHANTOM_URL, PHANTOM_USER, PHANTOM_PASS)
 agent: PhantomAgent | None = None
+auth_bridge: AuthBridge | None = None
 
 # Chat IDs that have sent /start — used for notifier
 active_chat_ids: set[int] = set()
@@ -247,6 +249,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+    # Check if this is a response to an auth request
+    if auth_bridge and auth_bridge.has_pending:
+        if auth_bridge.try_handle_auth_response(update.effective_chat.id, user_text):
+            await update.message.reply_text("✅ Данные получены. PHANTOM продолжает работу...")
+            return
+
     if not agent:
         await update.message.reply_text("❌ AI Agent not initialized. Check Claude API key.")
         return
@@ -317,13 +325,21 @@ async def post_init(app: Application):
     else:
         logger.warning("No Claude API key found! Bot will not be able to respond.")
 
-    # Start notifier
+    # Start notifier and auth bridge
     if ALLOWED_USERS:
         chat_ids = {int(uid.strip()) for uid in ALLOWED_USERS.split(",") if uid.strip()}
-        if chat_ids:
-            notifier = ScanNotifier(app.bot, chat_ids, REDIS_URL)
-            asyncio.create_task(notifier.start())
-            logger.info(f"Notifier started for {chat_ids}")
+    else:
+        chat_ids = set()
+
+    if chat_ids:
+        notifier = ScanNotifier(app.bot, chat_ids, REDIS_URL)
+        asyncio.create_task(notifier.start())
+        logger.info(f"Notifier started for {chat_ids}")
+
+        global auth_bridge
+        auth_bridge = AuthBridge(app.bot, chat_ids, REDIS_URL)
+        asyncio.create_task(auth_bridge.start())
+        logger.info(f"AuthBridge started for {chat_ids}")
 
     await app.bot.set_my_commands([
         BotCommand("start", "Start / Help"),

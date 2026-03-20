@@ -1442,6 +1442,7 @@ Respond in JSON:
             ("portscan", 15, self._phase_portscan),
             ("fingerprint", 20, self._phase_fingerprint),
             ("attack_routing", 23, self._phase_attack_routing),
+            ("auth_check", 25, self._check_auth_needed),
             ("endpoint", 28, self._phase_endpoint),
             ("browser_scan", 29, self._phase_browser_scan),
             ("graphql_attacks", 30, self._phase_graphql_attacks),
@@ -1859,6 +1860,52 @@ Respond in JSON:
             })
         else:
             await self.log(db, "attack_routing", "No specific attack vectors identified — using default strategy")
+
+    async def _check_auth_needed(self, db: AsyncSession):
+        """Check if target needs authentication and request from user if needed."""
+        try:
+            from app.core.auth_manager import AuthManager
+            auth_mgr = AuthManager()
+            domain = self.context.get("domain", "")
+
+            # Already have auth?
+            if self.context.get("auth_cookie") or self.context.get("auth_headers"):
+                return
+
+            auth_info = auth_mgr.detect_auth_type(self.context)
+            self.context["auth_info"] = auth_info
+
+            if not auth_info["needs_auth"]:
+                await self.log(db, "auth_check", "No authentication required for this target.")
+                return
+
+            await self.log(db, "auth_check",
+                f"Authentication needed: {auth_info['auth_type']} — {auth_info['details']}", "warning")
+
+            # Try to get/request credentials
+            result = auth_mgr.ensure_authenticated(domain, self.context, str(self.scan_id))
+
+            if result and result.get("credentials"):
+                creds = result["credentials"]
+                if creds.get("skip"):
+                    await self.log(db, "auth_check", "User skipped authentication.", "warning")
+                    return
+
+                # Store in context for subsequent phases
+                if creds.get("token"):
+                    self.context["auth_headers"] = {"Authorization": f"Bearer {creds['token']}"}
+                    await self.log(db, "auth_check", "Auth token received from user.", "success")
+                elif creds.get("username") or creds.get("phone"):
+                    self.context["user_credentials"] = creds
+                    await self.log(db, "auth_check",
+                        f"Credentials received for {creds.get('username') or creds.get('phone', '?')}. "
+                        f"Will attempt login during endpoint discovery.", "success")
+            else:
+                await self.log(db, "auth_check",
+                    "No credentials provided. Continuing with unauthenticated scan.", "warning")
+
+        except Exception as e:
+            await self.log(db, "auth_check", f"Auth check error: {e}", "warning")
 
     async def _phase_endpoint(self, db: AsyncSession):
         endpoint_mod = EndpointModule()
