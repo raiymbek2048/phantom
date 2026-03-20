@@ -38,19 +38,19 @@ TOOLS = [
     },
     {
         "name": "list_targets",
-        "description": "List all scan targets",
+        "description": "List all scan targets. Each target has: id, domain, status, scope. Use target 'id' field for start_scan.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "create_target",
-        "description": "Create a new scan target",
+        "description": "Create a new scan target. Pass domain name (e.g. 'example.com' or 'https://example.com'). Returns existing target if domain already exists.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Target URL (e.g. https://example.com)"},
-                "name": {"type": "string", "description": "Optional friendly name"},
+                "domain": {"type": "string", "description": "Domain to scan (e.g. example.com or https://example.com)"},
+                "scope": {"type": "string", "description": "Optional scope rules (e.g. '*.example.com')"},
             },
-            "required": ["url"],
+            "required": ["domain"],
         },
     },
     {
@@ -184,6 +184,18 @@ TOOLS = [
         "name": "get_top_targets",
         "description": "Get top targets ranked by vulnerability count",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "monitor_scan",
+        "description": "Start background monitoring of a scan — sends progress updates to the user every N seconds until scan completes. Then sends final summary.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scan_id": {"type": "string", "description": "Scan UUID to monitor"},
+                "interval": {"type": "integer", "description": "Update interval in seconds (default 30, min 15)"},
+            },
+            "required": ["scan_id"],
+        },
     },
     {
         "name": "send_file",
@@ -349,10 +361,8 @@ class PhantomAgent:
             elif name == "list_targets":
                 result = await self.api.list_targets()
             elif name == "create_target":
-                url = args["url"]
-                if not url.startswith("http"):
-                    url = f"https://{url}"
-                result = await self.api.create_target(url, args.get("name"))
+                domain = args["domain"]
+                result = await self.api.create_target(domain, args.get("scope"))
             elif name == "start_scan":
                 result = await self.api.start_scan(args["target_id"], args.get("scan_type", "full"))
             elif name == "get_scan_status":
@@ -393,6 +403,9 @@ class PhantomAgent:
                 result = await self.api.autopilot_status()
             elif name == "get_top_targets":
                 result = await self.api.get_top_targets()
+            elif name == "monitor_scan":
+                interval = max(15, args.get("interval", 30))
+                return json.dumps({"_monitor_scan": args["scan_id"], "interval": interval})
             elif name == "send_file":
                 # This is handled specially in the bot — return the path
                 return json.dumps({"_send_file": args.get("file_path"), "caption": args.get("caption", "")})
@@ -460,15 +473,22 @@ class PhantomAgent:
                 logger.info(f"Executing tool: {tool['name']}({tool.get('input', {})})")
                 result_str = await self._execute_tool(tool["name"], tool.get("input", {}))
 
-                # Check for file send
+                # Check for special actions (file send, scan monitor)
                 try:
                     parsed = json.loads(result_str)
-                    if isinstance(parsed, dict) and parsed.get("_send_file"):
-                        responses.append({
-                            "type": "file",
-                            "path": parsed["_send_file"],
-                            "caption": parsed.get("caption", ""),
-                        })
+                    if isinstance(parsed, dict):
+                        if parsed.get("_send_file"):
+                            responses.append({
+                                "type": "file",
+                                "path": parsed["_send_file"],
+                                "caption": parsed.get("caption", ""),
+                            })
+                        if parsed.get("_monitor_scan"):
+                            responses.append({
+                                "type": "monitor",
+                                "scan_id": parsed["_monitor_scan"],
+                                "interval": parsed.get("interval", 30),
+                            })
                 except (json.JSONDecodeError, TypeError):
                     pass
 

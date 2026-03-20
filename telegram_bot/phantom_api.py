@@ -43,7 +43,17 @@ class PhantomAPI:
                     headers={"Authorization": f"Bearer {self.token}"},
                     **kwargs,
                 )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = resp.text[:500]
+                try:
+                    detail = resp.json().get("detail", detail)
+                except Exception:
+                    pass
+                raise httpx.HTTPStatusError(
+                    f"{resp.status_code}: {detail}",
+                    request=resp.request,
+                    response=resp,
+                )
             ct = resp.headers.get("content-type", "")
             if ct.startswith("application/json"):
                 return resp.json()
@@ -71,8 +81,10 @@ class PhantomAPI:
     async def list_targets(self) -> list:
         return await self._request("GET", "/api/targets")
 
-    async def create_target(self, url: str, name: str | None = None) -> dict:
-        data = {"url": url, "name": name or url}
+    async def create_target(self, domain: str, scope: str | None = None) -> dict:
+        data = {"domain": domain}
+        if scope:
+            data["scope"] = scope
         return await self._request("POST", "/api/targets", json=data)
 
     async def get_target(self, target_id: str) -> dict:

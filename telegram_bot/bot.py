@@ -84,6 +84,84 @@ def _get_claude_key() -> tuple[str, bool] | None:
     return None
 
 
+SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+
+# Active scan monitors (scan_id -> task)
+_monitors: dict[str, asyncio.Task] = {}
+
+
+async def _monitor_scan_loop(bot, chat_id: int, scan_id: str, interval: int):
+    """Background loop: sends scan progress updates, then final summary."""
+    prev_phase = None
+    prev_vulns = 0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                scan = await api.get_scan(scan_id)
+            except Exception as e:
+                await bot.send_message(chat_id, f"⚠️ Не могу получить статус скана: {e}")
+                break
+
+            status = scan.get("status", "?")
+            phase = scan.get("current_phase", "?")
+            progress = scan.get("progress", 0)
+            vulns = scan.get("vulns_found", 0)
+            target = scan.get("target_name", scan.get("target_domain", "?"))
+
+            # Send update only if something changed
+            if phase != prev_phase or vulns != prev_vulns:
+                new_vulns_text = f" (+{vulns - prev_vulns} new)" if vulns > prev_vulns else ""
+                text = (
+                    f"📡 <b>Scan Update</b>\n"
+                    f"Target: {target}\n"
+                    f"Phase: <code>{phase}</code> | Progress: {progress}%\n"
+                    f"Vulns: {vulns}{new_vulns_text}"
+                )
+                try:
+                    await bot.send_message(chat_id, text, parse_mode="HTML")
+                except Exception:
+                    pass
+                prev_phase = phase
+                prev_vulns = vulns
+
+            if status in ("COMPLETED", "FAILED", "STOPPED"):
+                # Final summary
+                if status == "COMPLETED":
+                    # Get vuln breakdown
+                    try:
+                        all_vulns = await api.list_vulns(limit=100)
+                        scan_vulns = [v for v in all_vulns if str(v.get("scan_id", "")) == scan_id]
+                        by_sev = {}
+                        for v in scan_vulns:
+                            s = v.get("severity", "info")
+                            by_sev[s] = by_sev.get(s, 0) + 1
+                        sev_text = " | ".join(f"{SEVERITY_EMOJI.get(s, '⚪')}{s}: {c}" for s, c in sorted(by_sev.items()))
+                        text = (
+                            f"✅ <b>Scan Complete!</b>\n\n"
+                            f"Target: {target}\n"
+                            f"Total vulns: <b>{vulns}</b>\n"
+                            f"{sev_text}\n\n"
+                            f"Напиши «покажи уязвимости» или «скинь отчёт» для деталей."
+                        )
+                    except Exception:
+                        text = f"✅ <b>Scan Complete!</b>\nTarget: {target}\nVulns: {vulns}"
+                elif status == "FAILED":
+                    text = f"❌ <b>Scan Failed</b>\nTarget: {target}"
+                else:
+                    text = f"🛑 <b>Scan Stopped</b>\nTarget: {target}\nVulns found so far: {vulns}"
+
+                try:
+                    await bot.send_message(chat_id, text, parse_mode="HTML")
+                except Exception:
+                    pass
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _monitors.pop(scan_id, None)
+
+
 async def _send_response(update: Update, response: dict):
     """Send a single response item (text or file)."""
     if response["type"] == "text":
@@ -108,6 +186,22 @@ async def _send_response(update: Update, response: dict):
             os.unlink(path)  # cleanup
         else:
             await update.message.reply_text("❌ Не удалось скачать файл отчёта.")
+    elif response["type"] == "monitor":
+        scan_id = response["scan_id"]
+        interval = response.get("interval", 30)
+        if scan_id in _monitors:
+            await update.message.reply_text(f"📡 Мониторинг скана уже запущен.")
+        else:
+            task = asyncio.create_task(
+                _monitor_scan_loop(
+                    update.get_bot(),
+                    update.effective_chat.id,
+                    scan_id,
+                    interval,
+                )
+            )
+            _monitors[scan_id] = task
+            await update.message.reply_text(f"📡 Мониторинг запущен — обновления каждые {interval}с.")
 
 
 # --- Handlers ---
