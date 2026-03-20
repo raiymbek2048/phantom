@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     default-jre-headless \
     unzip \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Install jadx (APK decompiler)

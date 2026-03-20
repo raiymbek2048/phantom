@@ -45,6 +45,9 @@ services:
       - ./backend:/app
       - scan_results:/app/results
       - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.ssh:/app/.ssh:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy

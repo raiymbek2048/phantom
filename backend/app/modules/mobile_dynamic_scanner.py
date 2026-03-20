@@ -2,6 +2,9 @@
 Mobile Dynamic Scanner — runs APK in headless Android emulator,
 intercepts traffic via mitmproxy, bypasses SSL pinning with Frida.
 
+All commands execute via SSH to the host machine because the backend
+runs inside Docker while emulator/adb/frida/mitmproxy live on the host.
+
 Pipeline:
 1. Start headless Android emulator (if not running)
 2. Install mitmproxy CA cert as system cert (tmpfs overlay)
@@ -21,21 +24,30 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-ANDROID_HOME = os.environ.get("ANDROID_HOME", "/mnt/docker/android-sdk")
-ANDROID_AVD_HOME = os.environ.get("ANDROID_AVD_HOME", "/mnt/docker/android-avd")
+# SSH connection to host (emulator + tools run there, backend is in Docker)
+# host.docker.internal resolves to host machine (set via extra_hosts in docker-compose)
+SSH_HOST = os.environ.get("DYNAMIC_SCAN_HOST", "host.docker.internal")
+SSH_USER = os.environ.get("DYNAMIC_SCAN_USER", "trade")
+SSH_KEY = os.environ.get("DYNAMIC_SCAN_KEY", "/app/.ssh/id_ed25519")
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+
+# Paths on the HOST machine
+ANDROID_HOME = "/mnt/docker/android-sdk"
+ANDROID_AVD_HOME = "/mnt/docker/android-avd"
 ADB = os.path.join(ANDROID_HOME, "platform-tools", "adb")
 EMULATOR = os.path.join(ANDROID_HOME, "emulator", "emulator")
 AVD_NAME = "phantom_avd"
 MITMPROXY_PORT = 8888
 FRIDA_PORT = 27042
 
-# Tools path (venv with mitmproxy + frida)
-TOOLS_BIN = os.environ.get("PHANTOM_TOOLS_BIN", "/mnt/docker/phantom-tools/bin")
+# Tools path on HOST (venv with mitmproxy + frida)
+TOOLS_BIN = "/mnt/docker/phantom-tools/bin"
 
 # ─── Frida SSL Bypass Script (Universal: Java + Flutter + OkHttp proxy injection) ───
 
@@ -354,16 +366,73 @@ SKIP_HOSTS = {
 
 
 class MobileDynamicScanner:
-    """Runs APK in emulator, intercepts traffic, extracts real endpoints."""
+    """Runs APK in emulator, intercepts traffic, extracts real endpoints.
+
+    All commands execute via SSH because backend runs in Docker
+    while emulator/tools are on the host.
+    """
 
     def __init__(self):
-        self.emulator_proc = None
-        self.mitmproxy_proc = None
-        self.frida_proc = None
+        self.frida_log = []
+        # Remote (host) paths
         self.capture_file = "/tmp/phantom_mitm_capture.json"
         self.addon_file = "/tmp/phantom_mitm_addon.py"
         self.frida_script_file = "/tmp/phantom_frida_bypass.js"
-        self.frida_log = []
+
+    async def _ssh(self, cmd: str, timeout: int = 30) -> str:
+        """Execute command on host via SSH."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", *SSH_OPTS, "-i", SSH_KEY,
+                f"{SSH_USER}@{SSH_HOST}", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
+            )
+            return stdout.decode(errors="replace")
+        except asyncio.TimeoutError:
+            logger.debug(f"SSH timeout: {cmd[:80]}")
+            return ""
+        except Exception as e:
+            logger.debug(f"SSH error: {e}")
+            return ""
+
+    async def _ssh_bg(self, cmd: str) -> None:
+        """Execute command on host via SSH in background (nohup)."""
+        bg_cmd = f"nohup {cmd} > /dev/null 2>&1 &"
+        await self._ssh(bg_cmd, timeout=10)
+
+    async def _scp_to_host(self, local_path: str, remote_path: str) -> bool:
+        """Copy file from Docker container to host via SCP."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "scp", *SSH_OPTS, "-i", SSH_KEY,
+                local_path, f"{SSH_USER}@{SSH_HOST}:{remote_path}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            return proc.returncode == 0
+        except Exception as e:
+            logger.error(f"SCP error: {e}")
+            return False
+
+    async def _ssh_read_file(self, remote_path: str) -> str:
+        """Read file content from host via SSH."""
+        return await self._ssh(f"cat {remote_path}", timeout=15)
+
+    async def _ssh_write_file(self, remote_path: str, content: str) -> None:
+        """Write file on host via SCP (avoids shell escaping issues)."""
+        # Write to local temp file, then SCP to host
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
+            f.write(content)
+            local_path = f.name
+        try:
+            await self._scp_to_host(local_path, remote_path)
+        finally:
+            os.unlink(local_path)
 
     async def scan(self, apk_path: str, package_name: str = "",
                    duration: int = 120) -> dict:
@@ -388,6 +457,13 @@ class MobileDynamicScanner:
         }
 
         try:
+            # Step 0: Transfer APK to host (backend runs in Docker)
+            remote_apk = f"/tmp/phantom_scan_{int(time.time())}.apk"
+            logger.info(f"Step 0: Transferring APK to host: {remote_apk}")
+            if not await self._scp_to_host(apk_path, remote_apk):
+                result["errors"].append("Failed to transfer APK to host via SCP")
+                return result
+
             # Step 1: Ensure emulator is running
             logger.info("Step 1: Ensuring emulator is running...")
             if not await self._ensure_emulator():
@@ -398,11 +474,11 @@ class MobileDynamicScanner:
             logger.info("Step 2: Installing mitmproxy CA as system cert...")
             await self._install_system_ca()
 
-            # Step 3: Install APK
-            logger.info(f"Step 3: Installing APK: {apk_path}")
+            # Step 3: Install APK (from host path)
+            logger.info(f"Step 3: Installing APK: {remote_apk}")
             if not package_name:
-                package_name = await self._get_package_name(apk_path)
-            await self._install_apk(apk_path)
+                package_name = await self._get_package_name(remote_apk)
+            await self._install_apk(remote_apk)
 
             # Step 4: Set system proxy
             logger.info("Step 4: Setting system proxy...")
@@ -450,43 +526,38 @@ class MobileDynamicScanner:
             result["errors"].append(str(e))
         finally:
             await self._cleanup_processes()
+            # Clean remote APK
+            await self._ssh(f"rm -f {remote_apk}")
 
         return result
 
     # ─── Emulator Management ─────────────────────────────────────────
 
     async def _ensure_emulator(self) -> bool:
-        """Start emulator if not already running."""
+        """Start emulator if not already running (via SSH to host)."""
         output = await self._adb("devices")
         if "emulator" in output:
-            # Verify it's actually booted
             boot = await self._adb("shell", "getprop", "sys.boot_completed")
             if boot.strip() == "1":
                 logger.info("Emulator already running and booted")
                 return True
 
-        # Check AVD exists
-        avd_dir = Path(ANDROID_AVD_HOME) / f"{AVD_NAME}.avd"
-        if not avd_dir.exists():
+        # Check AVD exists on host
+        check = await self._ssh(f"test -d {ANDROID_AVD_HOME}/{AVD_NAME}.avd && echo exists")
+        if "exists" not in check:
             logger.info(f"Creating AVD: {AVD_NAME}")
             await self._create_avd()
 
-        # Start emulator headless
-        logger.info("Starting headless emulator...")
-        env = os.environ.copy()
-        env["ANDROID_HOME"] = ANDROID_HOME
-        env["ANDROID_AVD_HOME"] = ANDROID_AVD_HOME
-
-        self.emulator_proc = await asyncio.create_subprocess_exec(
-            EMULATOR, f"@{AVD_NAME}",
-            "-no-window", "-no-audio", "-no-boot-anim",
-            "-gpu", "swiftshader_indirect",
-            "-memory", "2048",
-            "-no-snapshot-save",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+        # Start emulator headless on host
+        logger.info("Starting headless emulator on host...")
+        emu_cmd = (
+            f"ANDROID_HOME={ANDROID_HOME} ANDROID_AVD_HOME={ANDROID_AVD_HOME} "
+            f"nohup {EMULATOR} @{AVD_NAME} "
+            f"-no-window -no-audio -no-boot-anim "
+            f"-gpu swiftshader_indirect -memory 2048 -no-snapshot-save "
+            f"> /tmp/phantom_emulator.log 2>&1 &"
         )
+        await self._ssh(emu_cmd, timeout=15)
 
         # Wait for boot (max 180s)
         for i in range(90):
@@ -494,91 +565,59 @@ class MobileDynamicScanner:
             boot = await self._adb("shell", "getprop", "sys.boot_completed")
             if boot.strip() == "1":
                 logger.info(f"Emulator booted in {(i+1)*2}s")
-                await asyncio.sleep(5)  # Extra wait for system services
+                await asyncio.sleep(5)
                 return True
 
         logger.error("Emulator boot timeout (180s)")
         return False
 
     async def _create_avd(self):
-        """Create Android Virtual Device."""
+        """Create Android Virtual Device on host."""
         avdmanager = os.path.join(
             ANDROID_HOME, "cmdline-tools", "latest", "bin", "avdmanager",
         )
-        env = os.environ.copy()
-        env["ANDROID_HOME"] = ANDROID_HOME
-        env["ANDROID_AVD_HOME"] = ANDROID_AVD_HOME
-
-        proc = await asyncio.create_subprocess_exec(
-            avdmanager, "create", "avd",
-            "-n", AVD_NAME,
-            "-k", "system-images;android-34;google_apis;x86_64",
-            "-d", "pixel_6",
-            "--force",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+        cmd = (
+            f"ANDROID_HOME={ANDROID_HOME} ANDROID_AVD_HOME={ANDROID_AVD_HOME} "
+            f"echo 'no' | {avdmanager} create avd "
+            f"-n {AVD_NAME} -k 'system-images;android-34;google_apis;x86_64' "
+            f"-d pixel_6 --force"
         )
-        stdout, stderr = await proc.communicate(input=b"no\n")
-        logger.info(f"AVD created: {stdout.decode()[:200]}")
+        output = await self._ssh(cmd, timeout=60)
+        logger.info(f"AVD created: {output[:200]}")
 
     async def _adb(self, *args) -> str:
-        """Run adb command and return output."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                ADB, *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=30,
-            )
-            return stdout.decode(errors="replace")
-        except asyncio.TimeoutError:
-            logger.debug(f"adb {' '.join(args)} timeout")
-            return ""
-        except Exception as e:
-            logger.debug(f"adb {' '.join(args)} error: {e}")
-            return ""
+        """Run adb command on host via SSH."""
+        cmd = f"{ADB} {' '.join(args)}"
+        return await self._ssh(cmd, timeout=30)
 
     async def _shell(self, cmd: str) -> str:
-        """Run shell command on emulator."""
-        return await self._adb("shell", cmd)
+        """Run shell command on emulator via SSH+adb."""
+        return await self._adb("shell", f"'{cmd}'")
 
     # ─── System CA Certificate ────────────────────────────────────────
 
     async def _install_system_ca(self):
         """Install mitmproxy CA as system cert using tmpfs overlay.
 
-        Android 14+ has readonly /system. We use a tmpfs overlay:
-        1. Copy existing system certs to temp
-        2. Mount tmpfs over /system/etc/security/cacerts
-        3. Restore original certs + add mitmproxy CA
+        All operations via SSH to host. Android 14+ has readonly /system.
+        We use a tmpfs overlay.
         """
-        ca_pem = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
-        if not ca_pem.exists():
-            # Generate CA cert by starting mitmproxy briefly
-            logger.info("Generating mitmproxy CA cert...")
-            proc = await asyncio.create_subprocess_exec(
-                os.path.join(TOOLS_BIN, "mitmdump"), "--help",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            if not ca_pem.exists():
+        # Check if CA cert exists on host
+        ca_pem = f"/home/{SSH_USER}/.mitmproxy/mitmproxy-ca-cert.pem"
+        check = await self._ssh(f"test -f {ca_pem} && echo exists")
+        if "exists" not in check:
+            logger.info("Generating mitmproxy CA cert on host...")
+            await self._ssh(f"{TOOLS_BIN}/mitmdump --help > /dev/null 2>&1")
+            check = await self._ssh(f"test -f {ca_pem} && echo exists")
+            if "exists" not in check:
                 logger.warning("mitmproxy CA cert not found — SSL intercept may fail")
                 return
 
-        # Get cert hash for Android naming
-        proc = await asyncio.create_subprocess_exec(
-            "openssl", "x509", "-inform", "PEM", "-subject_hash_old",
-            "-in", str(ca_pem), "-noout",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Get cert hash
+        cert_hash = await self._ssh(
+            f"openssl x509 -inform PEM -subject_hash_old -in {ca_pem} -noout"
         )
-        stdout, _ = await proc.communicate()
-        cert_hash = stdout.decode().strip()
+        cert_hash = cert_hash.strip()
         if not cert_hash:
             logger.warning("Failed to get cert hash")
             return
@@ -586,57 +625,47 @@ class MobileDynamicScanner:
         cert_name = f"{cert_hash}.0"
 
         # Push PEM cert to emulator
-        await self._adb("push", str(ca_pem), f"/sdcard/{cert_name}")
+        await self._ssh(f"{ADB} push {ca_pem} /sdcard/{cert_name}")
 
-        # Run the tmpfs overlay commands as root
-        await self._adb("root")
+        # Run tmpfs overlay as root
+        await self._ssh(f"{ADB} root")
         await asyncio.sleep(2)
 
         # Check if already installed
-        check = await self._shell(f"ls /system/etc/security/cacerts/{cert_name} 2>/dev/null")
+        check = await self._ssh(
+            f"{ADB} shell ls /system/etc/security/cacerts/{cert_name} 2>/dev/null"
+        )
         if cert_name in check:
             logger.info("mitmproxy CA cert already installed as system cert")
             return
 
         # Tmpfs overlay approach
         commands = [
-            # Copy existing certs to temp
             "mkdir -p /data/local/tmp/cacerts",
             "cp /system/etc/security/cacerts/* /data/local/tmp/cacerts/",
-            # Copy our cert
             f"cp /sdcard/{cert_name} /data/local/tmp/cacerts/{cert_name}",
             f"chmod 644 /data/local/tmp/cacerts/{cert_name}",
-            # Mount tmpfs overlay
             "mount -t tmpfs tmpfs /system/etc/security/cacerts",
-            # Restore all certs
             "cp /data/local/tmp/cacerts/* /system/etc/security/cacerts/",
             "chmod 644 /system/etc/security/cacerts/*",
             "chcon u:object_r:system_file:s0 /system/etc/security/cacerts/*",
-            # Cleanup temp
             "rm -rf /data/local/tmp/cacerts",
         ]
         for cmd in commands:
-            await self._shell(cmd)
+            await self._ssh(f"{ADB} shell '{cmd}'")
 
         logger.info(f"mitmproxy CA cert installed as system cert: {cert_name}")
 
     # ─── APK Management ──────────────────────────────────────────────
 
     async def _get_package_name(self, apk_path: str) -> str:
-        """Extract package name from APK using aapt2."""
+        """Extract package name from APK using aapt2 on host."""
         aapt2 = os.path.join(ANDROID_HOME, "build-tools", "34.0.0", "aapt2")
-        if not os.path.exists(aapt2):
-            return ""
-        proc = await asyncio.create_subprocess_exec(
-            aapt2, "dump", "packagename", apk_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        return stdout.decode().strip()
+        output = await self._ssh(f"{aapt2} dump packagename {apk_path}", timeout=15)
+        return output.strip()
 
     async def _install_apk(self, apk_path: str):
-        """Install APK on emulator."""
+        """Install APK on emulator (APK is already on host)."""
         output = await self._adb("install", "-r", "-g", apk_path)
         if "Success" not in output:
             logger.warning(f"APK install issue: {output[:300]}")
@@ -644,146 +673,114 @@ class MobileDynamicScanner:
     # ─── mitmproxy ───────────────────────────────────────────────────
 
     async def _start_mitmproxy(self):
-        """Start mitmproxy as background process."""
-        # Write addon script
-        Path(self.addon_file).write_text(MITM_ADDON_SCRIPT)
+        """Start mitmproxy on host as background process."""
+        # Write addon script on host
+        await self._ssh_write_file(self.addon_file, MITM_ADDON_SCRIPT)
         # Clear previous capture
-        Path(self.capture_file).write_text("[]")
+        await self._ssh(f"echo '[]' > {self.capture_file}")
 
-        env = os.environ.copy()
-        env["MITM_CAPTURE_FILE"] = self.capture_file
+        # Kill any existing mitmproxy
+        await self._ssh("pkill -f mitmdump 2>/dev/null; sleep 1")
 
         mitmdump = os.path.join(TOOLS_BIN, "mitmdump")
-        if not os.path.exists(mitmdump):
-            mitmdump = "mitmdump"  # Fallback to PATH
-
-        self.mitmproxy_proc = await asyncio.create_subprocess_exec(
-            mitmdump, "-p", str(MITMPROXY_PORT),
-            "-s", self.addon_file,
-            "--set", "ssl_insecure=true",
-            "--set", "connection_strategy=lazy",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+        cmd = (
+            f"MITM_CAPTURE_FILE={self.capture_file} "
+            f"nohup {mitmdump} -p {MITMPROXY_PORT} "
+            f"-s {self.addon_file} "
+            f"--set ssl_insecure=true --set connection_strategy=lazy "
+            f"> /tmp/phantom_mitm.log 2>&1 &"
         )
+        await self._ssh(cmd, timeout=10)
         await asyncio.sleep(3)
-        logger.info(f"mitmproxy started on port {MITMPROXY_PORT}")
+        logger.info(f"mitmproxy started on host port {MITMPROXY_PORT}")
 
     async def _set_proxy(self):
         """Configure emulator to use mitmproxy."""
-        await self._adb(
-            "shell", "settings", "put", "global", "http_proxy",
-            f"10.0.2.2:{MITMPROXY_PORT}",
-        )
+        await self._adb("shell", "settings", "put", "global", "http_proxy",
+                         f"10.0.2.2:{MITMPROXY_PORT}")
 
     # ─── Frida ───────────────────────────────────────────────────────
 
     async def _ensure_frida_server(self):
-        """Ensure frida-server is running on the emulator as root."""
-        await self._adb("root")
+        """Ensure frida-server is running on emulator (via SSH)."""
+        await self._ssh(f"{ADB} root")
         await asyncio.sleep(1)
 
-        ps_out = await self._shell("ps -A | grep frida-server")
+        ps_out = await self._ssh(f"{ADB} shell 'ps -A | grep frida-server'")
         if "frida-server" in ps_out:
             logger.info("frida-server already running")
             return
 
-        # Try to start frida-server
         frida_server = "/data/local/tmp/frida-server"
-        check = await self._shell(f"ls {frida_server}")
+        check = await self._ssh(f"{ADB} shell ls {frida_server}")
         if "No such file" in check:
             logger.warning(f"frida-server not found at {frida_server}")
             return
 
-        await self._shell(f"chmod 755 {frida_server}")
-        # Start in background
-        await asyncio.create_subprocess_exec(
-            ADB, "shell",
-            f"{frida_server} -D &",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        await self._ssh(f"{ADB} shell chmod 755 {frida_server}")
+        # Start frida-server in background on emulator
+        await self._ssh(f"{ADB} shell 'nohup {frida_server} -D &' &")
         await asyncio.sleep(3)
         logger.info("frida-server started on emulator")
 
     async def _attach_frida(self, package_name: str):
-        """Attach Frida CLI to running app (attach mode, not spawn).
+        """Attach Frida CLI to running app (via SSH to host).
 
         Must use CLI frida (not Python API) — Python API doesn't set up
         the Java bridge properly. Attach by PID after 8s delay for Java VM.
         """
-        # Write Frida script
-        Path(self.frida_script_file).write_text(SSL_BYPASS_SCRIPT)
+        # Write Frida script on host
+        await self._ssh_write_file(self.frida_script_file, SSL_BYPASS_SCRIPT)
 
         frida_bin = os.path.join(TOOLS_BIN, "frida")
-        if not os.path.exists(frida_bin):
-            frida_bin = "frida"
 
         # Get app PID
-        pid_output = await self._adb("shell", "pidof", package_name)
+        pid_output = await self._ssh(f"{ADB} shell pidof {package_name}")
         app_pid = pid_output.strip()
         if not app_pid:
             logger.warning(f"App {package_name} not running — skipping Frida")
             return
 
-        try:
-            self.frida_proc = await asyncio.create_subprocess_exec(
-                frida_bin, "-D", "emulator-5554",
-                "-l", self.frida_script_file,
-                "-p", app_pid,  # Attach by PID (most reliable)
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.sleep(5)
+        # Run Frida in background on host, capture output to log file
+        frida_log = "/tmp/phantom_frida.log"
+        cmd = (
+            f"nohup {frida_bin} -D emulator-5554 "
+            f"-l {self.frida_script_file} "
+            f"-p {app_pid} "
+            f"> {frida_log} 2>&1 &"
+        )
+        await self._ssh(cmd, timeout=10)
+        await asyncio.sleep(5)
 
-            # Read initial Frida output
-            if self.frida_proc.stdout:
-                try:
-                    data = await asyncio.wait_for(
-                        self.frida_proc.stdout.read(8192), timeout=3,
-                    )
-                    output = data.decode(errors="replace")
-                    logger.info(f"Frida output: {output[:500]}")
-                    if "hooked OK" in output or "HOOKS READY" in output:
-                        logger.info("Frida SSL bypass hooks installed successfully")
-                    elif "Java" in output and "not defined" in output:
-                        logger.warning("Java bridge not available — retrying...")
-                except asyncio.TimeoutError:
-                    pass
+        # Read Frida output
+        output = await self._ssh(f"cat {frida_log}", timeout=10)
+        if output:
+            logger.info(f"Frida output: {output[:500]}")
+            if "hooked OK" in output or "HOOKS READY" in output:
+                logger.info("Frida SSL bypass hooks installed successfully")
+            elif "Java" in output and "not defined" in output:
+                logger.warning("Java bridge not available")
 
-            logger.info(f"Frida attached to {package_name} (PID {app_pid})")
-        except FileNotFoundError:
-            logger.warning("frida CLI not installed — SSL bypass skipped")
+        logger.info(f"Frida attached to {package_name} (PID {app_pid})")
 
     async def _read_frida_output(self):
-        """Read Frida stdout for HTTP request logs."""
-        if not self.frida_proc or not self.frida_proc.stdout:
-            return
-        try:
-            while True:
-                data = await asyncio.wait_for(
-                    self.frida_proc.stdout.readline(), timeout=1,
-                )
-                if not data:
-                    break
-                line = data.decode(errors="replace").strip()
-                if "[PHANTOM-HTTP]" in line:
-                    self.frida_log.append(line)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        """Read Frida log from host for HTTP request logs."""
+        output = await self._ssh("cat /tmp/phantom_frida.log 2>/dev/null", timeout=10)
+        for line in output.split("\n"):
+            line = line.strip()
+            if "[PHANTOM-HTTP]" in line and line not in self.frida_log:
+                self.frida_log.append(line)
 
     # ─── App Interaction ─────────────────────────────────────────────
 
     async def _launch_app(self, package_name: str):
-        """Launch the app."""
-        # Force stop first
-        await self._adb("shell", "am", "force-stop", package_name)
+        """Launch the app on emulator via SSH."""
+        await self._adb("shell", f"am force-stop {package_name}")
         await asyncio.sleep(1)
 
         # Get main activity
-        output = await self._adb(
-            "shell", "cmd", "package", "resolve-activity",
-            "--brief", package_name,
+        output = await self._ssh(
+            f"{ADB} shell cmd package resolve-activity --brief {package_name}"
         )
         activity = ""
         for line in output.strip().split("\n"):
@@ -792,24 +789,20 @@ class MobileDynamicScanner:
                 break
 
         if activity:
-            await self._adb("shell", "am", "start", "-n", activity)
+            await self._adb("shell", f"am start -n {activity}")
         else:
-            await self._adb(
-                "shell", "monkey", "-p", package_name, "-c",
-                "android.intent.category.LAUNCHER", "1",
-            )
+            await self._adb("shell",
+                f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
         await asyncio.sleep(5)
 
     async def _restart_activity(self, package_name: str):
         """Restart main activity without killing process.
 
-        This forces the app to re-initialize network connections
-        while Frida hooks are active (SSL bypass + proxy injection).
+        Forces app to re-initialize network connections
+        while Frida hooks are active.
         """
-        # Get main activity
-        output = await self._adb(
-            "shell", "cmd", "package", "resolve-activity",
-            "--brief", package_name,
+        output = await self._ssh(
+            f"{ADB} shell cmd package resolve-activity --brief {package_name}"
         )
         activity = ""
         for line in output.strip().split("\n"):
@@ -818,56 +811,37 @@ class MobileDynamicScanner:
                 break
 
         if activity:
-            await self._adb(
-                "shell", "am", "start", "--activity-clear-top",
-                "-n", activity,
-            )
+            await self._adb("shell", f"am start --activity-clear-top -n {activity}")
         else:
-            # Fallback: just relaunch via monkey
-            await self._adb(
-                "shell", "monkey", "-p", package_name, "-c",
-                "android.intent.category.LAUNCHER", "1",
-            )
+            await self._adb("shell",
+                f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
         logger.info(f"Activity restarted: {activity or package_name}")
 
     async def _auto_interact(self, package_name: str, duration: int):
-        """Automated UI interaction — swipe, tap, explore screens.
-
-        Uses gentle monkey events + targeted taps/swipes.
-        Also periodically reads Frida HTTP output.
-        """
+        """Automated UI interaction via SSH — monkey events + taps/swipes."""
         start = time.time()
         interactions = 0
 
         while time.time() - start < duration:
             try:
-                # Monkey events (20 at a time, gentle)
-                await self._adb(
-                    "shell", "monkey", "-p", package_name,
-                    "--throttle", "1000",
-                    "--pct-touch", "40",
-                    "--pct-motion", "20",
-                    "--pct-trackball", "0",
-                    "--pct-nav", "20",
-                    "--pct-majornav", "10",
-                    "--pct-syskeys", "5",
-                    "--pct-appswitch", "5",
-                    "--pct-anyevent", "0",
-                    "-v", "20",
+                monkey_cmd = (
+                    f"monkey -p {package_name} --throttle 1000 "
+                    f"--pct-touch 40 --pct-motion 20 --pct-trackball 0 "
+                    f"--pct-nav 20 --pct-majornav 10 --pct-syskeys 5 "
+                    f"--pct-appswitch 5 --pct-anyevent 0 -v 20"
                 )
+                await self._adb("shell", monkey_cmd)
                 interactions += 20
             except Exception:
                 pass
 
-            # Targeted interactions
-            await self._adb("shell", "input", "swipe", "500", "1500", "500", "300")
+            await self._adb("shell", "input swipe 500 1500 500 300")
             await asyncio.sleep(1)
-            await self._adb("shell", "input", "tap", "540", "960")
+            await self._adb("shell", "input tap 540 960")
             await asyncio.sleep(2)
 
-            # Back button occasionally
             if interactions % 40 == 0:
-                await self._adb("shell", "input", "keyevent", "KEYCODE_BACK")
+                await self._adb("shell", "input keyevent KEYCODE_BACK")
                 await asyncio.sleep(1)
 
             # Read Frida HTTP log
@@ -884,7 +858,7 @@ class MobileDynamicScanner:
     async def _collect_results(self, result: dict) -> dict:
         """Parse captured traffic and extract security-relevant data."""
         try:
-            raw = Path(self.capture_file).read_text()
+            raw = await self._ssh_read_file(self.capture_file)
             captured = json.loads(raw) if raw.strip() else []
         except Exception:
             captured = []
@@ -995,47 +969,29 @@ class MobileDynamicScanner:
     # ─── Cleanup ─────────────────────────────────────────────────────
 
     async def _cleanup_processes(self):
-        """Stop mitmproxy and frida (keep emulator running)."""
-        for name, proc in [
-            ("mitmproxy", self.mitmproxy_proc),
-            ("frida", self.frida_proc),
-        ]:
-            if proc and proc.returncode is None:
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                logger.info(f"{name} stopped")
+        """Stop mitmproxy and frida on host (keep emulator running)."""
+        await self._ssh("pkill -f mitmdump 2>/dev/null")
+        await self._ssh("pkill -f 'frida -D' 2>/dev/null")
+        logger.info("mitmproxy + frida stopped on host")
 
         # Reset proxy on emulator
-        await self._adb("shell", "settings", "put", "global", "http_proxy", ":0")
+        await self._adb("shell", "settings put global http_proxy :0")
 
-        # Clean temp files
-        for f in [self.addon_file, self.frida_script_file]:
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
+        # Clean temp files on host
+        await self._ssh(
+            f"rm -f {self.addon_file} {self.frida_script_file} /tmp/phantom_frida.log"
+        )
 
     # ─── Status ──────────────────────────────────────────────────────
 
     async def is_emulator_running(self) -> bool:
-        """Check if emulator is running and booted."""
+        """Check if emulator is running and booted (via SSH)."""
         output = await self._adb("devices")
         if "emulator" not in output:
             return False
-        boot = await self._adb("shell", "getprop", "sys.boot_completed")
+        boot = await self._adb("shell", "getprop sys.boot_completed")
         return boot.strip() == "1"
 
     async def stop_emulator(self):
         """Stop the emulator."""
         await self._adb("emu", "kill")
-        if self.emulator_proc:
-            try:
-                self.emulator_proc.terminate()
-            except Exception:
-                pass
