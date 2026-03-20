@@ -104,6 +104,10 @@ VULN_TYPE_ALIASES: dict[str, VulnType] = {
     "two_factor_bypass": VulnType.AUTH_BYPASS,
     "account_enumeration": VulnType.INFO_DISCLOSURE,
     "user_enumeration": VulnType.INFO_DISCLOSURE,
+    "financial_logic": VulnType.BUSINESS_LOGIC,
+    "jwt_attack": VulnType.JWT_VULN,
+    "jwt_weakness": VulnType.JWT_VULN,
+    "weak_jwt": VulnType.JWT_VULN,
 }
 from app.modules.recon import ReconModule
 from app.modules.subdomain import SubdomainModule
@@ -134,6 +138,8 @@ from app.modules.vuln_confirmer import VulnConfirmer
 from app.modules.application_graph import ApplicationGraphBuilder
 from app.modules.stateful_crawler import StatefulCrawler
 from app.modules.business_logic import BusinessLogicTester
+from app.modules.financial_logic import FinancialLogicModule
+from app.modules.jwt_attacks import JWTAttackModule
 from app.modules.auto_register import AutoRegister
 from app.modules.request_smuggling import RequestSmugglingModule
 from app.modules.mass_assignment import MassAssignmentModule
@@ -1140,6 +1146,8 @@ class ScanPipeline:
             "mfa_bypass": self._phase_mfa_bypass,
             "account_enumeration": self._phase_account_enumeration,
             "business_logic": self._phase_business_logic,
+            "financial_logic": self._phase_financial_logic,
+            "jwt_attacks": self._phase_jwt_attacks,
             "graphql_attacks": self._phase_graphql_attacks,
             "request_smuggling": self._phase_request_smuggling,
             "mass_assignment": self._phase_mass_assignment,
@@ -1461,6 +1469,8 @@ Respond in JSON:
             ("account_enumeration", 76, self._phase_account_enumeration),
             ("mfa_bypass", 77, self._phase_mfa_bypass),
             ("business_logic", 78, self._phase_business_logic),
+            ("financial_logic", 79, self._phase_financial_logic),
+            ("jwt_attacks", 79, self._phase_jwt_attacks),
             ("request_smuggling", 80, self._phase_request_smuggling),
             ("mass_assignment", 82, self._phase_mass_assignment),
             ("cache_poisoning", 84, self._phase_cache_poisoning),
@@ -1476,7 +1486,8 @@ Respond in JSON:
             # Skip heavy phases for quick scan
             skip = {"subdomain", "portscan", "fingerprint", "nuclei", "waf",
                     "evidence", "service_attack", "auth_attack", "stress_test",
-                    "stateful_crawl", "business_logic", "auto_register",
+                    "stateful_crawl", "business_logic", "financial_logic",
+                    "auto_register",
                     "request_smuggling", "mass_assignment", "cache_poisoning",
                     "mfa_bypass", "account_enumeration", "browser_scan"}
             phases = [(n, p, f) for n, p, f in all_phases if n not in skip]
@@ -3904,6 +3915,101 @@ Respond in JSON:
                 await self.log(db, "business_logic", "No business logic vulnerabilities found")
         except Exception as e:
             await self.log(db, "business_logic", f"Business logic testing error (non-fatal): {e}", "error")
+
+    async def _phase_financial_logic(self, db: AsyncSession):
+        """Test for financial/banking business logic vulnerabilities."""
+        if self.context.get("stealth"):
+            await self.log(db, "financial_logic", "Skipped in stealth mode")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = FinancialLogicModule(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "financial_logic")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "Financial logic issue")[:500],
+                        vuln_type=VulnType.BUSINESS_LOGIC,
+                        severity=sev_map.get(f.get("severity", "medium"), Severity.MEDIUM),
+                        url=f.get("url", "")[:2000],
+                        method=f.get("method"),
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        ai_confidence=0.85,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "financial_logic",
+                    f"Financial logic testing: {saved} new issues ({len(findings) - saved} deduped)", "warning")
+            else:
+                await self.log(db, "financial_logic", "No financial logic vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "financial_logic", f"Financial logic testing error (non-fatal): {e}", "error")
+
+    async def _phase_jwt_attacks(self, db: AsyncSession):
+        """Test for JWT vulnerabilities (alg:none, weak secret, claim tampering)."""
+        if self.context.get("stealth"):
+            await self.log(db, "jwt_attacks", "Skipped in stealth mode")
+            return
+
+        try:
+            sem = asyncio.Semaphore(self.context.get("rate_limit") or 5)
+            mod = JWTAttackModule(rate_limit=sem)
+            findings = await mod.run(self.context)
+
+            if findings:
+                findings = await self._filter_false_positives(findings, db, "jwt_attacks")
+
+            if findings:
+                scan_result = await db.execute(select(Scan).where(Scan.id == self.context["scan_id"]))
+                scan = scan_result.scalar_one_or_none()
+
+                sev_map = {"critical": Severity.CRITICAL, "high": Severity.HIGH,
+                           "medium": Severity.MEDIUM, "low": Severity.LOW}
+
+                saved = 0
+                for f in findings:
+                    vuln = Vulnerability(
+                        target_id=self.context["target_id"],
+                        scan_id=self.context["scan_id"],
+                        title=f.get("title", "JWT vulnerability")[:500],
+                        vuln_type=VulnType.JWT_VULN,
+                        severity=sev_map.get(f.get("severity", "high"), Severity.HIGH),
+                        url=f.get("url", "")[:2000],
+                        description=f.get("description", ""),
+                        impact=f.get("impact", ""),
+                        remediation=f.get("remediation", ""),
+                        payload_used=f.get("payload"),
+                        ai_confidence=0.9,
+                    )
+                    result = await self._save_vuln_deduped(db, vuln, scan=scan, track_context=True, finding_dict=f)
+                    if result:
+                        saved += 1
+
+                await self.log(db, "jwt_attacks",
+                    f"JWT testing: {saved} vulnerabilities found", "warning")
+            else:
+                await self.log(db, "jwt_attacks", "No JWT vulnerabilities found")
+        except Exception as e:
+            await self.log(db, "jwt_attacks", f"JWT testing error (non-fatal): {e}", "error")
 
     async def _phase_request_smuggling(self, db: AsyncSession):
         """Test for HTTP Request Smuggling (CL.TE, TE.CL, TE.TE)."""
