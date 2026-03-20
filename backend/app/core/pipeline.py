@@ -480,7 +480,48 @@ class ScanPipeline:
         if track_context and finding_dict:
             self.context.setdefault("vulnerabilities", []).append(finding_dict)
 
+        # Telegram alert for critical/high vulns
+        if vuln.severity in (Severity.CRITICAL, Severity.HIGH):
+            try:
+                self._telegram_vuln_alert(vuln)
+            except Exception:
+                pass
+
         return vuln
+
+    def _telegram_vuln_alert(self, vuln: Vulnerability):
+        """Push critical/high vuln alert to Redis for Telegram bot."""
+        try:
+            import redis as redis_lib
+            from app.config import get_settings
+            r = redis_lib.from_url(get_settings().redis_url)
+            r.rpush("phantom:telegram:vuln_alerts", json.dumps({
+                "vuln_id": str(vuln.id),
+                "severity": vuln.severity.value if vuln.severity else "?",
+                "vuln_type": vuln.vuln_type.value if vuln.vuln_type else "?",
+                "url": vuln.url or "",
+                "title": (vuln.title or "")[:150],
+            }))
+            r.close()
+        except Exception as e:
+            logger.debug(f"Telegram vuln alert failed: {e}")
+
+    def _telegram_scan_event(self, event_type: str, scan, target, **extra):
+        """Push scan event to Redis for Telegram bot."""
+        try:
+            import redis as redis_lib
+            from app.config import get_settings
+            r = redis_lib.from_url(get_settings().redis_url)
+            r.rpush("phantom:telegram:scan_events", json.dumps({
+                "type": event_type,
+                "scan_id": str(scan.id),
+                "target_name": target.name if target else "?",
+                "vulns_found": scan.vulns_found or 0,
+                **extra,
+            }))
+            r.close()
+        except Exception as e:
+            logger.debug(f"Telegram scan event failed: {e}")
 
     async def log(self, db: AsyncSession, phase: str, message: str, level: str = "info", data: dict = None):
         log_entry = ScanLog(
@@ -953,6 +994,26 @@ class ScanPipeline:
                     except Exception as e:
                         logger.warning(f"Scan complete notification failed: {e}")
 
+                    # Telegram bot notification
+                    try:
+                        # Count critical/high for summary
+                        from sqlalchemy import func as _sf
+                        crit_count = (await db.execute(
+                            select(_sf.count(Vulnerability.id)).where(
+                                Vulnerability.scan_id == self.scan_id,
+                                Vulnerability.severity == Severity.CRITICAL,
+                            )
+                        )).scalar() or 0
+                        high_count = (await db.execute(
+                            select(_sf.count(Vulnerability.id)).where(
+                                Vulnerability.scan_id == self.scan_id,
+                                Vulnerability.severity == Severity.HIGH,
+                            )
+                        )).scalar() or 0
+                        self._telegram_scan_event("scan_completed", scan, target, critical=crit_count, high=high_count)
+                    except Exception:
+                        pass
+
                     # Notify for critical/high vulns found
                     await self._notify_critical_vulns(db, target)
 
@@ -982,6 +1043,10 @@ class ScanPipeline:
                     scan.completed_at = datetime.utcnow()
                     await self.log(db, "error", f"Scan failed: {str(e)}", "error")
                     await db.commit()
+                    try:
+                        self._telegram_scan_event("scan_failed", scan, target, error=str(e)[:200])
+                    except Exception:
+                        pass
                 except Exception as commit_err:
                     logger.error(f"Failed to persist scan failure status: {commit_err}")
                     # Last resort: raw SQL to mark scan as failed

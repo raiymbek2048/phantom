@@ -114,6 +114,23 @@ services:
       - frontend
     restart: unless-stopped
 
+  # Telegram Bot
+  telegram_bot:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - PHANTOM_URL=http://backend:8000
+      - PHANTOM_USER=${PHANTOM_USER:-admin}
+      - PHANTOM_PASS=${PHANTOM_PASS:-changeme}
+      - ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - backend
+      - redis
+    restart: unless-stopped
+
   # --- Security Tools (on-demand containers) ---
 
   nmap:
