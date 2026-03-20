@@ -741,16 +741,19 @@ async def get_claude_key_status(
     r = redis_lib.from_url(get_settings().redis_url)
     key = r.get(REDIS_KEY_CLAUDE)
 
-    from app.ai.get_claude_key import get_claude_api_key, get_key_source
+    from app.ai.get_claude_key import get_claude_api_key, get_key_source, get_token_status
     api_key = get_claude_api_key()
     if api_key:
         source = get_key_source()
         masked = api_key[:14] + "..." + api_key[-4:] if source == "max_subscription" else api_key[:10] + "..." + api_key[-4:]
-        return {
+        result = {
             "configured": True,
             "key_masked": masked,
             "source": source,
         }
+        if source == "max_subscription":
+            result["token_status"] = get_token_status()
+        return result
     return {"configured": False}
 
 
@@ -764,3 +767,59 @@ async def delete_claude_key(
     r = redis_lib.from_url(get_settings().redis_url)
     r.delete(REDIS_KEY_CLAUDE)
     return {"status": "deleted"}
+
+
+# ─── OAuth Auto-Refresh Management ──────────────────────────
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/settings/claude-refresh-token")
+async def seed_claude_refresh_token(
+    req: RefreshTokenRequest,
+    user: User = Depends(get_current_user),
+):
+    """Seed the server with a Claude OAuth refresh token.
+
+    After seeding, PHANTOM will auto-refresh the access token every ~8 hours.
+    Get the refresh token by running: claude login (on any machine with Claude CLI).
+    """
+    from app.ai.get_claude_key import seed_refresh_token
+    token = req.refresh_token.strip()
+
+    if not token.startswith("sk-ant-ort"):
+        raise HTTPException(status_code=400, detail="Invalid refresh token format. Should start with sk-ant-ort...")
+
+    success = seed_refresh_token(token)
+    if success:
+        return {
+            "status": "ok",
+            "message": "Refresh token seeded. PHANTOM will auto-refresh the Claude token from now on.",
+        }
+    raise HTTPException(status_code=500, detail="Refresh token seeded but initial token refresh failed. Check server logs.")
+
+
+@router.get("/settings/claude-token-status")
+async def get_claude_token_status(
+    user: User = Depends(get_current_user),
+):
+    """Get detailed Claude token status including auto-refresh info."""
+    from app.ai.get_claude_key import get_token_status
+    return get_token_status()
+
+
+@router.post("/settings/claude-refresh-now")
+async def force_claude_refresh(
+    user: User = Depends(get_current_user),
+):
+    """Force an immediate token refresh."""
+    from app.ai.get_claude_key import _refresh_oauth_token, get_token_status
+    new_token = _refresh_oauth_token()
+    if new_token:
+        return {
+            "status": "ok",
+            "message": "Token refreshed successfully.",
+            **get_token_status(),
+        }
+    raise HTTPException(status_code=500, detail="Token refresh failed. No refresh token or Anthropic API error.")

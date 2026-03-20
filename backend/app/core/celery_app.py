@@ -53,6 +53,10 @@ celery_app.conf.update(
             "task": "phantom.health_check",
             "schedule": 300.0,  # every 5 minutes
         },
+        "claude-token-refresh": {
+            "task": "phantom.refresh_claude_token",
+            "schedule": 3600.0,  # every 1 hour (token lasts 8h, refresh proactively)
+        },
     },
 )
 
@@ -786,3 +790,30 @@ def health_check_task():
         await engine.dispose()
 
     asyncio.run(_check())
+
+
+@celery_app.task(name="phantom.refresh_claude_token")
+def refresh_claude_token_task():
+    """Proactively refresh Claude OAuth token before it expires."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        from app.ai.get_claude_key import _is_token_expired, _refresh_oauth_token, get_token_status
+        status = get_token_status()
+
+        if not status.get("has_refresh_token"):
+            return  # No refresh token configured, skip
+
+        if _is_token_expired():
+            logger.info("Claude token expired or expiring soon, refreshing...")
+            new_token = _refresh_oauth_token()
+            if new_token:
+                logger.info(f"Claude token refreshed: {new_token[:20]}...")
+            else:
+                logger.warning("Claude token refresh FAILED")
+        else:
+            remaining = status.get("expires_in_hours")
+            logger.debug(f"Claude token OK, expires in {remaining}h")
+    except Exception as e:
+        logger.error(f"Claude token refresh task error: {e}")

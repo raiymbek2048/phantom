@@ -57,6 +57,21 @@ class LLMEngine:
         }
 
     def _refresh_key(self):
+        # First try auto-refresh via OAuth refresh token
+        try:
+            from app.ai.get_claude_key import _refresh_oauth_token, _is_token_expired
+            if _is_token_expired():
+                new_token = _refresh_oauth_token()
+                if new_token:
+                    logger.info("LLM key auto-refreshed via OAuth (%s...)", new_token[:20])
+                    self.claude_api_key = new_token
+                    self._is_oauth = self._detect_oauth()
+                    self._provider = None
+                    return True
+        except Exception as e:
+            logger.debug(f"OAuth auto-refresh attempt failed: {e}")
+
+        # Fallback: re-read from Redis (maybe someone updated it manually)
         from app.ai.get_claude_key import get_claude_api_key
         new_key = get_claude_api_key() or settings.anthropic_api_key
         if new_key and new_key != self.claude_api_key:
