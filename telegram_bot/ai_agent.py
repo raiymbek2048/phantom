@@ -264,6 +264,17 @@ TOOLS = [
         "description": "Check status of running dynamic APK scan. Returns status (idle/running/completed/failed) and results when done.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "apk_to_targets",
+        "description": "Analyze APK and create PHANTOM scan targets from discovered API domains. Combines static APK analysis + automatic target creation. After this, use start_scan on the created targets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "package_name": {"type": "string", "description": "Android package name (e.g. com.halyk.life.app)"},
+            },
+            "required": ["package_name"],
+        },
+    },
 ]
 
 
@@ -505,6 +516,12 @@ class PhantomAgent:
                 )
             elif name == "dynamic_scan_status":
                 result = await self.api._request("GET", "/api/mobile/dynamic-status")
+            elif name == "apk_to_targets":
+                pkg = args.get("package_name", "")
+                result = await self.api._request(
+                    "POST", "/api/mobile/create-targets-from-apk",
+                    data={"package_name": pkg},
+                )
             else:
                 result = {"error": f"Unknown tool: {name}"}
 

@@ -1,12 +1,15 @@
-"""Mobile API — APK upload, static analysis, and dynamic analysis endpoints."""
+"""Mobile API — APK upload, static analysis, dynamic analysis, and target creation."""
 import asyncio
 import os
 import tempfile
 import logging
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.mobile_api_extractor import MobileAPIExtractor
+from app.models.database import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -204,3 +207,107 @@ async def emulator_status():
         return {"emulator_running": running}
     except Exception as e:
         return {"emulator_running": False, "error": str(e)}
+
+
+# ─── Static → Targets Pipeline ──────────────────────────────────
+
+
+@router.post("/create-targets-from-apk")
+async def create_targets_from_apk(
+    package_name: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Analyze APK and create PHANTOM targets from discovered base URLs.
+
+    Pipeline: APK download → decompile → extract endpoints → create targets.
+    Returns list of created/existing targets ready for scanning.
+    """
+    from app.models.target import Target
+    from sqlalchemy import select
+
+    if not package_name or "." not in package_name:
+        raise HTTPException(400, "Invalid package name")
+
+    # Step 1: Static analysis
+    extractor = MobileAPIExtractor()
+    result = await extractor.extract_from_package(package_name)
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    findings = extractor.generate_findings(result)
+
+    # Step 2: Extract unique domains from base_urls and api_endpoints
+    domains = set()
+    for url in result.get("base_urls", []):
+        try:
+            parsed = urlparse(url)
+            if parsed.hostname and not _is_internal(parsed.hostname):
+                domains.add(parsed.hostname)
+        except Exception:
+            pass
+    for ep in result.get("api_endpoints", []):
+        url = ep if isinstance(ep, str) else ep.get("url", "")
+        try:
+            parsed = urlparse(url)
+            if parsed.hostname and not _is_internal(parsed.hostname):
+                domains.add(parsed.hostname)
+        except Exception:
+            pass
+
+    # Step 3: Create targets for each domain
+    created = []
+    existing = []
+    for domain in sorted(domains):
+        # Check if target already exists
+        stmt = select(Target).where(Target.domain == domain)
+        db_result = await db.execute(stmt)
+        target = db_result.scalar_one_or_none()
+
+        if target:
+            existing.append({
+                "id": str(target.id),
+                "domain": target.domain,
+                "status": "existing",
+            })
+        else:
+            target = Target(
+                domain=domain,
+                scope=f"*.{domain}",
+                tags=["mobile", "apk", package_name],
+            )
+            db.add(target)
+            await db.flush()
+            created.append({
+                "id": str(target.id),
+                "domain": domain,
+                "status": "created",
+            })
+
+    await db.commit()
+
+    return {
+        "package_name": package_name,
+        "static_findings": len(findings),
+        "domains_found": len(domains),
+        "targets_created": len(created),
+        "targets_existing": len(existing),
+        "targets": created + existing,
+        "base_urls": result.get("base_urls", []),
+        "secrets_count": len(result.get("secrets", [])),
+        "android_issues_count": len(result.get("android_issues", [])),
+    }
+
+
+def _is_internal(hostname: str) -> bool:
+    """Check if hostname is internal/localhost."""
+    internal = (
+        "localhost", "127.0.0.1", "0.0.0.0", "10.0.2.2",
+        "example.com", "example.org",
+    )
+    if hostname in internal:
+        return True
+    if hostname.startswith("10.") or hostname.startswith("192.168."):
+        return True
+    if hostname.startswith("172.") and 16 <= int(hostname.split(".")[1]) <= 31:
+        return True
+    return False
