@@ -182,6 +182,9 @@ class SensitiveFilesModule:
         if not base_url:
             return []
 
+        self._is_spa = context.get("is_spa_catchall", False)
+        self._spa_hash = context.get("spa_baseline_hash", "")
+
         findings = []
 
         # Batch check all paths
@@ -261,6 +264,12 @@ class SensitiveFilesModule:
 
                     body = resp.text
                     content_type = resp.headers.get("content-type", "")
+
+                    # Skip SPA catch-all responses (identical HTML for all URLs)
+                    if self._is_spa and self._spa_hash and "text/html" in content_type:
+                        import hashlib
+                        if hashlib.sha256(body.encode()).hexdigest() == self._spa_hash:
+                            return None
 
                     # Skip if it's an HTML error page (custom 404)
                     if "text/html" in content_type and len(body) > 500:

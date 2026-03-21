@@ -27,7 +27,9 @@ class PhantomAPI:
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         await self._ensure_auth()
-        async with httpx.AsyncClient(timeout=60) as c:
+        # Mobile APK endpoints need longer timeout (download + decompile can take 5+ min)
+        timeout = 600 if "/mobile/" in path else 60
+        async with httpx.AsyncClient(timeout=timeout) as c:
             resp = await c.request(
                 method,
                 f"{self.base_url}{path}",
@@ -92,6 +94,26 @@ class PhantomAPI:
 
     async def get_target_recon(self, target_id: str) -> dict:
         return await self._request("GET", f"/api/targets/{target_id}/recon")
+
+    async def set_target_auth(self, target_id: str, auth_type: str = "form",
+                               username: str = None, password: str = None,
+                               login_url: str = None, token: str = None,
+                               cookie: str = None) -> dict:
+        data = {"type": auth_type}
+        if username:
+            data["username"] = username
+        if password:
+            data["password"] = password
+        if login_url:
+            data["login_url"] = login_url
+        if token:
+            data["token"] = token
+        if cookie:
+            data["cookie"] = cookie
+        return await self._request("POST", f"/api/targets/{target_id}/auth", json=data)
+
+    async def clear_target_auth(self, target_id: str) -> dict:
+        return await self._request("DELETE", f"/api/targets/{target_id}/auth")
 
     # --- Scans ---
     async def start_scan(self, target_id: str, scan_type: str = "full") -> dict:

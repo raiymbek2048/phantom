@@ -198,7 +198,162 @@ class ScanPipeline:
         "reachable", "rate_limit", "scan_type", "stealth", "bounty_mode",
         "custom_headers", "bounty_rules", "proxy_url", "cross_scan_intel",
         "auto_register_result", "js_api_endpoints",
+        "auth_cookie", "is_spa_catchall", "spa_baseline_hash",
     ]
+
+    async def _detect_spa_catchall(self, base_url: str, db: AsyncSession) -> bool:
+        """Detect SPA catch-all: if 3 random URLs return identical 200 responses, it's a SPA."""
+        import hashlib, httpx, secrets
+        try:
+            hashes = []
+            async with httpx.AsyncClient(verify=False, timeout=10.0, follow_redirects=True,
+                                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as client:
+                for _ in range(3):
+                    random_path = f"/{secrets.token_hex(12)}"
+                    try:
+                        resp = await client.get(f"{base_url}{random_path}")
+                        if resp.status_code != 200:
+                            return False  # Real 404 = not a SPA catch-all
+                        body_hash = hashlib.sha256(resp.text.encode()).hexdigest()
+                        hashes.append(body_hash)
+                    except Exception:
+                        return False
+
+            if len(set(hashes)) == 1:
+                # All 3 random URLs return identical body → SPA catch-all
+                self.context["is_spa_catchall"] = True
+                self.context["spa_baseline_hash"] = hashes[0]
+                await self.log(db, "spa_detect",
+                    f"SPA catch-all detected: all random URLs return identical 200 response "
+                    f"(hash: {hashes[0][:16]}). Will filter false positives.")
+                return True
+        except Exception as e:
+            logger.warning(f"SPA detection failed: {e}")
+        return False
+
+    async def _resolve_auth(self, db: AsyncSession, target: Target, scan: Scan) -> str | None:
+        """Resolve authentication for target. Returns auth cookie/token string or None."""
+        import httpx
+        auth_cfg = target.auth_config
+        if not auth_cfg:
+            return None
+
+        auth_type = auth_cfg.get("type", "form")
+        base_url = self.context["base_url"]
+
+        try:
+            if auth_type == "bearer" and auth_cfg.get("token"):
+                # Pre-existing bearer token
+                token = auth_cfg["token"]
+                await self.log(db, "auth", f"Using pre-configured Bearer token")
+                return f"token={token}"
+
+            elif auth_type == "cookie" and auth_cfg.get("cookie"):
+                # Pre-existing session cookie
+                await self.log(db, "auth", f"Using pre-configured session cookie")
+                return auth_cfg["cookie"]
+
+            elif auth_type == "basic":
+                # HTTP Basic — encode as header, modules handle it via custom_headers
+                import base64
+                creds = base64.b64encode(
+                    f"{auth_cfg['username']}:{auth_cfg['password']}".encode()
+                ).decode()
+                self.context["custom_headers"]["Authorization"] = f"Basic {creds}"
+                await self.log(db, "auth", f"HTTP Basic auth configured for {auth_cfg.get('username')}")
+                return None  # Handled via custom_headers
+
+            elif auth_type in ("form", "jwt"):
+                # Form login or JWT API login
+                username = auth_cfg.get("username", "")
+                password = auth_cfg.get("password", "")
+                login_url = auth_cfg.get("login_url", "")
+                custom_payload = auth_cfg.get("payload")
+
+                if not login_url or not username:
+                    await self.log(db, "auth", "Auth config missing login_url or username", "warning")
+                    return None
+
+                full_url = f"{base_url}{login_url}" if login_url.startswith("/") else login_url
+
+                async with httpx.AsyncClient(verify=False, timeout=15.0, follow_redirects=True) as client:
+                    # Build request body
+                    if custom_payload:
+                        body = custom_payload
+                    else:
+                        body = {"username": username, "password": password}
+
+                    # Try JSON first, then form-encoded
+                    for content_type in ("json", "form"):
+                        try:
+                            if content_type == "json":
+                                resp = await client.post(full_url, json=body)
+                            else:
+                                resp = await client.post(full_url, data=body)
+
+                            if resp.status_code >= 400:
+                                continue
+
+                            # Extract JWT from response body
+                            try:
+                                data = resp.json()
+                                token = None
+                                if isinstance(data, dict):
+                                    for key in ("token", "access_token", "accessToken", "jwt",
+                                                "id_token", "data.token", "data.access_token"):
+                                        if "." in key:
+                                            parts = key.split(".")
+                                            val = data
+                                            for p in parts:
+                                                val = val.get(p, {}) if isinstance(val, dict) else None
+                                            if val and isinstance(val, str):
+                                                token = val
+                                                break
+                                        elif data.get(key):
+                                            token = data[key]
+                                            break
+                                    # Nested auth object
+                                    if not token:
+                                        for wrapper in ("authentication", "auth", "result", "data"):
+                                            inner = data.get(wrapper, {})
+                                            if isinstance(inner, dict):
+                                                for key in ("token", "access_token", "accessToken"):
+                                                    if inner.get(key):
+                                                        token = inner[key]
+                                                        break
+                                            if token:
+                                                break
+
+                                if token:
+                                    await self.log(db, "auth",
+                                        f"Authenticated as '{username}' via {auth_type} ({login_url}) — JWT obtained")
+                                    return f"token={token}"
+                            except Exception:
+                                pass
+
+                            # Extract session cookie from Set-Cookie
+                            cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
+                            if not cookies:
+                                raw = resp.headers.get("set-cookie", "")
+                                if raw:
+                                    cookies = [raw]
+                            if cookies:
+                                cookie_str = "; ".join(
+                                    c.split(";")[0] for c in cookies
+                                )
+                                await self.log(db, "auth",
+                                    f"Authenticated as '{username}' via form login ({login_url}) — session cookie obtained")
+                                return cookie_str
+
+                        except Exception:
+                            continue
+
+                await self.log(db, "auth", f"Login failed for '{username}' at {login_url}", "warning")
+                return None
+
+        except Exception as e:
+            await self.log(db, "auth", f"Auth resolution error: {e}", "warning")
+            return None
 
     def _make_json_serializable(self, obj):
         """Recursively convert sets and other non-JSON types to serializable forms."""
@@ -371,6 +526,19 @@ class ScanPipeline:
         Dedup key: (target_id, vuln_type, normalized_url, parameter).
         Returns the vuln if saved, None if duplicate.
         """
+        # --- SPA catch-all filter: reject findings from SPA that return identical pages ---
+        if self.context.get("is_spa_catchall") and vuln.url:
+            spa_hash = self.context.get("spa_baseline_hash")
+            if spa_hash and finding_dict:
+                resp_data = finding_dict.get("response_data", {})
+                body = resp_data.get("body_preview", "")
+                if body:
+                    import hashlib
+                    body_hash = hashlib.sha256(body.encode()).hexdigest()
+                    if body_hash == spa_hash:
+                        logger.debug(f"SPA filter: rejected finding with identical SPA response: {vuln.url}")
+                        return None
+
         # --- Scope enforcement: reject out-of-scope URLs ---
         if hasattr(self, '_scope') and vuln.url:
             if not self._scope.is_in_scope(vuln.url):
@@ -830,6 +998,15 @@ class ScanPipeline:
                     await self.log(db, "error", f"Scan aborted: target {domain} is unreachable", "error")
                     await db.commit()
                     return
+            await db.commit()
+
+            # --- SPA catch-all detection ---
+            await self._detect_spa_catchall(base_url, db)
+
+            # --- Resolve target authentication credentials ---
+            auth_cookie = await self._resolve_auth(db, target, scan)
+            if auth_cookie:
+                self.context["auth_cookie"] = auth_cookie
             await db.commit()
 
             # Determine phases based on scan type

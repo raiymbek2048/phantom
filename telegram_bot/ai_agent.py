@@ -42,6 +42,11 @@ sensitive data exposure, parameter injection, API versioning.
   - Авто-инъекция прокси через Frida хук OkHttpClient.Builder
   - Захват реальных API эндпоинтов, токенов, заголовков
   - Занимает 2-5 минут
+  - Интерактивный режим (interactive=true): UIAutomator + логин через Telegram
+    Когда приложению нужен вход — сканер делает скриншот, отправляет в Telegram,
+    запрашивает OTP/телефон у пользователя, заполняет формы автоматически.
+    ВСЕГДА используй interactive=true по умолчанию — так мы получаем больше API после логина.
+    Без interactive только если пользователь явно попросит «без логина» или «без входа».
 
 Правила:
 - Будь кратким, но информативным. Telegram — не место для эссе.
@@ -53,6 +58,11 @@ sensitive data exposure, parameter injection, API versioning.
 - ID объектов показывай коротко (первые 8 символов).
 - Для URL без протокола — добавляй https://
 - Отвечай ТОЛЬКО на основе реальных данных из tools. Не выдумывай.
+- СТРОГО ЗАПРЕЩЕНО: не придумывай JSON-ответы, не генерируй примеры данных, не фабрикуй результаты сканирования.
+- Если tool вернул ошибку или пустые данные — так и скажи. НЕ выдумывай альтернативные данные.
+- Не показывай «примерный» или «возможный» вывод уязвимостей — только реальный из tools.
+- Если не уверен — вызови tool ещё раз, а не пиши от себя.
+- Когда показываешь уязвимости — используй set_target_auth для установки кредов перед сканированием аутентифицированных приложений.
 """
 
 # Tool definitions for Claude
@@ -236,6 +246,23 @@ TOOLS = [
         },
     },
     {
+        "name": "set_target_auth",
+        "description": "Set login credentials for a target to enable authenticated scanning. PHANTOM will log in before scanning and test endpoints with a valid session. Supports: form login (username+password+login_url), JWT API auth, bearer token, HTTP basic auth, raw cookie.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string", "description": "Target UUID to set credentials for"},
+                "auth_type": {"type": "string", "enum": ["form", "jwt", "bearer", "basic", "cookie"], "description": "Authentication type (default: form)"},
+                "username": {"type": "string", "description": "Login username or email"},
+                "password": {"type": "string", "description": "Login password"},
+                "login_url": {"type": "string", "description": "Login endpoint path (e.g. /login, /api/auth/login)"},
+                "token": {"type": "string", "description": "Pre-existing JWT/Bearer token (for bearer/jwt type)"},
+                "cookie": {"type": "string", "description": "Pre-existing session cookie string (for cookie type)"},
+            },
+            "required": ["target_id"],
+        },
+    },
+    {
         "name": "analyze_apk",
         "description": "Static APK analysis — decompiles and extracts API endpoints, hardcoded secrets, OAuth config, certificate pinning info, and Android security issues. Pass package name (e.g. 'kz.homebank.mobile') or URL to APK file.",
         "input_schema": {
@@ -249,12 +276,14 @@ TOOLS = [
     },
     {
         "name": "dynamic_scan_apk",
-        "description": "Dynamic APK analysis — runs app in Android emulator with Frida SSL bypass + mitmproxy traffic interception. Captures real API endpoints, tokens, headers from live traffic. Takes 2-5 minutes. Use when static analysis isn't enough (e.g. need real API traffic, auth tokens, runtime behavior).",
+        "description": "Dynamic APK analysis — runs app in Android emulator with Frida SSL bypass + mitmproxy traffic interception. Captures real API endpoints, tokens, headers from live traffic. Takes 2-5 minutes. Use when static analysis isn't enough (e.g. need real API traffic, auth tokens, runtime behavior). For apps requiring login, use interactive=true — the bot will ask user for OTP via Telegram.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "package_name": {"type": "string", "description": "Android package name (e.g. kz.kkb.homebank)"},
                 "duration": {"type": "integer", "description": "How long to run the app in seconds (default 120)"},
+                "interactive": {"type": "boolean", "description": "Interactive mode — login via UIAutomator + OTP from user via Telegram. DEFAULT TRUE — always enable unless user explicitly says not to. More APIs are discovered when logged in."},
+                "phone_number": {"type": "string", "description": "Phone number for login (e.g. +77001234567). If not provided and interactive=true, bot will ask user."},
             },
             "required": ["package_name"],
         },
@@ -496,6 +525,16 @@ class PhantomAgent:
             elif name == "send_file":
                 # This is handled specially in the bot — return the path
                 return json.dumps({"_send_file": args.get("file_path"), "caption": args.get("caption", "")})
+            elif name == "set_target_auth":
+                result = await self.api.set_target_auth(
+                    target_id=args["target_id"],
+                    auth_type=args.get("auth_type", "form"),
+                    username=args.get("username"),
+                    password=args.get("password"),
+                    login_url=args.get("login_url"),
+                    token=args.get("token"),
+                    cookie=args.get("cookie"),
+                )
             elif name == "analyze_apk":
                 pkg = args.get("package_name", "")
                 url = args.get("apk_url", "")
@@ -510,9 +549,17 @@ class PhantomAgent:
             elif name == "dynamic_scan_apk":
                 pkg = args.get("package_name", "")
                 dur = args.get("duration", 120)
+                interactive = args.get("interactive", True)
+                phone = args.get("phone_number", "")
+                data = {
+                    "package_name": pkg,
+                    "duration": str(dur),
+                    "interactive": str(interactive).lower(),
+                    "phone_number": phone,
+                }
                 result = await self.api._request(
                     "POST", "/api/mobile/dynamic-scan",
-                    data={"package_name": pkg, "duration": str(dur)},
+                    data=data,
                 )
             elif name == "dynamic_scan_status":
                 result = await self.api._request("GET", "/api/mobile/dynamic-status")

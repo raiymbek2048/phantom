@@ -40,6 +40,11 @@ class Target(Base):
     technologies: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     ports: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Authentication credentials for authenticated scanning
+    # Format: {"type": "form|jwt|bearer|basic|cookie", "username": "...", "password": "...",
+    #          "login_url": "/login", "token": "...", "cookie": "...", "payload": {...}}
+    auth_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Tags / grouping
     tags: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["web", "api", "prod"]
 

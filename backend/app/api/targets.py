@@ -12,6 +12,17 @@ from app.api.audit import log_action
 router = APIRouter()
 
 
+class AuthConfig(BaseModel):
+    """Authentication configuration for authenticated scanning."""
+    type: str = "form"  # form, jwt, bearer, basic, cookie
+    username: str | None = None
+    password: str | None = None
+    login_url: str | None = None  # e.g. "/login", "/api/auth/token"
+    token: str | None = None  # Pre-existing JWT/Bearer token
+    cookie: str | None = None  # Pre-existing session cookie
+    payload: dict | None = None  # Custom JSON body for API login
+
+
 class TargetCreate(BaseModel):
     domain: str
     scope: str | None = None
@@ -19,6 +30,7 @@ class TargetCreate(BaseModel):
     notes: str | None = None
     source: TargetSource = TargetSource.MANUAL
     rate_limit: int | None = None  # requests/sec override
+    auth_config: AuthConfig | None = None
 
 
 class TargetUpdate(BaseModel):
@@ -29,6 +41,7 @@ class TargetUpdate(BaseModel):
     notes: str | None = None
     rate_limit: int | None = None
     tags: list[str] | None = None
+    auth_config: AuthConfig | None = None
 
 
 class MonitorRequest(BaseModel):
@@ -48,6 +61,7 @@ class TargetResponse(BaseModel):
     technologies: dict | None
     monitoring_enabled: bool
     monitoring_interval: str
+    has_auth: bool = False
     created_at: str
 
     model_config = {"from_attributes": True}
@@ -126,6 +140,7 @@ async def create_target(
         notes=target_data.notes,
         source=target_data.source,
         rate_limit=target_data.rate_limit,
+        auth_config=target_data.auth_config.model_dump() if target_data.auth_config else None,
         user_id=user.id,
     )
     db.add(target)
@@ -160,6 +175,39 @@ async def toggle_monitoring(
         "monitoring_enabled": target.monitoring_enabled,
         "monitoring_interval": target.monitoring_interval,
     }
+
+
+@router.post("/{target_id}/auth")
+async def set_target_auth(
+    target_id: str,
+    auth: AuthConfig,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Set authentication credentials for a target (used in authenticated scanning)."""
+    result = await db.execute(select(Target).where(Target.id == target_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    target.auth_config = auth.model_dump()
+    await db.flush()
+    return {"id": target.id, "domain": target.domain, "auth_type": auth.type, "has_auth": True}
+
+
+@router.delete("/{target_id}/auth")
+async def clear_target_auth(
+    target_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Remove stored credentials for a target."""
+    result = await db.execute(select(Target).where(Target.id == target_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    target.auth_config = None
+    await db.flush()
+    return {"id": target.id, "domain": target.domain, "has_auth": False}
 
 
 @router.get("/{target_id}/changes")

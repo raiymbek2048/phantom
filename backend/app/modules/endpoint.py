@@ -106,8 +106,11 @@ class EndpointModule:
         self._js_secret_findings = []
         self._custom_headers = (context or {}).get("custom_headers", {})
 
-        # Try to get auth cookie (for apps that require login like DVWA)
-        self._auth_cookie = await self._try_auto_login(base_url)
+        self._is_spa = (context or {}).get("is_spa_catchall", False)
+        self._spa_hash = (context or {}).get("spa_baseline_hash", "")
+
+        # Use auth cookie from context (target credentials) or try auto-login
+        self._auth_cookie = (context or {}).get("auth_cookie") or await self._try_auto_login(base_url)
 
         targets = [domain] + subdomains[:5]
 
@@ -406,6 +409,19 @@ class EndpointModule:
         """Fuzz common paths and files."""
         fuzz_base = base_url or f"https://{target}"
 
+        # SPA catch-all: ffuf will return hits for ALL paths. Use filter-size to exclude.
+        spa_filter_args = []
+        if self._is_spa and self._spa_hash:
+            # Fetch one random URL to get the SPA page size for ffuf -fs
+            try:
+                import secrets as _secrets
+                async with httpx.AsyncClient(verify=False, timeout=5.0, follow_redirects=True) as _c:
+                    _r = await _c.get(f"{fuzz_base}/{_secrets.token_hex(8)}")
+                    if _r.status_code == 200:
+                        spa_filter_args = ["-fs", str(len(_r.text))]
+            except Exception:
+                pass
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("\n".join(COMMON_DIRS))
             wordlist_path = f.name
@@ -419,7 +435,7 @@ class EndpointModule:
                 "-t", "20",
                 "-timeout", "5",
                 "-s",  # silent
-            ]
+            ] + spa_filter_args
             if self._auth_cookie:
                 cmd.extend(["-H", f"Cookie: {self._auth_cookie}"])
             for hk, hv in self._custom_headers.items():
